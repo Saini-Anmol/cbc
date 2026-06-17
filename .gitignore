@@ -1,0 +1,13 @@
+# Data directories (large files)
+data/input/
+data/output/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
