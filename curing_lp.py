@@ -104,7 +104,7 @@ class Config:
     PLAN_PARAMS_TABLE = "jkt_plan_params"
 
     # ── planning horizon ──────────────────────────────────────────────────────
-    PLANNING_DAYS    = 31
+    PLANNING_DAYS    = 30
     SHIFTS_PER_DAY   = 3
     HOURS_PER_SHIFT  = 8
     SHIFT_START_HOUR = 7
@@ -132,7 +132,7 @@ class Config:
     # False : strict — require MOULDS_PER_PRESS free moulds in the global pool.
     PERMISSIVE_MOULD_ELIGIBILITY = True
 
-    PLAN_DATE = datetime(2026, 5, 1, 7, 0, 0)
+    PLAN_DATE = datetime(2026, 6, 1, 7, 0, 0)
 
     # ── output ────────────────────────────────────────────────────────────────
     TYRE_TYPE   = "pcr"

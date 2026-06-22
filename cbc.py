@@ -58,6 +58,20 @@ OUT = cbc_env.OUTPUT_DIR
 MAIN_OUT = os.path.join(OUT, "main_output")
 os.makedirs(MAIN_OUT, exist_ok=True)
 
+# ══════════════════════════════════════════════════════════════════════════
+# USER SETTINGS  —  edit these for each planning run, then `python3 cbc.py`
+# ══════════════════════════════════════════════════════════════════════════
+# 1) Curing demand for the month being planned. Drop the new demand workbook in
+#    data/input/ and point this at it — this is the ONE file you change per run.
+#    Required columns: SKUCode, Requirement (or Updated_Requirement),
+#    ConsolidatedPriorityScore. Everything else comes from the DB.
+DEMAND_FILE = os.path.join(IN, "demand_tomerji_june_normalized.xlsx")
+# 2) First shift of the plan (07:00 = shift-A start) and the number of days to
+#    plan. Set these to the month you are scheduling (e.g. June = 1st, 30 days).
+PLAN_START_DT = datetime(2026, 6, 1, 7, 0, 0)
+PLANNING_DAYS = 30
+# ══════════════════════════════════════════════════════════════════════════
+
 # Building PDE (production-event) history — the monthly exports under
 # data/input/building pde/. These supply both the feed-map builder (Phase 0)
 # and the Phase-C2 building-history feasibility check. Replaces the old single
@@ -104,10 +118,10 @@ class CBCConfig:
     feed_cfg: FeedMapConfig = field(default_factory=_feed_cfg)
 
     # ── Curing inputs ───────────────────────────────────────────────────
-    # Demand comes from a file (Book4); everything else from the DB.
-    CUR_DEMAND: str = os.path.join(IN, "Book4.xlsx")
+    # Demand comes from a file (see DEMAND_FILE up top); everything else from DB.
+    CUR_DEMAND: str = DEMAND_FILE
     CUR_OUTPUT: str = os.path.join(MAIN_OUT, "PCR_CBC_Curing_Initial.xlsx")
-    PLAN_START: datetime = datetime(2026, 5, 1, 7, 0, 0)
+    PLAN_START: datetime = PLAN_START_DT
 
     # Feed-filter behaviour for missing data (see feed_aware_curing).
     KEEP_UNKNOWN_PRESS: bool = True
@@ -115,10 +129,9 @@ class CBCConfig:
 
     # ── Building stage ──────────────────────────────────────────────────
     RUN_BUILDING: bool = True
-    # Align building's horizon to curing's so it supplies GT for the WHOLE month
-    # (was 8 → final curing was capped at an 8-day build). Matches curing's
-    # PLANNING_DAYS=31. Building GA runs longer at this horizon.
-    BUILDING_PLANNING_DAYS: int = 31
+    # Building's horizon is kept equal to curing's (PLANNING_DAYS up top) so it
+    # supplies GT for the WHOLE month being planned.
+    BUILDING_PLANNING_DAYS: int = PLANNING_DAYS
     BUILDING_OUTPUT: str = os.path.join(MAIN_OUT, "PCR_CBC_Building.xlsx")
     BRIDGE_FILE: str = os.path.join(OUT, "curing_plan_for_building.xlsx")
 
@@ -200,7 +213,7 @@ def phase0_feed_map(cfg: CBCConfig) -> dict:
 
 def phaseC_curing(cfg: CBCConfig, feed_map, engine) -> dict:
     print("\n" + "=" * 70)
-    print("  PHASE C — FEED-AWARE CURING (DB inputs + Book4 demand)")
+    print("  PHASE C — FEED-AWARE CURING (DB inputs + file demand)")
     print("=" * 70)
 
     bld_allow = _building_allowable_from_db(engine)
@@ -534,7 +547,7 @@ def phaseC2_final_curing(cfg: CBCConfig, engine) -> dict | None:
 
     # ── summary ──────────────────────────────────────────────────────────
     summary = pd.DataFrame([
-        ("True curing demand (Book4)", round(orig_total)),
+        ("True curing demand (input file)", round(orig_total)),
         ("SKUs in true demand", orig_skus),
         ("Schedulable SKUs (curing∩building history)", len(overlap)),
         ("SKUs actually scheduled (feasible)", len(planned_by_sku)),
@@ -559,6 +572,8 @@ def phaseC2_final_curing(cfg: CBCConfig, engine) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════
 def run_cbc(cfg: CBCConfig | None = None):
     cfg = cfg or CBCConfig()
+    # Keep the curing scheduler's horizon equal to the planning window.
+    curing_lp.Config.PLANNING_DAYS = PLANNING_DAYS
     engine = cbc_env.make_engine()
     feed_map = phase0_feed_map(cfg)
     curing_results = phaseC_curing(cfg, feed_map, engine)
@@ -583,6 +598,7 @@ def run_final_only(cfg: CBCConfig | None = None):
     output (no full pipeline re-run). Installs feed-awareness from the saved
     feed map so eligibility matches the main run."""
     cfg = cfg or CBCConfig()
+    curing_lp.Config.PLANNING_DAYS = PLANNING_DAYS
     engine = cbc_env.make_engine()
     try:
         feed_map = load_feed_map(cfg.FEED_MAP_JSON)
