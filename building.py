@@ -959,9 +959,15 @@ class ExcelExporter:
         # Headline KPIs printed at the top of every sheet title bar.
         td  = int(df_sum["Net_GT_Demand"].sum()) if not df_sum.empty else 0
         tp  = int(df_sum["Planned_GT"].sum())    if not df_sum.empty else 0
-        pct = round(tp/td*100,1) if td else 0
+        # Fulfilment = demand actually COVERED, capped per SKU at its own demand.
+        # Total built (tp) can exceed demand via shelf-life topup pre-build and
+        # whole-cycle rounding, but that surplus does not "fulfil" demand, so it
+        # must not inflate the % past 100.
+        met = (int(np.minimum(df_sum["Planned_GT"], df_sum["Net_GT_Demand"]).sum())
+               if not df_sum.empty else 0)
+        pct = round(met/td*100,1) if td else 0
         stv = int((df_stv["Status"]=="STARVATION").sum()) if not df_stv.empty else 0
-        kpi = (f"GT Demand: {td:,}  |  Planned: {tp:,}  |  "
+        kpi = (f"GT Demand: {td:,}  |  Built: {tp:,}  |  "
                f"Fulfillment: {pct}%  |  Starvation: {stv}")
 
         with pd.ExcelWriter(self.path, engine="openpyxl") as writer:
@@ -1057,6 +1063,15 @@ class ExcelExporter:
 
             # 3. GT Machine Schedule
             c2 = ["Machine","SKUCode","Units","Mins_Used","CT_Min","ShiftIdx"]
+            # cat() returns a column-less empty frame when NO LP allocation rows
+            # were produced across the whole horizon (e.g. GT GA returned no
+            # matched allocation and the schedule was filled by topup only).
+            # Guarantee the expected columns so the sort/sheet-write doesn't
+            # KeyError — the sheet is simply empty in that case.
+            if df_gt.empty or "Machine" not in df_gt.columns:
+                df_gt = pd.DataFrame(columns=c2)
+            if df_s1.empty or "Machine" not in df_s1.columns:
+                df_s1 = pd.DataFrame(columns=c2)
             (df_gt.sort_values(["Machine","ShiftIdx","SKUCode"])
              .to_excel(writer, sheet_name="GT Machine Schedule", index=False))
             ws2 = writer.book["GT Machine Schedule"]
@@ -1360,7 +1375,13 @@ class LPMinuteSolver:
                     r[0, sli(si, tau)] = -1.0
                 rows.append(r); bvals.append(-need)
 
-        # MIN_CAMPAIGN per active y
+        # MIN_CAMPAIGN per active y — collected SEPARATELY so it can be dropped
+        # if it makes the LP infeasible. A hard 45-min floor on EVERY active
+        # (SKU,machine) pair is unsatisfiable when the GA packs many SKUs onto
+        # one machine (45·n + CO·(n−1) > day minutes). Left as a hard constraint
+        # that would make the WHOLE LP infeasible → nothing builds → topup masks
+        # it. Treated as a best-effort preference instead (see two-pass solve).
+        mc_rows, mc_bvals = [], []
         min_camp = float(Config.MIN_CAMPAIGN_MINS)
         for si in range(S):
             for mi in range(M):
@@ -1368,7 +1389,7 @@ class LPMinuteSolver:
                     r = new_row()
                     for t in range(T):
                         r[0, xi(si, mi, t)] = -1.0
-                    rows.append(r); bvals.append(-min_camp)
+                    mc_rows.append(r); mc_bvals.append(-min_camp)
 
         # LOCK
         lock_min = float(Config.LOCKED_MIN_SHIFT0_MINS)
@@ -1396,11 +1417,23 @@ class LPMinuteSolver:
                             r[0, xi(si, mi, t)] = 1.0 / ct
             rows.append(r); bvals.append(max(rhs, 0.0))
 
-        A_ub = sp_vstack(rows).tocsr() if rows else None
-        b_ub = np.array(bvals, dtype=float) if bvals else None
         bounds = [(0.0, ub[i]) for i in range(n_vars)]
 
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        def _run(extra_rows, extra_b):
+            all_rows = rows + extra_rows
+            all_b    = bvals + extra_b
+            A_ub = sp_vstack(all_rows).tocsr() if all_rows else None
+            b_ub = np.array(all_b, dtype=float) if all_b else None
+            return linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+
+        # Pass 1: with the min-campaign floor. Pass 2 (fallback): without it, so
+        # an over-packed machine assignment still yields a producing schedule
+        # rather than a globally-infeasible LP (which would build nothing).
+        res = _run(mc_rows, mc_bvals)
+        min_campaign_relaxed = False
+        if (not res.success or res.x is None) and mc_rows:
+            res = _run([], [])
+            min_campaign_relaxed = True
         if not res.success or res.x is None:
             return None, float("inf"), {"status": res.status}
 
@@ -1421,6 +1454,7 @@ class LPMinuteSolver:
         return x_sol, res.fun, {
             "units": units, "slack": slack_total, "y_sum": int(y.sum()),
             "distinct_produced": distinct_produced,
+            "min_campaign_relaxed": min_campaign_relaxed,
         }
 
 
@@ -2439,7 +2473,11 @@ class HybridDailyScheduler:
         # Fulfilment + utilisation + starvation
         td  = int(df_summary["Net_GT_Demand"].sum()) if not df_summary.empty else 0
         tp  = int(df_summary["Planned_GT"].sum())    if not df_summary.empty else 0
-        pct = round(tp / td * 100, 1) if td else 0.0
+        # capped per-SKU coverage (see build_summary KPI note) — never > 100%
+        met = (int(np.minimum(df_summary["Planned_GT"], df_summary["Net_GT_Demand"]).sum())
+               if not df_summary.empty else 0)
+        pct = round(met / td * 100, 1) if td else 0.0
+        over = max(tp - met, 0)
         full = (df_summary["Status"] == "FULLY MET").sum() if not df_summary.empty else 0
         part = (df_summary["Status"] == "PARTIAL").sum()   if not df_summary.empty else 0
         unmet= (df_summary["Status"] == "UNMET").sum()     if not df_summary.empty else 0
@@ -2449,7 +2487,8 @@ class HybridDailyScheduler:
         u_s1 = df_util_s1["Utilization_Pct"].mean() if not df_util_s1.empty else 0.0
 
         print(f"\n  Net GT demand        : {td:>10,}")
-        print(f"  Planned (built)      : {tp:>10,}  ({pct}%)")
+        print(f"  Demand met (capped)  : {met:>10,}  ({pct}%)")
+        print(f"  Total built          : {tp:>10,}  (+{over:,} over-build: topup/rounding)")
         print(f"  SKUs Fully met       : {full:>10}")
         print(f"  SKUs Partial         : {part:>10}")
         print(f"  SKUs Unmet           : {unmet:>10}")

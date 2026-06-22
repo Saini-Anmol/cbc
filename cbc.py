@@ -58,6 +58,16 @@ OUT = cbc_env.OUTPUT_DIR
 MAIN_OUT = os.path.join(OUT, "main_output")
 os.makedirs(MAIN_OUT, exist_ok=True)
 
+# Building PDE (production-event) history — the monthly exports under
+# data/input/building pde/. These supply both the feed-map builder (Phase 0)
+# and the Phase-C2 building-history feasibility check. Replaces the old single
+# productionevent_data.csv. Each file has workcenter / RecipeCode / DtandTime.
+BUILDING_PDE_FILES = [
+    os.path.join("building pde", "april_pde.csv"),
+    os.path.join("building pde", "maypde.csv"),
+    os.path.join("building pde", "junepde.csv"),
+]
+
 
 def _feed_cfg() -> FeedMapConfig:
     """Feed-map config pointed at the real data files (data/input) with the
@@ -65,7 +75,7 @@ def _feed_cfg() -> FeedMapConfig:
     return FeedMapConfig(
         INPUT_DIR=IN,
         CURING_EVENTS_FILE="CURING_PCR 1.csv",     # wcID, recipeID, dtandTime
-        BUILDING_EVENTS_FILE="productionevent_data.csv",  # full ~14-day building log
+        BUILDING_EVENTS_FILE=BUILDING_PDE_FILES,    # monthly building-pde exports
         RECIPE_MASTER_FILE="RECIPE_MASTER.csv",    # iD -> description (recipe code)
         WC_MASTER_FILE="WCMASTER.csv",             # iD -> name (curing press)
         NAME_MAP_FILE=None,                        # use built-in workcenter->code map
@@ -353,9 +363,11 @@ def _historical_overlap(cfg: CBCConfig):
                        rm["description"].astype(str).str.strip().str.upper()))
     cur = pd.read_csv(cbc_env.in_path("CURING_PCR 1.csv"), usecols=["recipeID"])
     cur_hist = set(cur["recipeID"].astype(str).str.strip().map(id2code).dropna())
-    bh = pd.read_csv(cbc_env.in_path("productionevent_data.csv"),
-                     usecols=["RecipeCode"], low_memory=False)
-    bld_hist = set(bh["RecipeCode"].astype(str).str.strip().str.upper())
+    bld_hist: set[str] = set()
+    for f in BUILDING_PDE_FILES:
+        bh = pd.read_csv(cbc_env.in_path(f), usecols=["RecipeCode"],
+                         low_memory=False)
+        bld_hist |= set(bh["RecipeCode"].astype(str).str.strip().str.upper())
 
     raw = pd.read_excel(cfg.CUR_DEMAND)
     dem_skus = set(raw["SKUCode"].astype(str).str.strip().str.upper())
@@ -586,7 +598,13 @@ def run_final_only(cfg: CBCConfig | None = None):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "final":
+    args = sys.argv[1:]
+    if "final" in args:
         run_final_only()
     else:
-        run_cbc()
+        # `python cbc.py rebuild` (or REBUILD_FEED_MAP=1) rebuilds the feed map
+        # from the building-pde files before running the pipeline. Use this after
+        # adding/refreshing the building-pde exports; otherwise the saved
+        # feed_map.json is reused.
+        rebuild = "rebuild" in args or os.environ.get("REBUILD_FEED_MAP") in ("1", "true", "True")
+        run_cbc(CBCConfig(REBUILD_FEED_MAP=True) if rebuild else None)

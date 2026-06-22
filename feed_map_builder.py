@@ -53,7 +53,9 @@ class FeedMapConfig:
 
     # ── input file names ────────────────────────────────────────────────
     CURING_EVENTS_FILE: str = "curing_events.xlsx"      # wcID, recipe id, dt
-    BUILDING_EVENTS_FILE: str = "building_events.xlsx"  # workcenter, recipecode, dt
+    # One filename, or a list/tuple of filenames to concatenate (e.g. monthly
+    # building-pde exports). Each must expose workcenter / recipecode / timestamp.
+    BUILDING_EVENTS_FILE: "str | list | tuple" = "building_events.xlsx"
     RECIPE_MASTER_FILE: str = "recipe_master.xlsx"      # recipe id -> recipecode
     WC_MASTER_FILE: str = "wc_master.xlsx"              # wcID -> curing press code
     NAME_MAP_FILE: str | None = "building_name_map.xlsx"  # workcenter -> machine code
@@ -212,12 +214,24 @@ class FeedMapBuilder:
 
     def _load_building(self) -> pd.DataFrame:
         cfg = self.cfg
-        bpath = cfg.path(cfg.BUILDING_EVENTS_FILE)
-        hdr = _read_header(bpath)
-        wc = _pick_col(hdr, cfg.BLD_WC_COLS, "building workcenter")
-        rc = _pick_col(hdr, cfg.BLD_RECIPE_COLS, "building recipecode")
-        tcol = _pick_col(hdr, cfg.BLD_TIME_COLS, "building timestamp")
-        df = _read_any(bpath, usecols=[wc, rc, tcol])
+        # Accept a single filename or a list/tuple of files (monthly exports).
+        files = cfg.BUILDING_EVENTS_FILE
+        if isinstance(files, (str, bytes)):
+            files = [files]
+        parts = []
+        for fname in files:
+            bpath = cfg.path(fname)
+            hdr = _read_header(bpath)
+            wc = _pick_col(hdr, cfg.BLD_WC_COLS, "building workcenter")
+            rc = _pick_col(hdr, cfg.BLD_RECIPE_COLS, "building recipecode")
+            tcol = _pick_col(hdr, cfg.BLD_TIME_COLS, "building timestamp")
+            d = _read_any(bpath, usecols=[wc, rc, tcol])
+            # standardise to fixed names so files with differing headers concat cleanly
+            d = d.rename(columns={wc: "_wc", rc: "_rc", tcol: "_t"})
+            parts.append(d[["_wc", "_rc", "_t"]])
+            print(f"  [Building] {os.path.basename(bpath)}: {len(d):,} rows")
+        df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        wc, rc, tcol = "_wc", "_rc", "_t"
 
         # workcenter -> machine code
         if cfg.NAME_MAP_FILE and os.path.exists(cfg.path(cfg.NAME_MAP_FILE)):
