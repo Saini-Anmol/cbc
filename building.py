@@ -83,6 +83,12 @@ class Config:
     MIN_CAMPAIGN_UNITS      = 40
     BUFFER_SHIFTS           = 1
     URGENT_THRESHOLD_HOURS  = 16.0
+    # Match building to curing demand EXACTLY: the per-day LP may not build a SKU
+    # beyond its net curing demand (gross − opening WIP). 0.0 = build exactly the
+    # GTs curing needs, no surplus. (Raise this fraction only if you want a small
+    # build-ahead buffer; whole-tyre rounding in the schedule builder may still
+    # round a campaign to the nearest whole cycle.)
+    OVERBUILD_BUFFER_FRAC   = 0.0
 
     # ── Hard caps used by the LP and reports ─────────────────────────
     QTY_MAX_OVER_DEMAND    = 5000
@@ -737,8 +743,15 @@ class StarvationValidator:
 def build_summary(df_sku_demand, df_all):
     prod = (
         df_all[~df_all["SKUCode"].isin(["CHANGEOVER","MOULD_CLEAN"])]
-        if not df_all.empty else pd.DataFrame(columns=["SKUCode","Qty"])
+        if not df_all.empty else pd.DataFrame(columns=["SKUCode","Qty","Machine"])
     )
+    # GT demand is satisfied ONLY by GT machines (Stage-2 + Unistage). Stage-1
+    # carcass output is a separate upstream WIP stage that FEEDS green-tyre
+    # building — counting it as "Planned_GT" double-counts and inflates the
+    # built/fulfilment numbers, so restrict to GT machines here.
+    gt_machines = set(map(str, Config.STAGE2 | Config.UNISTAGE))
+    if not prod.empty and "Machine" in prod.columns:
+        prod = prod[prod["Machine"].astype(str).isin(gt_machines)]
     planned = prod.groupby("SKUCode")["Qty"].sum().to_dict()
     rows = []
     for _, r in df_sku_demand.iterrows():
@@ -1416,6 +1429,30 @@ class LPMinuteSolver:
                         for t in range(T):
                             r[0, xi(si, mi, t)] = 1.0 / ct
             rows.append(r); bvals.append(max(rhs, 0.0))
+
+        # PRODUCTION CAP per SKU — keep building MATCHED to curing demand rather
+        # than maximizing throughput to capacity. Units built for a SKU this day
+        # may not exceed its net demand (gross − opening WIP) × (1 + buffer).
+        # Floored at the locked minimum so continuity locks never make it
+        # infeasible. Σ_{m,t} x[s,m,t]/ct ≤ cap_units[s].
+        buf = 1.0 + float(getattr(Config, "OVERBUILD_BUFFER_FRAC", 0.10))
+        locked_floor = np.zeros(S)
+        for m_lock, sku_lock in locked_pairs:
+            if m_lock in m_idx and sku_lock in sku_idx and y[sku_idx[sku_lock], m_idx[m_lock]] >= 0.5:
+                ctl = ct_map.get(m_lock, 2.0)
+                if ctl > 0:
+                    locked_floor[sku_idx[sku_lock]] += lock_min / ctl
+        for si, sku in enumerate(sku_list):
+            gross = float(curing_matrix[si].sum())
+            wip0  = float(inv_init.get(sku, 0))
+            cap_units = max(max(0.0, gross - wip0) * buf, float(locked_floor[si]))
+            r = new_row()
+            for mi, mach in enumerate(machines):
+                ct = ct_map.get(mach, 2.0)
+                if ct > 0:
+                    for t in range(T):
+                        r[0, xi(si, mi, t)] = 1.0 / ct
+            rows.append(r); bvals.append(cap_units)
 
         bounds = [(0.0, ub[i]) for i in range(n_vars)]
 
