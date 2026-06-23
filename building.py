@@ -2576,10 +2576,13 @@ def run_from_database_hybrid(plan_start=None, output_path=None):
     history_map    = etl.load_history_map()
 
     # ── Whole-month build with a one-day lead ────────────────────────────
-    # Building day D produces the GTs that curing consumes on day D+1.
-    # Shift curing back LEAD_DAYS so run()'s same-day matching aligns
-    # building day D (from plan_start = May 31) to curing day D+1 (June 1…),
-    # covering all 30 curing days across May 31 → June 29.
+    # Building day D produces the GTs that curing consumes on day D+1, so we
+    # shift the curing plan back LEAD_DAYS AND start building's window LEAD_DAYS
+    # earlier. Both must move together: shifting only the curing (not the window)
+    # pushed the first curing day before plan_start, silently dropping ~1 day of
+    # demand (e.g. 25,810 GTs for June) and collapsing the last building day.
+    # With the window aligned, building plans [plan_start-LEAD_DAYS … +DAYS) and
+    # covers ALL curing days.
     # Cold start: opening GT/carcass inventory = zero (the day-before-curing
     # build stocks day 1) and no machine is pre-locked mid-run; inventory
     # then rolls forward internally.
@@ -2587,18 +2590,20 @@ def run_from_database_hybrid(plan_start=None, output_path=None):
     df_curing = df_curing.copy()
     df_curing["StartTime"] = df_curing["StartTime"] - pd.Timedelta(days=LEAD_DAYS)
     df_curing["EndTime"]   = df_curing["EndTime"]   - pd.Timedelta(days=LEAD_DAYS)
+    build_start    = plan_start - timedelta(days=LEAD_DAYS)
     df_gt_inv      = pd.DataFrame(columns=["SKUCode", "GT_Inventory"])
     df_carcass_inv = pd.DataFrame(columns=["SKUCode", "Carcass_Inventory"])
     df_running     = pd.DataFrame(columns=["Machine", "SKUCode"])
 
     print(f"\n[v8 Hybrid] Rolling {Config.PLANNING_DAYS}-day horizon as "
-          f"{Config.PLANNING_DAYS} × (GA + LP) per day")
+          f"{Config.PLANNING_DAYS} × (GA + LP) per day "
+          f"(build window starts {build_start:%Y-%m-%d}, one day ahead of curing)")
 
     scheduler = HybridDailyScheduler()
     results = scheduler.run(
         df_curing, df_gt_inv, df_carcass_inv,
         df_allow, co_map, sku_to_size, df_running,
-        plan_start,
+        build_start,
         history_map=history_map,
     )
     ExcelExporter(output_path).export(results)

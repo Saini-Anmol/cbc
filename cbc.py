@@ -485,15 +485,18 @@ def phaseC2_final_curing(cfg: CBCConfig, engine) -> dict | None:
     # ── #2 historical overlap ────────────────────────────────────────────
     overlap, infeasible_reasons = _historical_overlap(cfg)
 
-    # ── building time-phased GT supply + opening inventory ───────────────
+    # ── building time-phased GT supply ───────────────────────────────────
     gt_built = _building_gt_timeline(cfg)
     from collections import defaultdict
     supply_total = defaultdict(float)
     for (s, _d, _sh), q in gt_built.items():
         supply_total[s] += q
-    opening = _opening_gt_inventory(engine)
+    # Opening GT inventory is intentionally NOT used: building and curing-1 both
+    # start cold (no opening GT), so curing-2 is capped purely by what building
+    # produced this run — keeping all three stages symmetric.
+    opening: dict = {}
 
-    # ── demand: Book4 → overlap SKUs only → cap at building GT total + opening
+    # ── demand: input file → overlap SKUs only → cap at building GT total
     raw = pd.read_excel(cfg.CUR_DEMAND)
     qcol = "Updated_Requirement" if "Updated_Requirement" in raw.columns else "Requirement"
     pcol = "ConsolidatedPriorityScore"
@@ -546,23 +549,31 @@ def phaseC2_final_curing(cfg: CBCConfig, engine) -> dict | None:
                                         infeasible_reasons=infeasible_reasons)
 
     # ── summary ──────────────────────────────────────────────────────────
+    # Total GT that building actually produced (per-SKU GT supply) — final curing
+    # is physically bounded by this. Report curing-2 BOTH vs true demand AND vs
+    # the GT building made, so the chain reads: demand → curing1 → GT → curing2.
+    gt_built_total = int(sum(supply_total.values()))
+    gt_pct = f"{100.0 * planned / gt_built_total:.1f}%" if gt_built_total else "n/a"
     summary = pd.DataFrame([
         ("True curing demand (input file)", round(orig_total)),
         ("SKUs in true demand", orig_skus),
         ("Schedulable SKUs (curing∩building history)", len(overlap)),
         ("SKUs actually scheduled (feasible)", len(planned_by_sku)),
         ("SKUs infeasible: no historical data", len(infeasible_reasons)),
+        ("Total GT built by building", gt_built_total),
         ("Curing planned before feasibility trim", round(raw_planned)),
         ("Trimmed: cured-before-built (day/shift)", round(trimmed)),
         ("Final feasible curing planned", round(planned)),
+        ("Curing-2 vs GT built %", gt_pct),
         ("True fulfilment % (feasible vs true demand)",
          f"{100.0 * planned / orig_total:.1f}%" if orig_total else "n/a"),
     ], columns=["Metric", "Value"])
     with pd.ExcelWriter(cfg.FINAL_CURING_OUTPUT, engine="openpyxl", mode="a",
                         if_sheet_exists="replace") as xw:
         summary.to_excel(xw, sheet_name="CBC True-Demand Summary", index=False)
-    print(f"  [Phase C2] feasible final curing → {100.0*planned/orig_total:.1f}% "
-          f"of true demand ({int(planned):,}/{int(orig_total):,})")
+    print(f"  [Phase C2] final curing planned {int(planned):,}  |  "
+          f"GT built {gt_built_total:,} ({gt_pct} of GT)  |  "
+          f"{100.0*planned/orig_total:.1f}% of true demand ({int(planned):,}/{int(orig_total):,})")
     print(f"\n  [Phase C2] final curing schedule -> {cfg.FINAL_CURING_OUTPUT}")
     return results
 

@@ -15,9 +15,9 @@ How it plugs in
 `install_feed_awareness()` monkeypatches
 `MouldTracker.get_eligible_machines_with_moulds` in curing_lp.py. That method
 already decides which presses a SKU may run on (mould + continuity logic); we
-wrap it so the result is additionally intersected with "presses whose feeders
-can build this SKU". Net effect: the LP can never assign a SKU to a press its
-building machines can't feed -> the structural starvation cases disappear.
+wrap it so the result is additionally checked against feed feasibility. The test
+uses the UNION of the press's feeder machines and the SKU's allowable building
+machines (looser than the old intersection rule — see FeedAwareFilter.can_feed).
 
 Usage
 -----
@@ -129,14 +129,21 @@ class FeedAwareFilter:
         return set(self.feed_map.get(self._norm(press), ()))
 
     def can_feed(self, sku, press) -> bool:
-        """True if at least one feeder of `press` can build `sku`."""
+        """Feed-feasible test (UNION mode).
+
+        Keeps the press when the UNION of the press's feeder machines and the
+        SKU's allowable building machines is non-empty — i.e. as long as the
+        press has known feeders AND the SKU is buildable somewhere. This is
+        looser than the old INTERSECTION rule (which required an actual feeder
+        of the press to be able to build that specific SKU).
+        """
         feeders = self.feeders(press)
         if not feeders:
             return self.keep_unknown_press
         builders = self.building_allowable.get(self._norm(sku))
         if builders is None:
             return self.keep_unknown_sku
-        return bool(feeders & {self._norm(b) for b in builders})
+        return bool(feeders | {self._norm(b) for b in builders})
 
     def filter_presses(self, sku, candidate_presses, continuity_presses=None) -> list:
         """

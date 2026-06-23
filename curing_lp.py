@@ -119,6 +119,11 @@ class Config:
     CLEANING_DURATION_MIN   = 120
     LOAD_UNLOAD_BUFFER_MIN  = 2.3
     PRESS_EFFICIENCY        = 0.94
+    # Default EFFECTIVE cycle time (min) for demand SKUs missing from the
+    # cycle-time master. This is the FINAL per-cycle value — it ALREADY includes
+    # the load/unload buffer and press efficiency, so it is used directly and NOT
+    # run through (raw + buffer) / efficiency again.
+    DEFAULT_CYCLE_TIME_MIN  = 17.0
 
     # ── changeover scheduling ─────────────────────────────────────────────────
     MAX_CHANGEOVERS_PER_SHIFT = 5
@@ -986,7 +991,7 @@ class JK_LP_Curing_Scheduler_v2:   # name kept for backwards compatibility
             sku      = r["SKUCode"]
             qty      = int(r["Quantity"])
             priority = r["Priority"]
-            ct       = cycle_map.get(sku, 15)
+            ct       = cycle_map.get(sku, Config.DEFAULT_CYCLE_TIME_MIN)
             machines = mach_map.get(sku, [])
             gt       = int(gt_map.get(sku, 0))
             dm       = math.ceil(qty / Config.CAVITIES_PER_MOULD) * ct if ct else 0
@@ -1054,7 +1059,7 @@ class JK_LP_Curing_Scheduler_v2:   # name kept for backwards compatibility
         for _, row in df_running.iterrows():
             mach = str(row["Machine"])
             sku  = str(row["SKUCode"])
-            ct   = cycle_map.get(sku, 15)
+            ct   = cycle_map.get(sku, Config.DEFAULT_CYCLE_TIME_MIN)
             if not ct:
                 locked_mins[mach] = 0.0
                 continue
@@ -1588,8 +1593,8 @@ def run_from_excel(
     return results
 
 
-_DEFAULT_CT_MIN = 15.0          # default RAW cure time (min) for SKUs missing in master;
-                                # (raw + buffer) / efficiency is applied like any other SKU
+# Default cycle time for SKUs missing in master now lives in
+# Config.DEFAULT_CYCLE_TIME_MIN (EFFECTIVE minutes, used directly).
 
 
 def _post_process_schedule_excel(path: str, default_ct_skus: set) -> None:
@@ -1784,20 +1789,20 @@ def run_from_database_simple(
     df_running = etl.load_running_moulds()
     df_mould_m = etl.load_mould_master()
 
-    # Default cycle time for demand SKUs missing in the cycle-time master
-    # (same (raw+buffer)/efficiency treatment as run_from_database).
+    # Default cycle time for demand SKUs missing in the cycle-time master.
+    # Config.DEFAULT_CYCLE_TIME_MIN is already EFFECTIVE (post buffer+efficiency),
+    # so it is used directly.
     have_ct     = set(df_cycles["SKUCode"].astype(str))
     demand_skus = set(df_demand["SKUCode"].astype(str))
     missing_ct  = demand_skus - have_ct
     if missing_ct:
-        default_ct = float(np.round(
-            (_DEFAULT_CT_MIN + Config.LOAD_UNLOAD_BUFFER_MIN) / Config.PRESS_EFFICIENCY
-        ))
+        default_ct = float(Config.DEFAULT_CYCLE_TIME_MIN)
         df_cycles = pd.concat(
             [df_cycles, pd.DataFrame({"SKUCode": sorted(missing_ct),
                                       "CycleTime_min": default_ct})],
             ignore_index=True)
-        print(f"[Phase 0] CT default applied to {len(missing_ct)} SKU(s).")
+        print(f"[Phase 0] CT default {default_ct:.0f} min (effective) applied "
+              f"to {len(missing_ct)} SKU(s).")
 
     tracker = MouldTracker()
     tracker.load_from_df(df_mould_m, df_running)
@@ -1873,26 +1878,22 @@ def run_from_database(
     df_mould_m = etl.load_mould_master()
 
     # ── Inject default cycle time for demand SKUs missing in master ──
-    # The default 15 min is a RAW cure time, so it goes through the SAME
-    # (raw + buffer) / efficiency formula used for every other SKU in
-    # ETL.load_cycle_times — default SKUs are then scheduled on a comparable
-    # basis (press load/unload buffer + efficiency included). Their
-    # CycleTime_min still displays as "NA" in the final Excel via
-    # _post_process_schedule_excel to flag the missing-master-data status.
+    # Config.DEFAULT_CYCLE_TIME_MIN is an EFFECTIVE cycle time (already includes
+    # the load/unload buffer and press efficiency), so it is used directly — not
+    # re-run through (raw + buffer) / efficiency. Their CycleTime_min still
+    # displays as "NA" in the final Excel via _post_process_schedule_excel to
+    # flag the missing-master-data status.
     have_ct      = set(df_cycles["SKUCode"].astype(str))
     demand_skus  = set(df_demand["SKUCode"].astype(str))
     missing_ct   = demand_skus - have_ct
     if missing_ct:
-        default_ct = float(np.round(
-            (_DEFAULT_CT_MIN + Config.LOAD_UNLOAD_BUFFER_MIN) / Config.PRESS_EFFICIENCY
-        ))
+        default_ct = float(Config.DEFAULT_CYCLE_TIME_MIN)
         extra = pd.DataFrame(
             {"SKUCode": sorted(missing_ct), "CycleTime_min": default_ct}
         )
         df_cycles = pd.concat([df_cycles, extra], ignore_index=True)
         print(f"[Phase 0] CT default applied to {len(missing_ct)} SKU(s) "
-              f"(raw {_DEFAULT_CT_MIN} + buffer {Config.LOAD_UNLOAD_BUFFER_MIN} "
-              f"/ eff {Config.PRESS_EFFICIENCY} = {default_ct} min — shown as 'NA' in output)")
+              f"({default_ct:.0f} min effective — shown as 'NA' in output)")
 
     tracker = MouldTracker()
     tracker.load_from_df(df_mould_m, df_running)
