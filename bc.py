@@ -105,11 +105,9 @@ class BCConfig:
     ANALYSIS_OUTPUT: str = os.path.join(MAIN_OUT, "bc_analysis.xlsx")
 
     # Pipeline control
-    # Phase 2 (curing) and Phase 3 (analysis) are deferred until the building
-    # schedule is reviewed and a curing approach is decided.
     RUN_BUILDING:  bool = True
-    RUN_CURING:    bool = False
-    RUN_ANALYSIS:  bool = False
+    RUN_CURING:    bool = True
+    RUN_ANALYSIS:  bool = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════

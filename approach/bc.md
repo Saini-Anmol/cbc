@@ -33,30 +33,44 @@ the curing schedule is **fully derived** from it. Direction is the reverse of C2
 GT inventory is loaded from `gt_inventory_manual` at plan start. This is **not** a cold start for curing.
 
 ```
-GT_inventory(SKU, start) = gt_inventory_manual.gtInventory[SKU]   (from DB)
-Carcass_inventory         = 0   (building stage always starts fresh)
+GT_inventory(SKU, start)      = gt_inventory_manual.gtInventory[SKU]   (from DB)
+Carcass_inventory(SKU, start) = 0   (B2C cold start — Stage-2 waits for Stage-1 output)
 ```
+
+**Carcass cold start rationale:** Stage-2 GT machines depend on Stage-1 carcass output.
+Opening carcass inventory is assumed **zero**. Stage-2 is blocked until Stage-1 produces
+in the same or earlier shift. Unistage machines are unaffected (they produce GT directly
+with no Stage-1 dependency).
 
 Opening GT inventory acts as a Day-1 buffer: curing can start immediately on
 June 1 Shift A using existing stock, even before the building pre-shift completes.
 It does not change the steady-state daily/monthly production rate — it is a
 one-time boost to early demand fulfillment.
 
-### 2.2 Building Pre-Start — One Shift Before
+### 2.2 Building Pre-Start — One Full Day Before Curing
 
-Building starts exactly **1 shift before** curing, not 1 full day.
+Building starts **1 full day (3 shifts = `BUILD_LEAD_SHIFTS`) before** curing consumption begins.
 
 ```
 Example: Curing starts  June 1  Shift A (07:00)
-         Building starts May 31 Shift C (23:00)  ← exactly 1 shift prior
+         Building starts May 31 Shift A (07:00)  ← 3 shifts = 1 full day prior
 ```
 
-- Only Shift C of May 31 is the pre-production shift.
-- Machine running state is taken from `Daily_Running_Moulds` as of the
-  **curing start date** (June 1 snapshot), not May 31.
-- GT produced in May 31 Shift C is available for Curing June 1 Shift A
-  (satisfies the S-1 preferred case of the hard constraint).
-- Opening GT inventory supplements May 31 Shift C output for early curing shifts.
+**Why 1 day ahead (`BUILD_LEAD_SHIFTS = 3`)**:
+- LP cap: `cap = max(0, gross_curing − opening_WIP)`. In same-day mode Day 2+ WIP ≈ Day 2 demand → cap ≈ 0 → machines idle.
+- Lead-time fix: each day's LP targets the NEXT day's curing demand. WIP is net-adjusted by subtracting today's curing (`gt_inv_for_cap = wip0 − today_cure`) before comparing to tomorrow's gross demand. LP sees full tomorrow demand every day.
+
+```
+May 31 (Shifts A→C): Building targets June 1 curing demand   ← 3-shift pre-start
+June 1 (Shifts A→C): Building targets June 2 curing demand
+June 2 (Shifts A→C): Building targets June 3 curing demand
+...
+Last planning day: no Day+1 demand → falls back to today's demand automatically.
+```
+
+- Machine running state is taken from `Daily_Running_Moulds` as of the **curing start date** (June 1 snapshot).
+- Opening GT inventory supplements May 31 output for early June 1 curing shifts.
+- Starvation validation and inventory roll always use **today's** actual curing demand, not the lead window.
 
 ---
 
@@ -75,10 +89,13 @@ Example: Curing starts  June 1  Shift A (07:00)
 Changeover always takes Shift A (of the assigned day). Mould clean takes Shift B.
 First production of new SKU = Shift C onward.
 
+> **Curing changeover cap: MAX 8 curing press changeovers per day (plant-wide hard limit).**
+> Building machine changeovers are UNLIMITED — no daily cap applies.
+
 ### 3.2 Building Machine — FREE in shift S means ALL of:
 ```
 ✗ NOT committed to any SKU production assignment
-✗ NOT in a building changeover window
+✗ NOT in a building changeover window (building COs are UNLIMITED per day)
 
 Spare-minutes check — a machine with leftover minutes is only FREE for a new SKU if:
   usable_spare = shift_remaining_min - changeover_cost(new_SKU)
@@ -243,6 +260,32 @@ Non-Runner-In:
   unit_GT_per_press(SKU) = qty_per_press_per_shift(SKU)  [multiplier = 0 now]
 ```
 
+### 6.3a GT Building Target — Demand Cap Rule
+
+> **Building output for any SKU must NEVER exceed customer demand.**
+
+```
+demand_per_shift(SKU) = Demand_Qty(SKU) / (planning_days × SHIFTS_PER_DAY)
+
+building_target_per_shift(SKU) = min(
+    total_GT_per_shift(SKU),   ← curing press consumption (physics ceiling)
+    demand_per_shift(SKU)      ← customer demand (business cap)
+)
+```
+
+When `demand_per_shift < total_GT_per_shift` (demand is met before month-end):
+- Building stops for that SKU once cumulative output = `Demand_Qty`
+- The freed curing press enters the changeover queue → reassigned to an NRI SKU
+
+For Non-Runner-In SKUs: building target = `demand_per_shift` (same formula, press consumption = 0 initially).
+
+### 6.3b NRI SKU Building Start
+
+Non-Runner-In SKUs do **not** wait for a curing press changeover confirmation before building starts.
+Building machines are assigned to NRI SKUs immediately (including Unistage machines 7001/7002/7003).
+Curing press changeovers for NRI SKUs are planned in parallel and limited to 8/day.
+GT built for NRI SKUs before their curing press CO will sit in GT inventory until the press is ready.
+
 ### 6.4 Dynamic Press Count Initialisation
 
 ```
@@ -272,6 +315,65 @@ All per-shift building targets and curing consumption use this table.
 ---
 
 ## 7. Phase 1a — Runner-In Building (Stage-1 + Stage-2 + Unistage)
+
+### 7.0 Machine Stages — Physical Setup (CONFIRMED)
+
+Three building stage groups — 39 machines total.
+**Source of truth:** column names of `Master_Building_Allowable_Machines_source` (39 numeric columns).
+
+```
+Stage-1  (Carcass machines — 15 machines)
+  Machines: 6801, 6802, 6803, 6909, 6911,
+            7601, 7701,
+            7801, 7802, 7803, 7804,
+            8001, 8002, 8003, 8101
+  Output  : Carcass (semi-finished tyre body) → feeds Stage-2 GT machines
+  Flow    : EVERY Stage-2 tyre also needs a Stage-1 carcass (two-step process)
+  SKUs    : 53 demand SKUs use the Stage-2 path (require both Stage-1 AND Stage-2)
+  Demand  : ~335,059 units
+
+Stage-2  (GT-from-Carcass machines — 6 machines)
+  Machines: 8201, 8301, 8302, 8501, 8502, 7301
+  Output  : Completed GT tyre — takes Stage-1 carcass as input
+  SKUs    : 53 demand SKUs (same set as Stage-1 above, two-step path)
+  Demand  : ~335,059 GTs
+  Bottleneck: Stage-2 is the constraint (6 machines vs 15 Stage-1 machines)
+
+Unistage  (Independent GT machines — 18 machines)
+  Machines: 6001, 6002, 6003, 6004,
+            7001, 7002, 7003, 7004,
+            7101, 7102, 7103, 7104, 7105, 7106,
+            7201,
+            7501, 7502, 7503
+  Output  : Completed GT tyre — fully independent (no Stage-1 dependency)
+  SKUs    : 94 demand SKUs
+  Demand  : ~397,722 GTs
+```
+
+**Capacity note (building CT ≠ curing CT):**
+```
+No building cycle-time table exists in DB. Curing CT (avg ~17 min) is used as a proxy.
+Actual building CT is much shorter (~2–3 min/tyre for PCR building machines).
+All capacity figures below are APPROXIMATIONS.
+
+Stage-2 capacity (6 machines, curing CT proxy @17 min):  6 × 90 × 56 = 30,240 GTs
+Unistage capacity (18 machines, curing CT proxy @17 min): 18 × 90 × 56 = 90,720 GTs
+```
+
+**7001–7004 constraint (within Unistage):**
+```
+SKUs allowed on any of 7001–7004: 48 SKUs
+Combined demand for those SKUs:   ~224,340 units
+Physical capacity (building CT @2.5 min, 1 cavity): 4×90×192 = 69,120 units
+Physical capacity (building CT @3.0 min, 1 cavity): 4×90×160 = 57,600 units
+
+→ Even at real building CT, demand (224k) is 3–4× capacity (58k–69k).
+  These 4 machines CANNOT satisfy all 224k demand in a 30-day plan.
+  Actual production ~54k ≈ theoretical max → machines were nearly fully utilised.
+  Root cause of low output: 48 SKUs on 4 machines → very short campaigns per SKU,
+  excessive CO time, low effective utilisation per SKU.
+  Fix: reduce distinct SKUs on 7001–7004, run longer campaigns.
+```
 
 ### 7.1 The Two-Level Availability Chain
 
@@ -584,10 +686,11 @@ For each curing shift S, each press P:
 - Stage-1 carcass capacity: 2,459/shift; Stage-2 demand: 2,215/shift → 11% headroom
 - Curing at CT=17 min default: **56 tyres/press/shift**
 
-**Impact of the 3 new updates:**
+**Impact of the 4 updates:**
 - Update 1 (opening GT inventory): Day-1 buffer; no change to daily/monthly rate
 - Update 2 (relaxed S constraint): Stage-2 startup cost eliminated (+2,215 units)
-- Update 3 (1 shift pre-start vs 1 day): Reduced pre-buffer but offset by inventory + relaxed rule
+- Update 3 (1 day pre-start): building day D targets day D+1 curing → LP sees full demand every day, eliminates Day-2+ idle
+- Update 4 (BUILD_LEAD_SHIFTS WIP cap fix): `gt_inv_for_cap = wip0 − today_cure` prevents LP cap collapse in steady state
 
 | KPI | C2B | B2C | Confidence |
 |-----|-----|-----|------------|
@@ -596,7 +699,7 @@ For each curing shift S, each press P:
 | Max changeovers/day | Uncontrolled | **≤ 8** | Hard constraint |
 | Opening GT inventory used | Ignored | **From DB** | Per update 1 |
 | Stage-2 startup idle shifts | 0 | **0** (relaxed rule, S allowed) | Per update 2 |
-| Building pre-production | 3 shifts (1 day) | **1 shift** (May 31 Shift C) | Per update 3 |
+| Building pre-production | 3 shifts (1 day) | **3 shifts / 1 day** (May 31 Shift A) | Per update 3 |
 | Building utilisation | ~65% | **~90–95%** | High-confidence estimate |
 | Curing util — Runner-In (55 presses) | ~80% (starvation) | **~98%** | High estimate |
 | Runner-Out CO complete | Never planned | **Day 4** (25 ÷ 8/day) | Calculated |
@@ -681,13 +784,16 @@ run_b2c(cfg):
 | `DEFAULT_CYCLE_TIME_MIN` | 17.0 | effective CT when SKU missing from DB |
 | `CAVITIES_PER_MOULD` | 2 | tyres per curing cycle |
 | `MOULDS_PER_PRESS` | 2 | tracked for mould-life; not in output formula |
-| `MAX_CURING_CHANGEOVERS_PER_DAY` | 8 | plant-wide; hard constraint |
+| `MAX_CURING_CHANGEOVERS_PER_DAY` | **8 (HARD)** | curing press changeovers only; **no limit on building machine COs** |
 | `CURING_CO_MIN` | 300 | changeover (press OCCUPIED whole shift) |
 | `MOULD_CLEAN_MIN` | 120 | mould clean (press OCCUPIED whole shift) |
 | `OPENING_GT_INVENTORY` | from DB | loaded from `gt_inventory_manual` at plan start |
-| `OPENING_CARCASS_INVENTORY` | 0 | building always starts carcass fresh |
-| `BUILDING_START_OFFSET_SHIFTS` | -1 | building pre-production = 1 shift before curing Shift A |
-| `BUILDING_PRE_SHIFT` | `Shift C of Day-1` | e.g. May 31 Shift C if curing starts June 1 |
+| `OPENING_CARCASS_INVENTORY` | **0 (cold start)** | Stage-2 blocked until Stage-1 produces carcasses in this plan |
+| `BUILDING_GT_CAP` | `min(press_consumption, demand/90)` | building output ≤ customer demand per SKU |
+| `BUILD_LEAD_SHIFTS` | **3** | building targets curing demand this many shifts ahead; 3 = 1 full day |
+| `OVERBUILD_BUFFER_FRAC` | 0.0 | fractional surplus allowed above net curing demand; 0 = exact match |
+| `BUILDING_START_OFFSET_SHIFTS` | -3 | building pre-start = 3 shifts (1 day) before curing Shift A |
+| `BUILDING_PRE_SHIFT` | `Shift A of Day-1` | e.g. May 31 Shift A if curing starts June 1 |
 
 ---
 
@@ -724,3 +830,78 @@ run_b2c(cfg):
 7. **Building machine running state** read from `TBMStage1/2_ProductionEventData` as of `PLAN_START`.
 8. **Mould clean mid-production** (when mould life expires within a running shift, not at CO time):
    effective output = `floor((480 - 120) / CT) × 2`. Accounted for when reading mould life from `Daily_Running_Moulds`.
+9. **NRI building starts without waiting for curing CO.** Building machines (including Unistage 7001/7002/7003) are assigned to NRI SKUs immediately. GT accumulates in inventory until the curing CO is executed. Curing CO limit = 8/day applies separately.
+
+---
+
+## 18. Output Metrics — Definitions
+
+### 18.1 Starvation (in Starvation Report sheet)
+
+**Starvation** = the curing press tries to consume GT that does not yet exist in inventory.
+
+```
+WIP_Balance(SKU, shift S) = Σ(Build_Qty, shifts 0..S) − Σ(Cure_Qty, shifts 0..S)
+
+STARVATION  : WIP_Balance < 0   → curing press idle waiting for GT
+WARNING     : WIP_Balance = 0   → buffer empty; any miss next shift causes starvation
+OK          : WIP_Balance > 0   → healthy surplus buffer
+```
+
+Starvation is a **future-state metric** for Phase 2 (curing). In Phase 1 (building), the Starvation Report represents a projection: if curing ran at full consumption rate, when would each SKU run out of GT?
+
+### 18.2 Total_Units in Machine Utilisation
+
+```
+Total_Units = Σ(production Qty) across ALL building machine types
+
+Breakdown:
+  Stage-2 + Unistage (GT machines) → these are FINISHED GREEN TYRES for curing
+  Stage-1             (Carcass)     → these are SEMI-FINISHED CARCASSES for Stage-2
+
+  GT_Total   = Stage-2 qty + Unistage qty   ← what the Demand header "Built" shows
+  Carcass    = Stage-1 qty                  ← internal intermediate product
+  Total_Units = GT_Total + Carcass          ← both types combined
+```
+
+Example: GT_Total = 621,297 + Carcass = 48,144 → Total_Units = **669,441**.
+
+### 18.3 Low Machine Utilisation — Root Cause Analysis
+
+**GT/Unistage machines (6003, 6004, 7001, 7002, 7003):**
+
+| Machine | Type | Util % | Root Cause |
+|---------|------|--------|-----------|
+| 6003 | Unistage | ~57% | Moderate — mixed NRI SKUs with some CO overhead |
+| 6004 | Unistage | ~54% | Moderate — mixed NRI SKUs with some CO overhead |
+| 7001 | Unistage | ~28% | **Excessive COs** — 30 changeovers / 36 production shifts = 45% of time in CO |
+| 7002 | Unistage | ~26% | **Excessive COs** — 32 changeovers / 38 production shifts = 46% in CO |
+| 7003 | Unistage | ~25% | Fewer COs (10) but small-lot NRI SKUs with short campaign length |
+
+Fix: Campaign consolidation — assign 7001/7002/7003 to 1–2 NRI SKUs for longer runs instead of cycling through 7–10 SKUs per month.
+
+**Stage-1 machines (6803, 7601, 8101, 7701, 8002, 7802, 7801, 7803, 7804, 8001, 6802, 6911, 6909, 6801, 8003 — ALL below 33%):**
+
+Root cause is **not** a scheduling inefficiency. Stage-1 util is structurally limited by Stage-2 GT demand:
+```
+Stage-2 GT demand ≈ 1,886 carcasses/shift (169,735 GT ÷ 90 shifts)
+Stage-1 capacity  = 2,459 carcasses/shift (15 machines × 164/machine/shift)
+Effective Stage-1 needed ≈ 1,886 / 164 ≈ 11.5 machines
+
+→ 15 Stage-1 machines for 11.5 machine-equivalents of demand = 77% theoretical peak
+  further reduced because carcass cold start blocks Stage-2 on Shift 1 (Day 1)
+```
+
+Stage-1 utilisation improves only if Stage-2 GT demand grows — i.e., more Runner-In or NRI SKUs are assigned to Stage-2 (two-piece tyre) building machines. This is driven by `Master_Building_Allowable_Machines_source`.
+
+### 18.4 NRI SKUs with Zero Production — Root Cause
+
+NRI SKUs can have zero production for two distinct reasons:
+
+| Root Cause | Skip_Reason in output | Fix |
+|---|---|---|
+| No allowable building machine in master data or history | `NRI: no building machine allocated — check allowable machines master data` | Add SKU to `Master_Building_Allowable_Machines_source` or source from history |
+| Building capacity already consumed by higher-priority SKUs | `NRI: partial build — building capacity shared with higher-priority SKUs` | Free up capacity by tightening Runner-In demand cap; check CO budget |
+| Curing CO deferred past horizon | `NRI: curing CO deferred — 8 CO/day cap reached` | Extend horizon or allow more COs in early days |
+
+NRI SKUs that ARE produced but partially: building machines are assigned, but the LP allocates less than total demand because higher-priority Runner-In SKUs claim the capacity first.

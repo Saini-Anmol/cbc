@@ -123,15 +123,20 @@ class BCAnalyser:
     def run(self) -> "BCAnalyser":
         """Load all data. Returns self for chaining."""
         print("  [Analyser] Loading building schedule …")
-        self.df_bld_shift  = _read_sheet(self.building_path, "Shift Schedule")
-        self.df_bld_demand = _read_sheet(self.building_path, "Demand Summary")
+        self.df_bld_shift  = _read_sheet(self.building_path, "Shift Schedule",
+                                         required_cols={"SKUCode", "Machine", "Qty"})
+        self.df_bld_demand = _read_sheet(self.building_path, "Demand Summary",
+                                         required_cols={"SKUCode"})
         self.df_co_plan    = _read_sheet(self.building_path, "Changeover Plan")
 
         print("  [Analyser] Loading curing schedule …")
-        self.df_cur_shift  = _read_sheet(self.curing_path, "Shift Schedule")
+        self.df_cur_shift  = _read_sheet(self.curing_path, "Shift Schedule",
+                                         required_cols={"SKUCode", "Date", "Shift"})
         self.df_gt_balance = _read_sheet(self.curing_path, "GT Balance")
-        self.df_demand_ful = _read_sheet(self.curing_path, "Demand Fulfillment")
-        self.df_daily_sum  = _read_sheet(self.curing_path, "Daily Summary")
+        self.df_demand_ful = _read_sheet(self.curing_path, "Demand Fulfillment",
+                                         required_cols={"SKUCode", "Demand_Qty"})
+        self.df_daily_sum  = _read_sheet(self.curing_path, "Daily Summary",
+                                         required_cols={"Total_Cured", "Starvation_Events"})
 
         print("  [Analyser] Loading consumption table …")
         self.df_consumption = _read_sheet(self.consumption_path, "Consumption Summary")

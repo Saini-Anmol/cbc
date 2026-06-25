@@ -90,6 +90,16 @@ class Config:
     # round a campaign to the nearest whole cycle.)
     OVERBUILD_BUFFER_FRAC   = 0.0
 
+    # ── Build-ahead lead time ─────────────────────────────────────────
+    # Building targets curing demand this many shifts ahead of today.
+    # 3 shifts = 1 full day: building on day D covers day D+1 curing,
+    # so finished GTs sit in WIP for ~1 day before curing consumes them.
+    # This eliminates Day-2+ LP cap collapse (WIP from previous day is
+    # earmarked for today's curing, so the LP sees net-zero inventory
+    # against the lead window and builds the full tomorrow's demand).
+    # Set to 0 to revert to same-day matching (original behaviour).
+    BUILD_LEAD_SHIFTS = 3
+
     # ── Hard caps used by the LP and reports ─────────────────────────
     QTY_MAX_OVER_DEMAND    = 5000
     GT_QTY_CAP             = 70000
@@ -123,19 +133,21 @@ class Config:
         "7201","7501","7502","7503",
     })
 
+    # Authoritative source: Master_Building_Machine_Design_cycleTime in DB.
+    # building_b2c.py loads from DB at runtime and overrides this dict.
     _CT_SEC = {
         "7001":57.6,  "7002":57.6,  "7003":57.6,  "7004":57.6,
-        "6001":57.6,  "6002":57.6,  "6003":57.6,  "6004":57.6,
-        "7101":102.0, "7102":102.0, "7103":102.0, "7104":102.0,
-        "7105":64.0,  "7106":64.0,  "7201":64.0,
-        "7501":104.0, "7502":104.0, "7503":104.0,
-        "8201":72.0,  "8301":60.0,  "8302":74.0,
-        "8501":81.0,  "8502":106.0, "7301":90.0,
-        "6801":144,   "6802":185,   "6803":240,
-        "6909":175,   "6911":144,   "7601":240,
-        "7701":261,   "7801":163,   "7802":163,
-        "7803":244,   "7804":244,   "8001":108,
-        "8002":169,   "8003":108,   "8101":288,
+        "6001":60.0,  "6002":60.0,  "6003":60.0,  "6004":60.0,
+        "7101":102.0, "7102":102.0, "7103":78.0,  "7104":108.0,
+        "7105":108.0, "7106":57.6,  "7201":66.0,
+        "7501":108.0, "7502":108.0, "7503":108.0,
+        "8201":72.0,  "8301":78.0,  "8302":78.0,
+        "8501":108.0, "8502":120.0, "7301":90.0,
+        "6801":150,   "6802":218,   "6803":262,
+        "6909":187,   "6911":150,   "7601":253,
+        "7701":267,   "7801":163,   "7802":182,
+        "7803":261,   "7804":257,   "8001":114,
+        "8002":169,   "8003":113,   "8101":300,
     }
 
     @classmethod
@@ -1746,6 +1758,7 @@ class HybridDailyScheduler:
             print(f"█  [v8 Hybrid] DAY {d+1}/{full_days}  —  {day_start:%Y-%m-%d}")
             print("█" * 72)
 
+            # TODAY's curing: used for starvation validation and inventory roll.
             mask = ((df_curing["StartTime"] >= day_start)
                     & (df_curing["StartTime"] < day_end))
             day_curing = df_curing.loc[mask].copy()
@@ -1753,12 +1766,32 @@ class HybridDailyScheduler:
                 print(f"  [Day {d+1}] No curing — skipping.")
                 continue
 
+            # LEAD window: LP/GA targets curing demand BUILD_LEAD_SHIFTS ahead.
+            # 3 shifts = 1 full day, so day D builds for day D+1 curing demand.
+            lead_delta = timedelta(
+                hours=Config.BUILD_LEAD_SHIFTS * Config.HOURS_PER_SHIFT
+            )
+            build_target_start = day_start + lead_delta
+            build_target_end   = day_end   + lead_delta
+            mask_lead = ((df_curing["StartTime"] >= build_target_start)
+                         & (df_curing["StartTime"] < build_target_end))
+            day_curing_lead = df_curing.loc[mask_lead].copy()
+            # Last planning day has no lead-window data; fall back to today.
+            if day_curing_lead.empty:
+                day_curing_lead    = day_curing
+                build_target_start = day_start
+
             # 1-day demand
             prev_days = Config.PLANNING_DAYS
             Config.PLANNING_DAYS = 1
             try:
                 deriver = DemandDeriver()
-                df_sku_demand, cur_mat, sku_list, df_shift_demand_day = (
+                # LP/GA demand matrix: derived from lead window (next day's curing)
+                df_sku_demand, cur_mat, sku_list, _ = (
+                    deriver.derive(day_curing_lead, gt_inv, build_target_start)
+                )
+                # Shift-demand for starvation validator: today's actual curing
+                _, _, _, df_shift_demand_day = (
                     deriver.derive(day_curing, gt_inv, day_start)
                 )
             finally:
@@ -1769,6 +1802,21 @@ class HybridDailyScheduler:
                 dict(zip(s1_inv["SKUCode"], s1_inv["Carcass_Inventory"]))
                 if not s1_inv.empty else {}
             )
+
+            # When using lead-time building the LP cap formula is:
+            #   cap = max(0, gross_lead − wip0) × buf
+            # In steady state wip0 ≈ today's demand ≈ gross_lead → cap ≈ 0.
+            # Fix: subtract today's curing consumption from opening WIP so the LP
+            # sees the net WIP that will remain AFTER today's curing has run.
+            # That net WIP is then compared against tomorrow's (lead) demand.
+            if Config.BUILD_LEAD_SHIFTS > 0:
+                _today_cure_qty = day_curing.groupby("SKUCode")["Qty"].sum().to_dict()
+                gt_inv_for_cap = {
+                    sku: max(0.0, qty - float(_today_cure_qty.get(sku, 0.0)))
+                    for sku, qty in gt_inv_init.items()
+                }
+            else:
+                gt_inv_for_cap = gt_inv_init
 
             locked = {}
             for _, r in running.iterrows():
@@ -1961,7 +2009,7 @@ class HybridDailyScheduler:
             ga = GeneticOptimiser(rng_seed=42 + d)
             best_y_gt, best_x_gt, meta_gt = ga.optimise(
                 sku_list, gt_machines, allow_map_gt, cur_mat, ct_map,
-                gt_inv_init, gt_locked, history_map,
+                gt_inv_for_cap, gt_locked, history_map,
                 inv_cap=None, label="GT",
                 co_time_map=co_time_map,
             )

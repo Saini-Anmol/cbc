@@ -77,6 +77,10 @@ os.makedirs(MAIN_OUT, exist_ok=True)
 # Config.X pick up the B2C values when called through this module.
 Config.MAX_CHANGEOVERS_PER_DAY = 8   # new plant-wide daily cap
 Config.OVERBUILD_BUFFER_FRAC   = 0.0 # strict: build exactly what curing consumes
+# Building lead time: day D LP targets day D+1 curing demand (1 full day ahead).
+# Eliminates LP cap collapse on Day 2+ where same-day WIP blocks new building.
+# Default already 3 in Config; explicit here so operators can tune per-run.
+Config.BUILD_LEAD_SHIFTS       = 3   # 3 shifts = 1 day ahead of curing
 # Remove CURING_PLAN_FILE — not used in B2C (we use consumption table)
 Config.CURING_PLAN_FILE = None
 
@@ -168,11 +172,19 @@ class B2C_DemandDeriver:
             dem_qty  = float(row.get("Demand_Qty", 0))
 
             if cat == "Runner-In":
+                # Cap at customer demand spread evenly — building must not exceed demand.
+                # Press consumption rate is the physical ceiling; demand is the business cap.
+                # If demand < press consumption, build only to demand (press will idle/CO after).
+                if dem_qty > 0:
+                    demand_per_shift = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
+                    capped = min(qty_per, demand_per_shift)
+                else:
+                    capped = qty_per  # no demand info — fall back to press consumption
                 for t in range(T):
-                    sku_shift_demand[(sku, t)] = qty_per
+                    sku_shift_demand[(sku, t)] = capped
             elif cat == "Non-Runner-In" and dem_qty > 0:
                 # Spread total demand evenly across shifts
-                per_shift = dem_qty / (Config.PLANNING_DAYS * Config.SHIFTS_PER_DAY)
+                per_shift = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
                 for t in range(T):
                     sku_shift_demand[(sku, t)] = per_shift
             # Runner-Out: excluded from building demand (they'll changeover)
@@ -260,7 +272,12 @@ def _make_synthetic_curing(
         dem_qty  = float(row.get("Demand_Qty", 0))
 
         if cat == "Runner-In":
-            target_qty = qty_ps
+            # Cap synthetic curing target at customer demand — same cap as demand deriver.
+            if dem_qty > 0:
+                demand_spread = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
+                target_qty = min(qty_ps, demand_spread)
+            else:
+                target_qty = qty_ps
         elif cat == "Non-Runner-In" and dem_qty > 0:
             # Spread total demand evenly so the LP sees steady need
             target_qty = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
@@ -513,6 +530,23 @@ def run_from_database_b2c(
     print("  B2C Phase 1 — Building Scheduler")
     print("=" * 70)
 
+    # ── Load building CT from DB (authoritative source) ───────────────────────
+    try:
+        df_bct = pd.read_sql(
+            "SELECT `SAP Machine Code` AS machine, `Cycle Time (Minutes)` AS ct_min "
+            "FROM Master_Building_Machine_Design_cycleTime",
+            engine,
+        )
+        db_ct = {
+            str(r["machine"]).strip(): round(float(r["ct_min"]) * 60, 4)
+            for _, r in df_bct.iterrows()
+            if r["machine"] is not None
+        }
+        Config._CT_SEC.update(db_ct)
+        print(f"  [Config] Building CT loaded from DB: {len(db_ct)} machines")
+    except Exception as _e:
+        print(f"  [Config] CT load from DB failed ({_e}); using hardcoded fallback")
+
     # ── B2C pre-start: 1 shift before first curing shift ─────────────────────
     # CBC used 1 full day (LEAD_DAYS=1); B2C uses 1 shift (8 hours).
     # plan_start = June 1 07:00 (Shift A) → build_start = May 31 23:00 (Shift C)
@@ -530,8 +564,15 @@ def run_from_database_b2c(
     df_gt_inv = etl.load_gt_inventory_for_b2c()
     print(f"        {len(df_gt_inv)} SKUs with opening GT inventory")
 
-    print("  [ETL] Loading carcass inventory …")
+    print("  [ETL] Loading carcass inventory (zeroing — B2C cold start) …")
     df_carcass_inv = etl.load_carcass_inventory()
+    # B2C assumption: opening carcass inventory = 0.
+    # Stage-2 GT machines can only consume carcasses produced by Stage-1 in this plan.
+    # This makes the Stage-1 → Stage-2 dependency a hard binding constraint.
+    if df_carcass_inv is not None and not df_carcass_inv.empty:
+        df_carcass_inv = df_carcass_inv.copy()
+        df_carcass_inv["Carcass_Inventory"] = 0
+    print(f"        Carcass inventory zeroed — Stage-2 waits for Stage-1 output")
 
     print("  [ETL] Loading building allowable machines …")
     df_allow = etl.load_machine_allowable()
@@ -629,7 +670,10 @@ def run_from_database_b2c(
     exporter.export(results)
 
     # ── Append B2C-specific sheets ────────────────────────────────────────────
-    _append_b2c_sheets(output_path, df_co_plan, results["dynamic_targets"], df_consumption)
+    _append_b2c_sheets(
+        output_path, df_co_plan, results["dynamic_targets"],
+        df_consumption, consumption_path,
+    )
 
     print("=" * 70)
     print("  Phase 1 complete.")
@@ -638,72 +682,357 @@ def run_from_database_b2c(
     return results
 
 
+def _skip_reason(
+    sku: str,
+    status: str,
+    category: str,
+    co_targets: dict,
+    planned_gt: float,
+) -> str:
+    """Return a human-readable Skip_Reason for a given demand SKU."""
+    if status == "FULLY MET":
+        return "-"
+    if category == "Runner-Out":
+        return "Runner-Out: SKU not in customer demand — excluded from building plan"
+    if category == "Runner-In":
+        if planned_gt == 0:
+            return "Runner-In: zero build — check allowable machines master data"
+        return "Runner-In: partial — demand cap applied (build ≤ customer demand)"
+    # Non-Runner-In
+    co = co_targets.get(sku)
+    if co:
+        if co["status"] == "SCHEDULED":
+            d = co["day"] + 1
+            return (f"NRI: curing CO Day {d} — building ahead; "
+                    f"curing starts Shift C Day {d}")
+        if co["status"] == "DEFERRED":
+            return ("NRI: curing CO deferred — 8 CO/day cap reached; "
+                    "expand horizon or rebalance CO budget")
+    if planned_gt == 0:
+        return ("NRI: no building machine allocated — "
+                "check allowable machines master data for this SKU")
+    return "NRI: partial — building capacity shared with higher-priority SKUs"
+
+
 def _append_b2c_sheets(
     output_path: str,
     df_co_plan: pd.DataFrame,
     df_dynamic_targets: pd.DataFrame,
     df_consumption: pd.DataFrame,
+    consumption_path: str | None = None,
 ):
     """Append B2C-specific sheets to the building output workbook."""
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
-        wb = load_workbook(output_path)
+    wb = load_workbook(output_path)
 
-        _NAVY  = "1F3864"
-        _WHITE = "FFFFFF"
+    _NAVY   = "1F3864"
+    _WHITE  = "FFFFFF"
+    _GREEN  = "E2EFDA"
+    _AMBER  = "FFF2CC"
+    _RED    = "FFE0E0"
+    _GREY   = "D3D3D3"
 
-        def _add_sheet(wb, name, df):
-            ws = wb.create_sheet(name)
-            hdr_fill = PatternFill("solid", fgColor=_NAVY)
-            hdr_font = Font(bold=True, color=_WHITE)
-            bd = Border(
-                left=Side(style="thin"), right=Side(style="thin"),
-                top=Side(style="thin"),  bottom=Side(style="thin"),
-            )
-            for ci, col in enumerate(df.columns, start=1):
-                cell = ws.cell(row=1, column=ci, value=col)
-                cell.fill = hdr_fill
-                cell.font = hdr_font
+    def _add_sheet(wb, name, df):
+        # Remove sheet if it already exists (avoid duplicate errors on re-run)
+        if name in wb.sheetnames:
+            del wb[name]
+        ws = wb.create_sheet(name)
+        hdr_fill = PatternFill("solid", fgColor=_NAVY)
+        hdr_font = Font(bold=True, color=_WHITE)
+        bd = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"),  bottom=Side(style="thin"),
+        )
+        for ci, col in enumerate(df.columns, start=1):
+            cell = ws.cell(row=1, column=ci, value=col)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.border = bd
+            cell.alignment = Alignment(horizontal="center")
+        for ri, (_, row) in enumerate(df.iterrows(), start=2):
+            for ci, val in enumerate(row, start=1):
+                cell = ws.cell(row=ri, column=ci, value=val)
                 cell.border = bd
                 cell.alignment = Alignment(horizontal="center")
-            for ri, (_, row) in enumerate(df.iterrows(), start=2):
-                for ci, val in enumerate(row, start=1):
-                    cell = ws.cell(row=ri, column=ci, value=val)
-                    cell.border = bd
-                    cell.alignment = Alignment(horizontal="center")
-            for col in ws.columns:
-                w = max((len(str(c.value or "")) for c in col), default=10)
-                ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 35)
+        for col in ws.columns:
+            w = max((len(str(c.value or "")) for c in col), default=10)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 35)
+        return ws
 
-        # Sheet: Changeover Plan
+    # ── Build CO lookup for Skip_Reason ──────────────────────────────────────
+    co_targets: dict = {}
+    if df_co_plan is not None and len(df_co_plan) > 0:
+        for _, co_row in df_co_plan.iterrows():
+            tgt = str(co_row.get("Target_SKU", "")).strip()
+            if tgt:
+                co_targets[tgt] = {
+                    "status": str(co_row.get("Status", "")),
+                    "day":    int(co_row.get("CO_Day_Index", -1)),
+                }
+
+    # ── Category + demand lookup from consumption table ───────────────────────
+    cat_map:  dict = {}
+    dem_map:  dict = {}
+    qty_map:  dict = {}
+    if df_consumption is not None and not df_consumption.empty:
+        for _, cr in df_consumption.iterrows():
+            s = str(cr["SKUCode"]).strip()
+            cat_map[s] = str(cr.get("Category", ""))
+            dem_raw = cr.get("Demand_Qty", 0)
+            dem_map[s] = 0.0 if (dem_raw is None or (isinstance(dem_raw, float) and math.isnan(dem_raw))) else float(dem_raw)
+
+    # ── Load excluded SKUs from consumption table (Phase 0 output) ────────────
+    df_excluded_skus = pd.DataFrame()
+    if consumption_path and os.path.exists(consumption_path):
+        try:
+            xl_cons = pd.ExcelFile(consumption_path)
+            if "Excluded SKUs" in xl_cons.sheet_names:
+                df_excluded_skus = pd.read_excel(consumption_path, sheet_name="Excluded SKUs")
+                df_excluded_skus["SKUCode"] = df_excluded_skus["SKUCode"].astype(str).str.strip()
+                print(f"  [B2C Sheets] Loaded {len(df_excluded_skus)} excluded SKUs from consumption table")
+        except Exception as _e:
+            print(f"  ⚠  Could not load Excluded SKUs: {_e}")
+
+    # ── Read Shift Schedule for daily totals + CO count ───────────────────────
+    _sentinel_skus = {"CHANGEOVER", "MOULD_CLEAN", "C/O", "CLEANING", "MOULDCLEAN", "CO"}
+    df_ss       = pd.DataFrame()
+    df_clean    = pd.DataFrame()
+    total_co_count = 0
+
+    try:
+        df_ss = pd.read_excel(output_path, sheet_name="Shift Schedule", header=2)
+    except Exception as _e:
+        print(f"  ⚠  Could not read Shift Schedule: {_e}")
+
+    if not df_ss.empty:
+        prod_mask = ~df_ss["SKUCode"].astype(str).str.strip().str.upper().isin(_sentinel_skus)
+        df_prod    = df_ss[prod_mask].copy()
+        df_nonprod = df_ss[~prod_mask].copy()
+
+        total_co_count = int(
+            df_ss["SKUCode"].astype(str).str.strip().str.upper()
+            .isin({"CHANGEOVER", "C/O"}).sum()
+        )
+
+        grp_cols = [c for c in ["Machine", "Date", "Shift", "SKUCode"] if c in df_prod.columns]
+        if grp_cols and "Qty" in df_prod.columns:
+            other_cols = [c for c in df_prod.columns if c not in grp_cols + ["Qty"]]
+            agg_spec   = {"Qty": "sum", **{c: "first" for c in other_cols}}
+            df_merged  = df_prod.groupby(grp_cols, as_index=False).agg(agg_spec)
+            df_clean   = pd.concat([df_merged, df_nonprod], ignore_index=True)
+            sort_keys  = [c for c in ["Date", "Machine", "Shift"] if c in df_clean.columns]
+            if sort_keys:
+                df_clean = df_clean.sort_values(sort_keys).reset_index(drop=True)
+        else:
+            df_clean = df_ss
+
+    # ── Sheet: Changeover Plan ────────────────────────────────────────────────
+    try:
         if df_co_plan is not None and len(df_co_plan) > 0:
             _add_sheet(wb, "Changeover Plan", df_co_plan)
+            print(f"  [B2C Sheets] Changeover Plan: {len(df_co_plan)} rows")
+    except Exception as _e:
+        print(f"  ⚠  Changeover Plan sheet failed: {_e}")
 
-        # Sheet: Dynamic Targets (top 1000 rows to keep file manageable)
+    # ── Sheet: Dynamic Targets ────────────────────────────────────────────────
+    try:
         if df_dynamic_targets is not None and len(df_dynamic_targets) > 0:
-            top_targets = df_dynamic_targets.head(1000)
-            _add_sheet(wb, "Dynamic Targets", top_targets)
+            _add_sheet(wb, "Dynamic Targets", df_dynamic_targets.head(1000))
+            print(f"  [B2C Sheets] Dynamic Targets: {len(df_dynamic_targets)} rows")
+    except Exception as _e:
+        print(f"  ⚠  Dynamic Targets sheet failed: {_e}")
 
-        # Sheet: SKU Classification Summary
-        cat_summary = (
-            df_consumption.groupby("Category")
-            .agg(
-                SKU_Count=("SKUCode", "count"),
-                Total_GT_Per_Shift=("Total_GT_Per_Shift_Day0", "sum"),
-                Avg_Priority=("Priority_Score", "mean"),
-            )
-            .reset_index()
+    # ── Sheet: SKU Classification Summary ────────────────────────────────────
+    try:
+        agg_dict: dict = {"SKU_Count": ("SKUCode", "count")}
+        if "Total_GT_Per_Shift_Day0" in df_consumption.columns:
+            agg_dict["Total_GT_Per_Shift"] = ("Total_GT_Per_Shift_Day0", "sum")
+        if "Priority_Score" in df_consumption.columns:
+            agg_dict["Avg_Priority"] = ("Priority_Score", "mean")
+        if "Demand_Qty" in df_consumption.columns:
+            agg_dict["Total_Customer_Demand"] = ("Demand_Qty", "sum")
+
+        cat_summary = df_consumption.groupby("Category").agg(**agg_dict).reset_index()
+        ws_cat = _add_sheet(wb, "SKU Classification", cat_summary)
+        footer_row = len(cat_summary) + 3
+        ws_cat.cell(row=footer_row,     column=1, value="KPI").font = Font(bold=True)
+        ws_cat.cell(row=footer_row + 1, column=1, value="Total Building COs (no daily limit)")
+        ws_cat.cell(row=footer_row + 1, column=2, value=total_co_count)
+        ws_cat.cell(row=footer_row + 2, column=1, value="Curing Press CO limit / day")
+        ws_cat.cell(row=footer_row + 2, column=2, value=8)
+        ws_cat.cell(row=footer_row + 3, column=1, value="Curing COs scheduled (this plan)")
+        ws_cat.cell(row=footer_row + 3, column=2, value=len(df_co_plan) if df_co_plan is not None else 0)
+        print(f"  [B2C Sheets] SKU Classification: {len(cat_summary)} categories")
+    except Exception as _e:
+        print(f"  ⚠  SKU Classification sheet failed: {_e}")
+
+    # ── Sheet: Shift Schedule (Clean) ─────────────────────────────────────────
+    try:
+        if not df_clean.empty:
+            _add_sheet(wb, "Shift Schedule (Clean)", df_clean)
+            print(f"  [B2C Sheets] Shift Schedule (Clean): {len(df_clean)} rows")
+    except Exception as _e:
+        print(f"  ⚠  Shift Schedule (Clean) sheet failed: {_e}")
+
+    # ── Sheet: Daily GT & Carcass ─────────────────────────────────────────────
+    _S1_MACHINES = {
+        "6801","6802","6803","6909","6911",
+        "7601","7701","7801","7802","7803","7804",
+        "8001","8002","8003","8101",
+    }
+    try:
+        if not df_clean.empty and "Qty" in df_clean.columns:
+            df_pc = df_clean[
+                ~df_clean["SKUCode"].astype(str).str.strip().str.upper().isin(_sentinel_skus)
+            ].copy()
+            df_pc["_mach"] = df_pc["Machine"].astype(str).str.strip()
+            if "Stage" in df_pc.columns:
+                df_pc["_is_s1"] = df_pc["Stage"].astype(str).str.upper().str.contains("1")
+            elif "MachineType" in df_pc.columns:
+                df_pc["_is_s1"] = df_pc["MachineType"].astype(str).str.upper() == "STAGE1"
+            else:
+                df_pc["_is_s1"] = df_pc["_mach"].isin(_S1_MACHINES)
+            df_pc["GT_Qty"]      = df_pc["Qty"].where(~df_pc["_is_s1"], 0)
+            df_pc["Carcass_Qty"] = df_pc["Qty"].where( df_pc["_is_s1"], 0)
+            if "Date" in df_pc.columns:
+                daily = (
+                    df_pc.groupby("Date", as_index=False)
+                    .agg(
+                        GT_Produced=("GT_Qty", "sum"),
+                        Carcass_Produced=("Carcass_Qty", "sum"),
+                        Total_Units=("Qty", "sum"),
+                        Active_SKUs=("SKUCode", "nunique"),
+                    )
+                    .sort_values("Date")
+                )
+                daily["Cumulative_GT"] = daily["GT_Produced"].cumsum()
+                _add_sheet(wb, "Daily GT & Carcass", daily)
+                print(f"  [B2C Sheets] Daily GT & Carcass: {len(daily)} days | "
+                      f"Total GT: {daily['GT_Produced'].sum():,.0f} | "
+                      f"Total Carcass: {daily['Carcass_Produced'].sum():,.0f}")
+    except Exception as _e:
+        print(f"  ⚠  Daily GT & Carcass sheet failed: {_e}")
+
+    # ── Sheet: Demand Fulfillment (B2C) — ALL demand SKUs + Skip_Reason ───────
+    try:
+        # Read the base demand summary written by the old ExcelExporter
+        demand_sheet = next(
+            (s for s in wb.sheetnames if "demand" in s.lower()
+             and "fulfillment" not in s.lower()), None
         )
-        _add_sheet(wb, "SKU Classification", cat_summary)
+        df_dem = pd.DataFrame()
+        if demand_sheet:
+            df_dem = pd.read_excel(output_path, sheet_name=demand_sheet)
+        if not df_dem.empty and "SKUCode" in df_dem.columns:
+            df_dem["SKUCode"]  = df_dem["SKUCode"].astype(str).str.strip()
+            df_dem["Category"] = df_dem["SKUCode"].map(cat_map).fillna("Unknown")
 
-        wb.save(output_path)
-        print(f"  [B2C Sheets] Appended Changeover Plan, Dynamic Targets, SKU Classification")
+        # Append excluded SKUs (from Phase 0) so ALL demand SKUs are visible
+        if not df_excluded_skus.empty:
+            excl_rows = []
+            for _, er in df_excluded_skus.iterrows():
+                sku = str(er["SKUCode"]).strip()
+                if not df_dem.empty and sku in df_dem["SKUCode"].values:
+                    continue   # already in demand summary
+                excl_rows.append({
+                    "SKUCode":   sku,
+                    "GT_Demand": float(er.get("Demand_Qty", 0)) if "Demand_Qty" in er.index else 0,
+                    "Net_GT_Demand": 0,
+                    "Planned_GT": 0,
+                    "Gap":       float(er.get("Demand_Qty", 0)) if "Demand_Qty" in er.index else 0,
+                    "Fulfill%":  0.0,
+                    "Status":    "EXCLUDED",
+                    "Category":  "Excluded",
+                    "Skip_Reason": str(er.get("Remark", "No PDE & master data — building machine / curing mould")),
+                })
+            if excl_rows:
+                df_excl = pd.DataFrame(excl_rows)
+                df_dem  = pd.concat([df_dem, df_excl], ignore_index=True)
 
-    except Exception as exc:
-        print(f"  ⚠️  Could not append B2C sheets: {exc}")
+        if not df_dem.empty and "SKUCode" in df_dem.columns:
+            planned_col = next((c for c in df_dem.columns if "planned" in c.lower()), None)
+            status_col  = next((c for c in df_dem.columns if c.lower() == "status"), None)
+
+            df_dem["Skip_Reason"] = df_dem.apply(
+                lambda r: (
+                    str(r.get("Skip_Reason", "")) if str(r.get("Skip_Reason", "")).strip()
+                    and str(r.get("Status", "")) == "EXCLUDED"
+                    else _skip_reason(
+                        sku        = str(r["SKUCode"]),
+                        status     = str(r[status_col]) if status_col else "UNMET",
+                        category   = str(r.get("Category", "Unknown")),
+                        co_targets = co_targets,
+                        planned_gt = float(r[planned_col]) if planned_col and not pd.isna(r[planned_col]) else 0,
+                    )
+                ),
+                axis=1,
+            )
+            ws_dem = _add_sheet(wb, "Demand Fulfillment (B2C)", df_dem)
+
+            # Colour rows
+            status_colors = {
+                "FULLY MET": _GREEN, "PARTIAL": _AMBER,
+                "UNMET": _RED,       "EXCLUDED": _GREY,
+            }
+            if status_col:
+                for ri, (_, row) in enumerate(df_dem.iterrows(), start=2):
+                    fill_hex = status_colors.get(str(row.get(status_col, "")), "")
+                    if fill_hex:
+                        row_fill = PatternFill("solid", fgColor=fill_hex)
+                        for ci in range(1, len(df_dem.columns) + 1):
+                            ws_dem.cell(row=ri, column=ci).fill = row_fill
+
+            # KPI footer
+            n_full  = int((df_dem[status_col] == "FULLY MET").sum()) if status_col else 0
+            n_part  = int((df_dem[status_col] == "PARTIAL").sum())   if status_col else 0
+            n_unmet = int((df_dem[status_col] == "UNMET").sum())     if status_col else 0
+            n_excl  = int((df_dem[status_col] == "EXCLUDED").sum())  if status_col else len(df_excluded_skus)
+
+            # KPI: Total GT Built / Total Customer Demand
+            qty_col = next((c for c in ["Planned_GT","GT_Built","Qty_Built"] if c in df_dem.columns), None)
+            dem_col = next((c for c in ["GT_Demand","Demand_Qty","Customer_Demand"] if c in df_dem.columns), None)
+            total_built  = int(df_dem[qty_col].sum())  if qty_col else 0
+            total_demand = int(df_dem[dem_col].sum())  if dem_col else 0
+            kpi_pct = round(100 * total_built / total_demand, 1) if total_demand else 0.0
+
+            footer  = len(df_dem) + 3
+            ws_dem.cell(row=footer, column=1, value="KPI SUMMARY").font = Font(bold=True)
+            ws_dem.cell(row=footer + 1, column=1, value="Total Customer Demand (units)")
+            ws_dem.cell(row=footer + 1, column=2, value=total_demand)
+            ws_dem.cell(row=footer + 2, column=1, value="Total GT Built (units)")
+            ws_dem.cell(row=footer + 2, column=2, value=total_built)
+            kpi_cell = ws_dem.cell(row=footer + 3, column=1, value="KPI — GT Built / Customer Demand")
+            kpi_cell.font = Font(bold=True)
+            kpi_val = ws_dem.cell(row=footer + 3, column=2, value=f"{kpi_pct}%")
+            kpi_val.font = Font(bold=True)
+            ws_dem.cell(row=footer + 4, column=1, value="")
+            ws_dem.cell(row=footer + 5, column=1, value="Total SKUs in demand file")
+            ws_dem.cell(row=footer + 5, column=2, value=len(df_dem))
+            ws_dem.cell(row=footer + 6, column=1, value="Fully Met")
+            ws_dem.cell(row=footer + 6, column=2, value=n_full)
+            ws_dem.cell(row=footer + 7, column=1, value="Partial")
+            ws_dem.cell(row=footer + 7, column=2, value=n_part)
+            ws_dem.cell(row=footer + 8, column=1, value="Unmet (in plan, not built)")
+            ws_dem.cell(row=footer + 8, column=2, value=n_unmet)
+            ws_dem.cell(row=footer + 9, column=1, value="Excluded (no machine / mould data)")
+            ws_dem.cell(row=footer + 9, column=2, value=n_excl)
+            ws_dem.cell(row=footer + 10, column=1, value="Total Building COs (no limit)")
+            ws_dem.cell(row=footer + 10, column=2, value=total_co_count)
+            ws_dem.cell(row=footer + 11, column=1, value="Curing COs scheduled (≤8/day)")
+            ws_dem.cell(row=footer + 11, column=2, value=len(df_co_plan) if df_co_plan is not None else 0)
+            print(f"  [B2C KPI] GT Built / Customer Demand = {total_built:,} / {total_demand:,} = {kpi_pct}%")
+            print(f"  [B2C Sheets] Demand Fulfillment (B2C): {len(df_dem)} SKUs "
+                  f"(FULLY MET={n_full}, PARTIAL={n_part}, UNMET={n_unmet}, EXCLUDED={n_excl})")
+    except Exception as _e:
+        import traceback
+        print(f"  ⚠  Demand Fulfillment (B2C) sheet failed: {_e}")
+        print(traceback.format_exc())
+
+    wb.save(output_path)
+    print(f"  [B2C Sheets] Saved → {output_path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
