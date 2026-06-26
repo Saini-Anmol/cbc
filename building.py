@@ -773,24 +773,27 @@ def build_summary(df_sku_demand, df_all):
     planned = prod.groupby("SKUCode")["Qty"].sum().to_dict()
     rows = []
     for _, r in df_sku_demand.iterrows():
-        sku  = r["SKUCode"]
-        dem  = int(r.get("Net_GT_Demand", 0))
-        plan = int(planned.get(sku, 0))
-        gap  = max(dem - plan, 0)
-        pct  = round(plan / dem * 100, 1) if dem > 0 else 100.0
+        sku     = r["SKUCode"]
+        gt_dem  = int(r.get("GT_Demand", 0))      # customer demand
+        net_dem = int(r.get("Net_GT_Demand", 0))  # demand after opening inventory
+        plan    = int(planned.get(sku, 0))
+        # Gap and fulfillment against customer demand (not net demand).
+        # With demand_cap, plan ≤ gt_dem so gap ≥ 0.
+        gap     = max(gt_dem - plan, 0)
+        pct     = round(plan / gt_dem * 100, 1) if gt_dem > 0 else 100.0
         rows.append({
             "SKUCode":             sku,
-            "GT_Demand":           int(r.get("GT_Demand",0)),
-            "GT_Inventory":        int(r.get("GT_Inventory",0)),
-            "Net_GT_Demand":       dem,
+            "GT_Demand":           gt_dem,
+            "GT_Inventory":        int(r.get("GT_Inventory", 0)),
+            "Net_GT_Demand":       net_dem,
             "Planned_GT":          plan,
             "Gap":                 gap,
             "Fulfillment_Pct":     pct,
-            "Status": ("FULLY MET" if gap<=0
-                       else "PARTIAL" if plan>0 else "UNMET"),
-            "Burn_Rate_Per_Shift": round(r.get("Burn_Rate_Per_Shift",0),1),
-            "Active_Shifts":       int(r.get("Active_Shifts",0)),
-            "First_Curing_Start":  r.get("First_Curing_Start",""),
+            "Status": ("FULLY MET" if plan >= net_dem
+                       else "PARTIAL" if plan > 0 else "UNMET"),
+            "Burn_Rate_Per_Shift": round(r.get("Burn_Rate_Per_Shift", 0), 1),
+            "Active_Shifts":       int(r.get("Active_Shifts", 0)),
+            "First_Curing_Start":  r.get("First_Curing_Start", ""),
         })
     return pd.DataFrame(rows).sort_values("First_Curing_Start")
 
@@ -988,15 +991,11 @@ class ExcelExporter:
             )
 
         # Headline KPIs printed at the top of every sheet title bar.
-        td  = int(df_sum["Net_GT_Demand"].sum()) if not df_sum.empty else 0
-        tp  = int(df_sum["Planned_GT"].sum())    if not df_sum.empty else 0
-        # Fulfilment = demand actually COVERED, capped per SKU at its own demand.
-        # Total built (tp) can exceed demand via shelf-life topup pre-build and
-        # whole-cycle rounding, but that surplus does not "fulfil" demand, so it
-        # must not inflate the % past 100.
-        met = (int(np.minimum(df_sum["Planned_GT"], df_sum["Net_GT_Demand"]).sum())
-               if not df_sum.empty else 0)
-        pct = round(met/td*100,1) if td else 0
+        # KPI uses total customer demand (GT_Demand), not net demand after inventory.
+        # With demand cap active, Planned_GT ≤ GT_Demand per SKU → fulfillment ≤ 100%.
+        td  = int(df_sum["GT_Demand"].sum())  if not df_sum.empty else 0
+        tp  = int(df_sum["Planned_GT"].sum()) if not df_sum.empty else 0
+        pct = round(tp / td * 100, 1) if td else 0
         stv = int((df_stv["Status"]=="STARVATION").sum()) if not df_stv.empty else 0
         kpi = (f"GT Demand: {td:,}  |  Built: {tp:,}  |  "
                f"Fulfillment: {pct}%  |  Starvation: {stv}")
@@ -1872,7 +1871,8 @@ class HybridDailyScheduler:
 
     def run(self, df_curing, df_gt_inv, df_carcass_inv, df_allow, co_map,
             sku_to_size, df_running, plan_start,
-            history_map=None, priority_map=None, extra_topup_demand=None):
+            history_map=None, priority_map=None, extra_topup_demand=None,
+            demand_cap=None):
         # Pipeline (once per day of horizon):
         #   1. Slice today's curing demand, subtract opening GT inv.
         #   2. Inch-lock Stage1/Unistage presses (coverage-then-balance).
@@ -1919,6 +1919,13 @@ class HybridDailyScheduler:
                 self._gt_remaining[sku] = (
                     self._gt_remaining.get(sku, 0) + qty
                 )
+        # Cap at customer demand so TopUp never builds beyond what was ordered.
+        # Freed capacity is redistributed to under-served SKUs by TopUp.
+        if demand_cap:
+            for sku in list(self._gt_remaining.keys()):
+                cap = demand_cap.get(sku)
+                if cap is not None:
+                    self._gt_remaining[sku] = min(self._gt_remaining[sku], cap)
         # Stage1 topup target — approximated as horizon GT demand of SKUs
         # that will be produced on Stage2 downstream (they need carcass).
         # For simplicity, mirror the GT target initially and let stage1_roll
@@ -2763,13 +2770,10 @@ class HybridDailyScheduler:
               f"{total_gt_skus:>8} {tot_gt_q:>10,} {tot_s1_q:>10,} {tot_cos:>6}")
 
         # Fulfilment + utilisation + starvation
-        td  = int(df_summary["Net_GT_Demand"].sum()) if not df_summary.empty else 0
-        tp  = int(df_summary["Planned_GT"].sum())    if not df_summary.empty else 0
-        # capped per-SKU coverage (see build_summary KPI note) — never > 100%
-        met = (int(np.minimum(df_summary["Planned_GT"], df_summary["Net_GT_Demand"]).sum())
-               if not df_summary.empty else 0)
-        pct = round(met / td * 100, 1) if td else 0.0
-        over = max(tp - met, 0)
+        td  = int(df_summary["GT_Demand"].sum()) if not df_summary.empty else 0
+        tp  = int(df_summary["Planned_GT"].sum()) if not df_summary.empty else 0
+        pct = round(tp / td * 100, 1) if td else 0.0
+        over = max(tp - td, 0)
         full = (df_summary["Status"] == "FULLY MET").sum() if not df_summary.empty else 0
         part = (df_summary["Status"] == "PARTIAL").sum()   if not df_summary.empty else 0
         unmet= (df_summary["Status"] == "UNMET").sum()     if not df_summary.empty else 0

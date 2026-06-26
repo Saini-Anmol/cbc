@@ -732,6 +732,18 @@ def run_from_database_b2c(
     print(f"  [UNISTAGE] {n_extra} SKUs ({extra_total:,.0f} units) added to "
           f"UNISTAGE idle-fill pool (not in active LP plan)")
 
+    # Customer demand cap: prevents TopUp from building beyond what the
+    # customer ordered, freeing machine time for under-served SKUs instead.
+    demand_cap: dict = {}
+    if qty_col:
+        for _, row in df_consumption_updated.iterrows():
+            sku = str(row["SKUCode"])
+            qty = float(row.get(qty_col, 0) or 0)
+            if qty > 0:
+                demand_cap[sku] = qty
+    print(f"  [Cap] Demand cap set for {len(demand_cap)} SKUs — "
+          f"building will not exceed customer demand per SKU")
+
     # ── Run the existing HybridDailyScheduler ────────────────────────────────
     # Pass real GT/carcass inventory (NOT zeroed — B2C uses opening inventory).
     # Pass real running machine state (continuity locks active on Day 0).
@@ -749,7 +761,66 @@ def run_from_database_b2c(
         history_map=history_map,
         priority_map=priority_map,
         extra_topup_demand=extra_topup_demand if extra_topup_demand else None,
+        demand_cap=demand_cap if demand_cap else None,
     )
+
+    # ── Augment demand_summary with ALL demand SKUs ───────────────────────────
+    # scheduler.run() only includes LP-active SKUs (Runner-In + NRI-with-CO).
+    # Add remaining demand SKUs so the Demand Summary sheet shows all 89.
+    _GT_MACH      = {str(m) for m in Config.STAGE2 | Config.UNISTAGE}
+    _sentinels    = {"CHANGEOVER", "MOULD_CLEAN", "C/O", "CLEANING"}
+    _ss           = results.get("shift_schedule", pd.DataFrame())
+    _prod_by_sku  : dict = {}
+    if not _ss.empty:
+        _pr = _ss[
+            ~_ss["SKUCode"].astype(str).str.upper().isin(_sentinels)
+            & _ss["Machine"].astype(str).isin(_GT_MACH)
+        ]
+        _prod_by_sku = _pr.groupby("SKUCode")["Qty"].sum().to_dict()
+
+    _existing_skus = set(
+        results["demand_summary"]["SKUCode"].astype(str)
+    ) if "demand_summary" in results and not results["demand_summary"].empty else set()
+
+    _gt_inv_dict  = dict(zip(
+        df_gt_inv["SKUCode"].astype(str).str.strip(),
+        df_gt_inv["GT_Inventory"].astype(float),
+    )) if df_gt_inv is not None and not df_gt_inv.empty else {}
+
+    _extra_rows = []
+    for _, cr in df_consumption_updated.iterrows():
+        sku    = str(cr["SKUCode"])
+        if sku in _existing_skus:
+            continue
+        demand = float(cr.get("Demand_Qty", 0) or 0)
+        if demand <= 0:
+            continue
+        gt_inv  = float(_gt_inv_dict.get(sku, 0))
+        net_dem = max(0, int(demand) - int(gt_inv))
+        planned = float(_prod_by_sku.get(sku, 0))
+        gap     = max(0, int(demand) - int(planned))
+        pct     = round(planned / demand * 100, 1) if demand > 0 else 0.0
+        _extra_rows.append({
+            "SKUCode":             sku,
+            "GT_Demand":           int(demand),
+            "GT_Inventory":        int(gt_inv),
+            "Net_GT_Demand":       int(net_dem),
+            "Planned_GT":          int(planned),
+            "Gap":                 gap,
+            "Fulfillment_Pct":     pct,
+            "Status":              ("FULLY MET" if planned >= net_dem and net_dem >= 0
+                                    else "PARTIAL" if planned > 0 else "UNMET"),
+            "Burn_Rate_Per_Shift": 0.0,
+            "Active_Shifts":       0,
+            "First_Curing_Start":  "",
+        })
+    if _extra_rows:
+        results["demand_summary"] = pd.concat(
+            [results["demand_summary"], pd.DataFrame(_extra_rows)],
+            ignore_index=True,
+        )
+        print(f"  [Summary] Added {len(_extra_rows)} demand SKUs to Demand Summary "
+              f"(NRI-no-CO + excluded)")
 
     # ── Attach B2C-specific data to results ───────────────────────────────────
     results["consumption_table"]   = df_consumption
