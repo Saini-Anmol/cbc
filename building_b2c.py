@@ -600,6 +600,39 @@ def run_from_database_b2c(
     print("  [ETL] Loading history map (heuristic scoring) …")
     history_map = etl.load_history_map()
 
+    # ── Union: merge historical production machines into allow_map ────────────
+    # Master_Building_Allowable_Machines_source = current master data (hard allow_map).
+    # Building_Stage1/2_Best_Machines = 3-month historical runs (actual production).
+    # Union ensures SKUs that were historically built on a machine but are missing
+    # from master data still get scheduled on that machine.
+    print("  [Allow] Merging historical machine-SKU pairs into allow_map …")
+    hist_by_sku: dict = {}
+    for (machine, sku), count in history_map.items():
+        if count > 0:
+            hist_by_sku.setdefault(sku, set()).add(machine)
+
+    allow_sku_idx = {str(r["SKUCode"]): i for i, r in df_allow.iterrows()}
+    extra_pairs = 0
+    new_hist_rows = []
+    for sku, hist_machs in hist_by_sku.items():
+        if sku in allow_sku_idx:
+            idx = allow_sku_idx[sku]
+            cur_set = set(df_allow.at[idx, "Machines"] or [])
+            added = hist_machs - cur_set
+            if added:
+                df_allow.at[idx, "Machines"] = list(cur_set | added)
+                extra_pairs += len(added)
+        else:
+            new_hist_rows.append({"SKUCode": sku, "Machines": list(hist_machs)})
+            extra_pairs += len(hist_machs)
+
+    if new_hist_rows:
+        df_allow = pd.concat(
+            [df_allow, pd.DataFrame(new_hist_rows)], ignore_index=True
+        )
+    print(f"  [Allow] +{extra_pairs} machine-SKU pairs from historical data "
+          f"({len(new_hist_rows)} new SKUs unlocked via production history)")
+
     print("  [ETL] Loading running curing moulds (for changeover planning) …")
     try:
         from curing_consumption import ConsumptionETL
@@ -732,9 +765,21 @@ def run_from_database_b2c(
     exporter.export(results)
 
     # ── Append B2C-specific sheets ────────────────────────────────────────────
+    # Build SKU-level allow_map and avg-CT map for the Demand Fulfillment sheet
+    _allow_map_final = {}
+    for _, r in df_allow.iterrows():
+        _allow_map_final[str(r["SKUCode"])] = set(map(str, r.get("Machines", []) or []))
+    gt_inv_map = dict(zip(
+        df_gt_inv["SKUCode"].astype(str).str.strip(),
+        df_gt_inv["GT_Inventory"].astype(float),
+    )) if df_gt_inv is not None and not df_gt_inv.empty else {}
+
     _append_b2c_sheets(
         output_path, df_co_plan, results["dynamic_targets"],
         df_consumption, consumption_path,
+        gt_inv_map=gt_inv_map,
+        allow_map_lookup=_allow_map_final,
+        planning_days=planning_days,
     )
 
     print("=" * 70)
@@ -750,6 +795,7 @@ def _skip_reason(
     category: str,
     co_targets: dict,
     planned_gt: float,
+    eligible_machines: int = 0,
 ) -> str:
     """Return a human-readable Skip_Reason for a given demand SKU."""
     if status == "FULLY MET":
@@ -771,8 +817,11 @@ def _skip_reason(
             return ("NRI: curing CO deferred — 8 CO/day cap reached; "
                     "expand horizon or rebalance CO budget")
     if planned_gt == 0:
-        return ("NRI: no building machine allocated — "
-                "check allowable machines master data for this SKU")
+        if eligible_machines > 0:
+            return ("NRI: machines available (historical) but no curing CO scheduled — "
+                    "add curing mould/CO to activate this SKU")
+        return ("NRI: no building machine in master data or historical production — "
+                "add to Master_Building_Allowable_Machines_source")
     return "NRI: partial — building capacity shared with higher-priority SKUs"
 
 
@@ -782,6 +831,9 @@ def _append_b2c_sheets(
     df_dynamic_targets: pd.DataFrame,
     df_consumption: pd.DataFrame,
     consumption_path: str | None = None,
+    gt_inv_map: dict | None = None,
+    allow_map_lookup: dict | None = None,
+    planning_days: int = 31,
 ):
     """Append B2C-specific sheets to the building output workbook."""
     from openpyxl import load_workbook
@@ -997,6 +1049,22 @@ def _append_b2c_sheets(
             ]
             prod_by_sku = _prod_rows.groupby("SKUCode")["Qty"].sum().to_dict()
 
+        # Helper: avg cycle time (min) for a SKU across its eligible machines
+        _gt_inv_map    = gt_inv_map or {}
+        _allow_lkp     = allow_map_lookup or {}
+        _plan_mins     = planning_days * 3 * 8 * 60  # total shift-minutes per press
+        # Presses_Needed normalisation: 86,400 min = 60 days × 24h × 60min
+        # This gives an intuitive count of how many continuously-running presses
+        # are required to satisfy the monthly demand for a given SKU.
+        _PRESS_NORM    = 86_400.0
+
+        def _sku_ct(sku: str) -> float | None:
+            machs = _allow_lkp.get(sku, set())
+            if not machs:
+                return None
+            cts = [Config.ct_min(m) for m in machs]
+            return round(sum(cts) / len(cts), 1) if cts else None
+
         # 2. All demand SKUs from df_consumption (Demand_Qty > 0 = in demand file)
         dem_rows: list = []
         active_skus: set = set()
@@ -1007,22 +1075,35 @@ def _append_b2c_sheets(
                 if demand <= 0:
                     continue
                 active_skus.add(sku)
-                produced  = float(prod_by_sku.get(sku, 0))
-                fill_pct  = round(100 * produced / demand, 1) if demand > 0 else 0.0
-                status    = (
+                produced   = float(prod_by_sku.get(sku, 0))
+                gt_inv     = float(_gt_inv_map.get(sku, 0))
+                fill_pct   = round(100 * produced / demand, 1) if demand > 0 else 0.0
+                gap        = max(0, int(demand) - int(produced))
+                status     = (
                     "FULLY MET" if produced >= demand * 0.95
                     else "PARTIAL"  if produced > 0
                     else "UNMET"
                 )
+                avg_ct     = _sku_ct(sku)
+                elig_count = len(_allow_lkp.get(sku, set()))
+                presses    = (
+                    round(demand * avg_ct / _PRESS_NORM, 2)
+                    if avg_ct else None
+                )
                 dem_rows.append({
-                    "SKUCode":         sku,
-                    "Category":        str(cr.get("Category", "")),
-                    "Priority_Score":  round(float(cr.get("Priority_Score", 0) or 0), 4),
-                    "Customer_Demand": int(demand),
-                    "GT_Built":        int(produced),
-                    "Fulfillment%":    fill_pct,
-                    "Status":          status,
-                    "Skip_Reason":     "",
+                    "SKUCode":           sku,
+                    "Category":          str(cr.get("Category", "")),
+                    "Priority":          round(float(cr.get("Priority_Score", 0) or 0), 7),
+                    "Demand":            int(demand),
+                    "GT_Inventory":      int(gt_inv),
+                    "Planned_Units":     int(produced),
+                    "Gap":               gap,
+                    "Fulfillment_Pct":   f"{fill_pct}%",
+                    "Status":            status,
+                    "CycleTime_min":     avg_ct if avg_ct is not None else "NA",
+                    "Eligible_Machines": elig_count if elig_count else "NA",
+                    "Presses_Needed":    presses if presses is not None else "NA",
+                    "Skip_Reason":       "",
                 })
 
         # 3. Excluded SKUs (in demand file but not in consumption table).
@@ -1044,15 +1125,25 @@ def _append_b2c_sheets(
                             _demand = float(er.get("Demand_Qty", 0) or 0)
                             _remark = str(er.get("Remark",
                                 "No master data — building machine or curing mould missing"))
+                            avg_ct_ex  = _sku_ct(sku)
+                            elig_ex    = len(_allow_lkp.get(sku, set()))
                             dem_rows.append({
-                                "SKUCode":         sku,
-                                "Category":        "Excluded",
-                                "Priority_Score":  0.0,
-                                "Customer_Demand": int(_demand),
-                                "GT_Built":        0,
-                                "Fulfillment%":    0.0,
-                                "Status":          "EXCLUDED",
-                                "Skip_Reason":     _remark,
+                                "SKUCode":           sku,
+                                "Category":          "Excluded",
+                                "Priority":          0.0,
+                                "Demand":            int(_demand),
+                                "GT_Inventory":      int(float(_gt_inv_map.get(sku, 0))),
+                                "Planned_Units":     0,
+                                "Gap":               int(_demand),
+                                "Fulfillment_Pct":   "0.0%",
+                                "Status":            "EXCLUDED",
+                                "CycleTime_min":     avg_ct_ex if avg_ct_ex is not None else "NA",
+                                "Eligible_Machines": elig_ex if elig_ex else "NA",
+                                "Presses_Needed":    (
+                                    round(_demand * avg_ct_ex / _PRESS_NORM, 2)
+                                    if avg_ct_ex and _demand > 0 else "NA"
+                                ),
+                                "Skip_Reason":       _remark,
                             })
                             active_skus.add(sku)
             except Exception as _ee:
@@ -1065,20 +1156,29 @@ def _append_b2c_sheets(
                 lambda r: (
                     r["Skip_Reason"] if str(r["Status"]) == "EXCLUDED"
                     else _skip_reason(
-                        sku        = str(r["SKUCode"]),
-                        status     = str(r["Status"]),
-                        category   = str(r["Category"]),
-                        co_targets = co_targets,
-                        planned_gt = float(r["GT_Built"]),
+                        sku               = str(r["SKUCode"]),
+                        status            = str(r["Status"]),
+                        category          = str(r["Category"]),
+                        co_targets        = co_targets,
+                        planned_gt        = float(r["Planned_Units"]),
+                        eligible_machines = int(r["Eligible_Machines"])
+                            if str(r["Eligible_Machines"]) not in ("NA", "nan") else 0,
                     )
                 ),
                 axis=1,
             )
             df_dem = df_dem.sort_values(
-                ["Category", "Priority_Score"], ascending=[True, False]
+                ["Category", "Priority"], ascending=[True, False]
             ).reset_index(drop=True)
 
             ws_dem = _add_sheet(wb, "Demand Fulfillment (B2C)", df_dem)
+
+            # Bold Planned_Units column
+            _col_idx = {c: i+1 for i, c in enumerate(df_dem.columns)}
+            _pu_col  = _col_idx.get("Planned_Units")
+            if _pu_col:
+                for _ri in range(2, len(df_dem) + 2):
+                    ws_dem.cell(row=_ri, column=_pu_col).font = Font(bold=True)
 
             # Colour-code rows by status
             status_colors = {
@@ -1097,14 +1197,10 @@ def _append_b2c_sheets(
             n_part  = int((df_dem["Status"] == "PARTIAL").sum())
             n_unmet = int((df_dem["Status"] == "UNMET").sum())
             n_excl  = int((df_dem["Status"] == "EXCLUDED").sum())
-            total_built  = int(df_dem["GT_Built"].sum())
-            total_demand = int(df_dem["Customer_Demand"].sum())
+            total_built  = int(df_dem["Planned_Units"].sum())
+            total_demand = int(df_dem["Demand"].sum())
             kpi_pct = round(100 * total_built / total_demand, 1) if total_demand else 0.0
 
-            # Over-production note: GT built may exceed cured because TopUp
-            # pre-builds inventory; the excess carries into the next period.
-            # Net GT demand here = total customer demand from demand file
-            # (not curing consumption), so KPI = GT Built / Customer Demand.
             footer = len(df_dem) + 3
             ws_dem.cell(row=footer,   column=1, value="KPI SUMMARY").font = Font(bold=True)
             ws_dem.cell(row=footer+1, column=1, value="Total Customer Demand (units)  ← Net GT demand = this value")
