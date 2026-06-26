@@ -666,30 +666,38 @@ def run_from_database_b2c(
     else:
         priority_map = {}
 
-    # extra_topup_demand: NRI SKUs excluded from LP (no planned CO) but
-    # eligible for UNISTAGE — lets TopUp fill idle UNISTAGE time with them.
+    # extra_topup_demand: ALL demand SKUs eligible for UNISTAGE that are NOT
+    # already in the active LP synthetic curing plan (i.e., not in _gt_remaining).
+    # LP covers Runner-In + NRI-with-CO. Everything else with UNISTAGE eligibility
+    # goes here so TopUp can fill idle UNISTAGE tails with them.
+    # This maximises UNISTAGE utilisation without changing the LP problem size.
     unistage_set = set(map(str, Config.UNISTAGE))
     allow_map_lookup = {}
     for _, r in df_allow.iterrows():
         allow_map_lookup[str(r["SKUCode"])] = set(map(str, r.get("Machines", [])))
 
     qty_col = "Demand_Qty" if "Demand_Qty" in df_consumption_updated.columns else None
-    nri_no_co_mask = (
-        (df_consumption_updated["Category"] == "Non-Runner-In") &
-        (~df_consumption_updated["SKUCode"].astype(str).isin(nri_with_co))
-    )
+
+    # SKUs already in active LP plan (Runner-In active + NRI-with-CO + Runner-Out)
+    lp_active_skus = set(
+        df_curing_synthetic["SKUCode"].astype(str).unique()
+    ) if not df_curing_synthetic.empty else set()
+
     extra_topup_demand = {}
-    for _, row in df_consumption_updated[nri_no_co_mask].iterrows():
+    for _, row in df_consumption_updated.iterrows():
         sku = str(row["SKUCode"])
-        if allow_map_lookup.get(sku, set()) & unistage_set:
-            demand = float(row[qty_col]) if qty_col else 0.0
-            if demand > 0:
-                extra_topup_demand[sku] = demand
+        if sku in lp_active_skus:
+            continue  # already tracked in _gt_remaining via synthetic curing
+        if not (allow_map_lookup.get(sku, set()) & unistage_set):
+            continue  # not eligible for any UNISTAGE machine
+        demand = float(row[qty_col]) if qty_col else 0.0
+        if demand > 0:
+            extra_topup_demand[sku] = demand
 
     n_extra = len(extra_topup_demand)
     extra_total = sum(extra_topup_demand.values())
-    print(f"  [UNISTAGE] {n_extra} NRI SKUs ({extra_total:,.0f} units) added to "
-          f"UNISTAGE idle-fill pool")
+    print(f"  [UNISTAGE] {n_extra} SKUs ({extra_total:,.0f} units) added to "
+          f"UNISTAGE idle-fill pool (not in active LP plan)")
 
     # ── Run the existing HybridDailyScheduler ────────────────────────────────
     # Pass real GT/carcass inventory (NOT zeroed — B2C uses opening inventory).
@@ -971,112 +979,159 @@ def _append_b2c_sheets(
         print(f"  ⚠  Daily GT & Carcass sheet failed: {_e}")
 
     # ── Sheet: Demand Fulfillment (B2C) — ALL demand SKUs + Skip_Reason ───────
+    # Built from scratch so it is never broken by the ExcelExporter header format.
+    # Shows all 89 demand SKUs; unscheduled ones carry a Skip_Reason.
     try:
-        # Read the base demand summary written by the old ExcelExporter
-        demand_sheet = next(
-            (s for s in wb.sheetnames if "demand" in s.lower()
-             and "fulfillment" not in s.lower()), None
+        # 1. Actual GT production per SKU (STAGE2 + UNISTAGE only — not carcass).
+        #    Stage1 carcass is an intermediate product, not a finished tyre, so
+        #    it must not be counted toward customer demand fulfillment.
+        _GT_MACHINES = (
+            {str(m) for m in Config.STAGE2} | {str(m) for m in Config.UNISTAGE}
         )
-        df_dem = pd.DataFrame()
-        if demand_sheet:
-            df_dem = pd.read_excel(output_path, sheet_name=demand_sheet)
-        if not df_dem.empty and "SKUCode" in df_dem.columns:
-            df_dem["SKUCode"]  = df_dem["SKUCode"].astype(str).str.strip()
-            df_dem["Category"] = df_dem["SKUCode"].map(cat_map).fillna("Unknown")
+        prod_by_sku: dict = {}
+        if not df_clean.empty and "Qty" in df_clean.columns:
+            _prod_rows = df_clean[
+                ~df_clean["SKUCode"].astype(str).str.strip().str.upper()
+                .isin(_sentinel_skus)
+                & df_clean["Machine"].astype(str).str.strip().isin(_GT_MACHINES)
+            ]
+            prod_by_sku = _prod_rows.groupby("SKUCode")["Qty"].sum().to_dict()
 
-        # Append excluded SKUs (from Phase 0) so ALL demand SKUs are visible
-        if not df_excluded_skus.empty:
-            excl_rows = []
-            for _, er in df_excluded_skus.iterrows():
-                sku = str(er["SKUCode"]).strip()
-                if not df_dem.empty and sku in df_dem["SKUCode"].values:
-                    continue   # already in demand summary
-                excl_rows.append({
-                    "SKUCode":   sku,
-                    "GT_Demand": float(er.get("Demand_Qty", 0)) if "Demand_Qty" in er.index else 0,
-                    "Net_GT_Demand": 0,
-                    "Planned_GT": 0,
-                    "Gap":       float(er.get("Demand_Qty", 0)) if "Demand_Qty" in er.index else 0,
-                    "Fulfill%":  0.0,
-                    "Status":    "EXCLUDED",
-                    "Category":  "Excluded",
-                    "Skip_Reason": str(er.get("Remark", "No PDE & master data — building machine / curing mould")),
+        # 2. All demand SKUs from df_consumption (Demand_Qty > 0 = in demand file)
+        dem_rows: list = []
+        active_skus: set = set()
+        if df_consumption is not None and not df_consumption.empty:
+            for _, cr in df_consumption.iterrows():
+                sku    = str(cr["SKUCode"]).strip()
+                demand = float(cr.get("Demand_Qty", 0) or 0)
+                if demand <= 0:
+                    continue
+                active_skus.add(sku)
+                produced  = float(prod_by_sku.get(sku, 0))
+                fill_pct  = round(100 * produced / demand, 1) if demand > 0 else 0.0
+                status    = (
+                    "FULLY MET" if produced >= demand * 0.95
+                    else "PARTIAL"  if produced > 0
+                    else "UNMET"
+                )
+                dem_rows.append({
+                    "SKUCode":         sku,
+                    "Category":        str(cr.get("Category", "")),
+                    "Priority_Score":  round(float(cr.get("Priority_Score", 0) or 0), 4),
+                    "Customer_Demand": int(demand),
+                    "GT_Built":        int(produced),
+                    "Fulfillment%":    fill_pct,
+                    "Status":          status,
+                    "Skip_Reason":     "",
                 })
-            if excl_rows:
-                df_excl = pd.DataFrame(excl_rows)
-                df_dem  = pd.concat([df_dem, df_excl], ignore_index=True)
 
-        if not df_dem.empty and "SKUCode" in df_dem.columns:
-            planned_col = next((c for c in df_dem.columns if "planned" in c.lower()), None)
-            status_col  = next((c for c in df_dem.columns if c.lower() == "status"), None)
+        # 3. Excluded SKUs (in demand file but not in consumption table).
+        #    The "Excluded SKUs" sheet has a title in row 0, blank in row 1,
+        #    actual column headers in row 2 — read with header=2 to fix that.
+        if consumption_path and os.path.exists(consumption_path):
+            try:
+                _xl = pd.ExcelFile(consumption_path)
+                if "Excluded SKUs" in _xl.sheet_names:
+                    _df_ex = pd.read_excel(consumption_path,
+                                           sheet_name="Excluded SKUs", header=2)
+                    _df_ex.columns = [str(c).strip() for c in _df_ex.columns]
+                    if "SKUCode" in _df_ex.columns:
+                        _df_ex["SKUCode"] = _df_ex["SKUCode"].astype(str).str.strip()
+                        for _, er in _df_ex.iterrows():
+                            sku = str(er["SKUCode"]).strip()
+                            if not sku or sku.lower() == "nan" or sku in active_skus:
+                                continue
+                            _demand = float(er.get("Demand_Qty", 0) or 0)
+                            _remark = str(er.get("Remark",
+                                "No master data — building machine or curing mould missing"))
+                            dem_rows.append({
+                                "SKUCode":         sku,
+                                "Category":        "Excluded",
+                                "Priority_Score":  0.0,
+                                "Customer_Demand": int(_demand),
+                                "GT_Built":        0,
+                                "Fulfillment%":    0.0,
+                                "Status":          "EXCLUDED",
+                                "Skip_Reason":     _remark,
+                            })
+                            active_skus.add(sku)
+            except Exception as _ee:
+                print(f"  ⚠  Could not load Excluded SKUs sheet: {_ee}")
 
+        # 4. Fill Skip_Reason and write sheet
+        df_dem = pd.DataFrame(dem_rows)
+        if not df_dem.empty:
             df_dem["Skip_Reason"] = df_dem.apply(
                 lambda r: (
-                    str(r.get("Skip_Reason", "")) if str(r.get("Skip_Reason", "")).strip()
-                    and str(r.get("Status", "")) == "EXCLUDED"
+                    r["Skip_Reason"] if str(r["Status"]) == "EXCLUDED"
                     else _skip_reason(
                         sku        = str(r["SKUCode"]),
-                        status     = str(r[status_col]) if status_col else "UNMET",
-                        category   = str(r.get("Category", "Unknown")),
+                        status     = str(r["Status"]),
+                        category   = str(r["Category"]),
                         co_targets = co_targets,
-                        planned_gt = float(r[planned_col]) if planned_col and not pd.isna(r[planned_col]) else 0,
+                        planned_gt = float(r["GT_Built"]),
                     )
                 ),
                 axis=1,
             )
+            df_dem = df_dem.sort_values(
+                ["Category", "Priority_Score"], ascending=[True, False]
+            ).reset_index(drop=True)
+
             ws_dem = _add_sheet(wb, "Demand Fulfillment (B2C)", df_dem)
 
-            # Colour rows
+            # Colour-code rows by status
             status_colors = {
                 "FULLY MET": _GREEN, "PARTIAL": _AMBER,
                 "UNMET": _RED,       "EXCLUDED": _GREY,
             }
-            if status_col:
-                for ri, (_, row) in enumerate(df_dem.iterrows(), start=2):
-                    fill_hex = status_colors.get(str(row.get(status_col, "")), "")
-                    if fill_hex:
-                        row_fill = PatternFill("solid", fgColor=fill_hex)
-                        for ci in range(1, len(df_dem.columns) + 1):
-                            ws_dem.cell(row=ri, column=ci).fill = row_fill
+            for ri, (_, row) in enumerate(df_dem.iterrows(), start=2):
+                fill_hex = status_colors.get(str(row.get("Status", "")), "")
+                if fill_hex:
+                    _fill = PatternFill("solid", fgColor=fill_hex)
+                    for ci in range(1, len(df_dem.columns) + 1):
+                        ws_dem.cell(row=ri, column=ci).fill = _fill
 
             # KPI footer
-            n_full  = int((df_dem[status_col] == "FULLY MET").sum()) if status_col else 0
-            n_part  = int((df_dem[status_col] == "PARTIAL").sum())   if status_col else 0
-            n_unmet = int((df_dem[status_col] == "UNMET").sum())     if status_col else 0
-            n_excl  = int((df_dem[status_col] == "EXCLUDED").sum())  if status_col else len(df_excluded_skus)
-
-            # KPI: Total GT Built / Total Customer Demand
-            qty_col = next((c for c in ["Planned_GT","GT_Built","Qty_Built"] if c in df_dem.columns), None)
-            dem_col = next((c for c in ["GT_Demand","Demand_Qty","Customer_Demand"] if c in df_dem.columns), None)
-            total_built  = int(df_dem[qty_col].sum())  if qty_col else 0
-            total_demand = int(df_dem[dem_col].sum())  if dem_col else 0
+            n_full  = int((df_dem["Status"] == "FULLY MET").sum())
+            n_part  = int((df_dem["Status"] == "PARTIAL").sum())
+            n_unmet = int((df_dem["Status"] == "UNMET").sum())
+            n_excl  = int((df_dem["Status"] == "EXCLUDED").sum())
+            total_built  = int(df_dem["GT_Built"].sum())
+            total_demand = int(df_dem["Customer_Demand"].sum())
             kpi_pct = round(100 * total_built / total_demand, 1) if total_demand else 0.0
 
-            footer  = len(df_dem) + 3
-            ws_dem.cell(row=footer, column=1, value="KPI SUMMARY").font = Font(bold=True)
-            ws_dem.cell(row=footer + 1, column=1, value="Total Customer Demand (units)")
-            ws_dem.cell(row=footer + 1, column=2, value=total_demand)
-            ws_dem.cell(row=footer + 2, column=1, value="Total GT Built (units)")
-            ws_dem.cell(row=footer + 2, column=2, value=total_built)
-            kpi_cell = ws_dem.cell(row=footer + 3, column=1, value="KPI — GT Built / Customer Demand")
-            kpi_cell.font = Font(bold=True)
-            kpi_val = ws_dem.cell(row=footer + 3, column=2, value=f"{kpi_pct}%")
-            kpi_val.font = Font(bold=True)
-            ws_dem.cell(row=footer + 4, column=1, value="")
-            ws_dem.cell(row=footer + 5, column=1, value="Total SKUs in demand file")
-            ws_dem.cell(row=footer + 5, column=2, value=len(df_dem))
-            ws_dem.cell(row=footer + 6, column=1, value="Fully Met")
-            ws_dem.cell(row=footer + 6, column=2, value=n_full)
-            ws_dem.cell(row=footer + 7, column=1, value="Partial")
-            ws_dem.cell(row=footer + 7, column=2, value=n_part)
-            ws_dem.cell(row=footer + 8, column=1, value="Unmet (in plan, not built)")
-            ws_dem.cell(row=footer + 8, column=2, value=n_unmet)
-            ws_dem.cell(row=footer + 9, column=1, value="Excluded (no machine / mould data)")
-            ws_dem.cell(row=footer + 9, column=2, value=n_excl)
-            ws_dem.cell(row=footer + 10, column=1, value="Total Building COs (no limit)")
-            ws_dem.cell(row=footer + 10, column=2, value=total_co_count)
-            ws_dem.cell(row=footer + 11, column=1, value="Curing COs scheduled (≤8/day)")
-            ws_dem.cell(row=footer + 11, column=2, value=len(df_co_plan) if df_co_plan is not None else 0)
+            # Over-production note: GT built may exceed cured because TopUp
+            # pre-builds inventory; the excess carries into the next period.
+            # Net GT demand here = total customer demand from demand file
+            # (not curing consumption), so KPI = GT Built / Customer Demand.
+            footer = len(df_dem) + 3
+            ws_dem.cell(row=footer,   column=1, value="KPI SUMMARY").font = Font(bold=True)
+            ws_dem.cell(row=footer+1, column=1, value="Total Customer Demand (units)  ← Net GT demand = this value")
+            ws_dem.cell(row=footer+1, column=2, value=total_demand)
+            ws_dem.cell(row=footer+2, column=1, value="Total GT Built (units)")
+            ws_dem.cell(row=footer+2, column=2, value=total_built)
+            _kpi = ws_dem.cell(row=footer+3, column=1, value="KPI — GT Built / Customer Demand")
+            _kpi.font = Font(bold=True)
+            _kpiv = ws_dem.cell(row=footer+3, column=2, value=f"{kpi_pct}%")
+            _kpiv.font = Font(bold=True)
+            ws_dem.cell(row=footer+4, column=1,
+                        value="Note: GT Built > Customer Demand possible — TopUp pre-builds inventory for next period")
+            ws_dem.cell(row=footer+6, column=1, value="Total SKUs in demand file")
+            ws_dem.cell(row=footer+6, column=2, value=len(df_dem))
+            ws_dem.cell(row=footer+7, column=1, value="Fully Met (≥95% of demand built)")
+            ws_dem.cell(row=footer+7, column=2, value=n_full)
+            ws_dem.cell(row=footer+8, column=1, value="Partial (0 < built < 95%)")
+            ws_dem.cell(row=footer+8, column=2, value=n_part)
+            ws_dem.cell(row=footer+9, column=1, value="Unmet (0 built)")
+            ws_dem.cell(row=footer+9, column=2, value=n_unmet)
+            ws_dem.cell(row=footer+10, column=1, value="Excluded (no machine / mould data)")
+            ws_dem.cell(row=footer+10, column=2, value=n_excl)
+            ws_dem.cell(row=footer+11, column=1, value="Total Building COs")
+            ws_dem.cell(row=footer+11, column=2, value=total_co_count)
+            ws_dem.cell(row=footer+12, column=1, value="Curing COs scheduled (≤8/day)")
+            ws_dem.cell(row=footer+12, column=2, value=len(df_co_plan) if df_co_plan is not None else 0)
+
             print(f"  [B2C KPI] GT Built / Customer Demand = {total_built:,} / {total_demand:,} = {kpi_pct}%")
             print(f"  [B2C Sheets] Demand Fulfillment (B2C): {len(df_dem)} SKUs "
                   f"(FULLY MET={n_full}, PARTIAL={n_part}, UNMET={n_unmet}, EXCLUDED={n_excl})")
