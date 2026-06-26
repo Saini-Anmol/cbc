@@ -1758,8 +1758,14 @@ class DemandHeuristicAssigner:
             return len([m for m in allow_map.get(sku, []) if m in m_idx])
         order = sorted(range(S), key=lambda si: (_elig_count(si), -sku_demand_mins[si]))
 
-        # Pre-compute priority steering: SKUs at or above median priority are
-        # "high-priority" and get UNISTAGE machines sorted first.
+        # Pre-compute priority steering.
+        # Above-median ConsolidatedPriorityScore SKUs get a soft UNISTAGE
+        # preference in the machine sort: UNISTAGE machines are placed first,
+        # weighted by the SKU's share of total curing demand.  STAGE2 remains
+        # in the eligible set as LP fallback — "soft prefer, never hard-enforce".
+        # LP then decides how many minutes each machine gets, balanced against
+        # CO cost; high-demand SKUs naturally attract more UNISTAGE minutes.
+        total_demand = float(max(sku_demand_units.sum(), 1))
         if priority_map:
             pri_values = sorted(priority_map.get(s, 0) for s in sku_list)
             pri_threshold = pri_values[len(pri_values) // 2] if pri_values else 0
@@ -1779,12 +1785,19 @@ class DemandHeuristicAssigner:
             is_high_pri = (pri_threshold is not None
                            and priority_map.get(sku, 0) >= pri_threshold)
 
-            # Sort: balance load first; for high-priority SKUs prefer UNISTAGE
-            # machines over STAGE2-only; then specialised machines first,
-            # history score, stable index tiebreak.
+            # Soft UNISTAGE bias proportional to this SKU's curing demand
+            # fraction.  High-demand high-priority SKUs get a stronger pull
+            # toward UNISTAGE (more negative score = sorted earlier).
+            # STAGE2 stays at 0.0 so LP can always trade UNISTAGE COs for
+            # STAGE2 minutes when COs would be prohibitively expensive.
+            if is_high_pri:
+                demand_frac = float(sku_demand_units[si]) / total_demand
+            else:
+                demand_frac = 0.0
+
             elig.sort(key=lambda m: (
                 int(y[:, m_idx[m]].sum()),
-                0 if (is_high_pri and m in unistage_set) else 1,
+                (-demand_frac if m in unistage_set else 0.0),
                 mach_elig_count.get(m, 0),
                 -history_map.get((m, sku), 0.0),
                 m_idx[m],
