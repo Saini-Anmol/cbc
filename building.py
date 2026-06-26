@@ -83,12 +83,13 @@ class Config:
     MIN_CAMPAIGN_UNITS      = 40
     BUFFER_SHIFTS           = 1
     URGENT_THRESHOLD_HOURS  = 16.0
-    # Match building to curing demand EXACTLY: the per-day LP may not build a SKU
-    # beyond its net curing demand (gross − opening WIP). 0.0 = build exactly the
-    # GTs curing needs, no surplus. (Raise this fraction only if you want a small
-    # build-ahead buffer; whole-tyre rounding in the schedule builder may still
-    # round a campaign to the nearest whole cycle.)
-    OVERBUILD_BUFFER_FRAC   = 0.0
+    # LP per-SKU production cap = net_demand × (1 + OVERBUILD_BUFFER_FRAC).
+    # 0.0 was causing LP cap to collapse to 0 on Days 2+ whenever TopUp or
+    # prior-day carry-over partially covered the lead-window demand.
+    # 0.2 gives a 20% headroom so the LP stays active even when some WIP already
+    # exists, without violating the hard "total build ≤ 30-day demand" ceiling
+    # enforced by the TopUp target (gt_topup_target is already capped to unmet demand).
+    OVERBUILD_BUFFER_FRAC   = 0.2
 
     # ── Build-ahead lead time ─────────────────────────────────────────
     # Building targets curing demand this many shifts ahead of today.
@@ -115,6 +116,11 @@ class Config:
     #   • Carcass (Stage1): max age 1 day  → build at most 1 day pre-use
     # Capping per-SKU cover to these windows also guarantees no on-hand
     # unit ever ages past its shelf life (FIFO: inv ≤ N-day demand ⇒ age ≤ N).
+    #
+    # LP now uses cap_on_gross=True, so the LP cap = gross×buf regardless of
+    # rolling WIP. TopUp and LP no longer compete for the same demand window —
+    # LP covers Day+1 and TopUp builds ahead for Days+2,+3,+4 in idle machine
+    # tails, reducing late-horizon starvation risk.
     TOPUP_LOOKAHEAD_DAYS_GT      = 3
     TOPUP_LOOKAHEAD_DAYS_CARCASS = 1
 
@@ -1316,7 +1322,8 @@ class LPMinuteSolver:
         self.T = Config.SHIFTS_PER_DAY
 
     def solve(self, y, curing_matrix, ct_map, sku_list, machines,
-              inv_init, locked_pairs, inv_cap=None, co_time_map=None):
+              inv_init, locked_pairs, inv_cap=None, co_time_map=None,
+              cap_on_gross=False):
         S, M, T = len(sku_list), len(machines), self.T
         if S == 0 or M == 0:
             return None, float("inf"), {}
@@ -1442,9 +1449,16 @@ class LPMinuteSolver:
                             r[0, xi(si, mi, t)] = 1.0 / ct
             rows.append(r); bvals.append(max(rhs, 0.0))
 
-        # PRODUCTION CAP per SKU — keep building MATCHED to curing demand rather
-        # than maximizing throughput to capacity. Units built for a SKU this day
-        # may not exceed its net demand (gross − opening WIP) × (1 + buffer).
+        # PRODUCTION CAP per SKU — limits daily building to avoid gross
+        # overproduction.  Two modes:
+        #   cap_on_gross=True  (GT):  cap = gross × buf, ignoring WIP.
+        #     Used when rolling WIP from DB inventory would otherwise suppress
+        #     the cap to zero and leave machines idle.  The starvation constraint
+        #     (above) already uses WIP to set the lower bound; this upper bound
+        #     just prevents runaway overproduction beyond 1+buf× daily demand.
+        #   cap_on_gross=False (S1):  cap = max(0, gross − wip0) × buf.
+        #     Classic net-demand cap; safe for carcass whose 1-day shelf life
+        #     means surplus inventory should suppress today's build.
         # Floored at the locked minimum so continuity locks never make it
         # infeasible. Σ_{m,t} x[s,m,t]/ct ≤ cap_units[s].
         buf = 1.0 + float(getattr(Config, "OVERBUILD_BUFFER_FRAC", 0.10))
@@ -1456,8 +1470,11 @@ class LPMinuteSolver:
                     locked_floor[sku_idx[sku_lock]] += lock_min / ctl
         for si, sku in enumerate(sku_list):
             gross = float(curing_matrix[si].sum())
-            wip0  = float(inv_init.get(sku, 0))
-            cap_units = max(max(0.0, gross - wip0) * buf, float(locked_floor[si]))
+            if cap_on_gross:
+                cap_units = max(gross * buf, float(locked_floor[si]))
+            else:
+                wip0  = float(inv_init.get(sku, 0))
+                cap_units = max(max(0.0, gross - wip0) * buf, float(locked_floor[si]))
             r = new_row()
             for mi, mach in enumerate(machines):
                 ct = ct_map.get(mach, 2.0)
@@ -1653,6 +1670,138 @@ class GeneticOptimiser:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# DEMAND HEURISTIC ASSIGNER  (replaces GeneticOptimiser in bc_lp branch)
+# ══════════════════════════════════════════════════════════════════════
+# Deterministic, demand-driven machine assignment.
+#
+# Algorithm (per day):
+#   For each SKU sorted by total demand DESC:
+#     1. Find eligible machines: allow_map[sku] ∩ machines
+#     2. Score by history_count[(machine, sku)] — prefer experienced machines
+#     3. Assign top-N machines until demand_minutes ≤ assigned_capacity
+#     4. Machines are partially committed — other SKUs share remaining idle time
+#
+# Returns y[S, M] binary matrix, which is passed directly to LPMinuteSolver.
+# ~100 lines vs ~600 lines of GA; deterministic, debuggable, demand-driven.
+class DemandHeuristicAssigner:
+    """
+    Demand-driven heuristic machine assignment — replaces GeneticOptimiser.
+    Produces a y[S, M] matrix for LPMinuteSolver.
+    """
+    MAX_MACH_PER_SKU = 5   # cap matches GA's MAX_MACH_PER_SKU
+    MIN_MACH_PER_SKU = 1
+    MAX_SKUS_PER_MACHINE = 4  # hard cap to limit CO overhead per machine
+
+    def assign(self, sku_list, machines, allow_map, curing_matrix,
+               ct_map, history_map, locked_pairs, co_time_map=None):
+        """
+        Build y[S, M] assignment matrix.
+
+        Parameters
+        ----------
+        sku_list      : list[str]  — length S
+        machines      : list[str]  — length M
+        allow_map     : dict {sku: set(machines)} — eligible machines per SKU
+        curing_matrix : ndarray (S, T) — demand per SKU per shift
+        ct_map        : dict {machine: cycle_time_min}
+        history_map   : dict {(machine, sku): count} — 3-month history score
+        locked_pairs  : list[(machine, sku)] — currently-running pairs
+        co_time_map   : unused (kept for API compatibility with GA)
+
+        Returns
+        -------
+        y : ndarray (S, M) int8
+        """
+        S, M = len(sku_list), len(machines)
+        y = np.zeros((S, M), dtype=np.int8)
+        if S == 0 or M == 0:
+            return y
+
+        m_idx   = {m: i for i, m in enumerate(machines)}
+        sku_idx = {s: i for i, s in enumerate(sku_list)}
+
+        # Enforce locks: currently-running machines stay with their SKU.
+        for m_lock, sku_lock in locked_pairs:
+            if sku_lock in sku_idx and m_lock in m_idx:
+                y[sku_idx[sku_lock], m_idx[m_lock]] = 1
+
+        # Demand in machine-minutes per SKU (total across all shifts today).
+        T   = curing_matrix.shape[1]
+        cap = float(Config.SHIFT_MINS * T)   # full-day capacity per machine
+
+        sku_demand_units = curing_matrix.sum(axis=1)    # (S,) units
+        sku_demand_mins  = np.zeros(S, dtype=float)
+        for si, sku in enumerate(sku_list):
+            elig = [m for m in allow_map.get(sku, []) if m in m_idx]
+            if elig:
+                avg_ct = sum(ct_map.get(m, 2.0) for m in elig) / len(elig)
+            else:
+                avg_ct = 2.0
+            sku_demand_mins[si] = float(sku_demand_units[si]) * avg_ct
+
+        # Pre-compute per-machine demand eligibility count (how many SKUs can
+        # use each machine). Machines with fewer eligible SKUs are more
+        # specialised; prefer them to avoid flooding general-purpose machines.
+        mach_elig_count = {
+            m: sum(1 for si in range(S) if m in allow_map.get(sku_list[si], set()))
+            for m in machines
+        }
+
+        # Sort SKUs: most-constrained first (fewest eligible GT machines) so
+        # restricted SKUs get placed before popular machines fill up; within
+        # equal eligibility, highest demand first to prioritise load.
+        def _elig_count(si):
+            sku = sku_list[si]
+            return len([m for m in allow_map.get(sku, []) if m in m_idx])
+        order = sorted(range(S), key=lambda si: (_elig_count(si), -sku_demand_mins[si]))
+
+        for si in order:
+            sku         = sku_list[si]
+            demand_mins = float(sku_demand_mins[si])
+
+            elig = [m for m in allow_map.get(sku, []) if m in m_idx]
+            if not elig:
+                continue
+
+            # Sort: balance load first, then prefer specialised machines
+            # (fewest total eligible SKUs → UNISTAGE before STAGE2-only),
+            # then history score, then stable index tiebreak.
+            elig.sort(key=lambda m: (
+                int(y[:, m_idx[m]].sum()),
+                mach_elig_count.get(m, 0),
+                -history_map.get((m, sku), 0.0),
+                m_idx[m],
+            ))
+
+            # Machines needed to cover demand (at least MIN, at most MAX).
+            if demand_mins > 0 and cap > 0:
+                n_needed = max(self.MIN_MACH_PER_SKU,
+                               math.ceil(demand_mins / cap))
+            else:
+                n_needed = self.MIN_MACH_PER_SKU
+            n_needed = min(n_needed, self.MAX_MACH_PER_SKU, len(elig))
+
+            already = int(y[si].sum())   # count locked machines already set
+
+            # Prefer machines under the per-machine SKU cap; fall back to any
+            # eligible machine if all are at cap (so no SKU is left unassigned).
+            cap_limit = self.MAX_SKUS_PER_MACHINE
+            elig_under_cap = [m for m in elig if int(y[:, m_idx[m]].sum()) < cap_limit]
+            elig_to_use = elig_under_cap if elig_under_cap else elig
+
+            for m in elig_to_use:
+                if already >= n_needed:
+                    break
+                mi = m_idx[m]
+                if y[si, mi] == 1:
+                    continue            # lock already set this entry
+                y[si, mi] = 1
+                already  += 1
+
+        return y
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Allocation extractor
 # ══════════════════════════════════════════════════════════════════════
 def lp_x_to_alloc(x, sku_list, machines, ct_map):
@@ -1684,8 +1833,11 @@ def lp_x_to_alloc(x, sku_list, machines, ct_map):
 # HYBRID DAILY SCHEDULER
 # ══════════════════════════════════════════════════════════════════════
 class HybridDailyScheduler:
-    """End-to-end scheduler. Runs one GA + LP pass per plan-day, rolling
-    GT/carcass inventory and running-machine state forward between days.
+    """End-to-end scheduler. Runs one Heuristic + LP pass per plan-day,
+    rolling GT/carcass inventory and running-machine state forward between days.
+
+    Machine assignment: DemandHeuristicAssigner (demand-driven, deterministic).
+    Minute allocation:  LPMinuteSolver (continuous LP, HiGHS backend).
     """
 
     def run(self, df_curing, df_gt_inv, df_carcass_inv, df_allow, co_map,
@@ -1694,9 +1846,9 @@ class HybridDailyScheduler:
         # Pipeline (once per day of horizon):
         #   1. Slice today's curing demand, subtract opening GT inv.
         #   2. Inch-lock Stage1/Unistage presses (coverage-then-balance).
-        #   3. GA + LP → today's GT (Stage2 + Unistage) allocation.
+        #   3. Heuristic assignment → LP → today's GT (Stage2+Unistage) alloc.
         #   4. Derive Stage-1 carcass demand from Stage-2 output.
-        #   5. GA + LP again → today's Stage-1 (carcass) allocation.
+        #   5. Heuristic assignment → LP again → today's Stage-1 (carcass) alloc.
         #   6. Sequence campaigns per press, insert CHANGEOVER rows.
         #   7. TopUp: fill idle tails with pre-build for future demand.
         #   8. Anti-starvation validation (WIP balance per shift).
@@ -1803,12 +1955,11 @@ class HybridDailyScheduler:
                 if not s1_inv.empty else {}
             )
 
-            # When using lead-time building the LP cap formula is:
-            #   cap = max(0, gross_lead − wip0) × buf
-            # In steady state wip0 ≈ today's demand ≈ gross_lead → cap ≈ 0.
-            # Fix: subtract today's curing consumption from opening WIP so the LP
-            # sees the net WIP that will remain AFTER today's curing has run.
-            # That net WIP is then compared against tomorrow's (lead) demand.
+            # gt_inv_for_cap feeds the LP starvation constraint (lower bound) so
+            # the LP knows how much WIP will remain after today's curing.
+            # The PRODUCTION CAP now uses cap_on_gross=True (gross×buf) and
+            # ignores wip0 entirely, preventing cap-collapse when DB inventory
+            # is large relative to the lead-window demand.
             if Config.BUILD_LEAD_SHIFTS > 0:
                 _today_cure_qty = day_curing.groupby("SKUCode")["Qty"].sum().to_dict()
                 gt_inv_for_cap = {
@@ -2002,25 +2153,31 @@ class HybridDailyScheduler:
                     out[sku] = keep
                 return out
 
-            # GT GA + LP
-            gt_machines = sorted(Config.STAGE2 | Config.UNISTAGE)
+            # GT  — Heuristic assignment → LP minute allocation
+            gt_machines  = sorted(Config.STAGE2 | Config.UNISTAGE)
             allow_map_gt = _filter_for_locks(allow_map)
-            gt_locked   = [(m, s) for m, s in locked.items() if m in gt_machines]
-            ga = GeneticOptimiser(rng_seed=42 + d)
-            best_y_gt, best_x_gt, meta_gt = ga.optimise(
+            gt_locked    = [(m, s) for m, s in locked.items() if m in gt_machines]
+
+            heuristic_gt = DemandHeuristicAssigner()
+            best_y_gt    = heuristic_gt.assign(
                 sku_list, gt_machines, allow_map_gt, cur_mat, ct_map,
-                gt_inv_for_cap, gt_locked, history_map,
-                inv_cap=None, label="GT",
-                co_time_map=co_time_map,
+                history_map or {}, gt_locked, co_time_map=co_time_map,
+            )
+            lp_gt = LPMinuteSolver()
+            best_x_gt, _, meta_gt = lp_gt.solve(
+                best_y_gt, cur_mat, ct_map, sku_list, gt_machines,
+                gt_inv_for_cap, gt_locked, co_time_map=co_time_map,
+                cap_on_gross=True,
             )
             df_gt_alloc = (
                 lp_x_to_alloc(best_x_gt, sku_list, gt_machines, ct_map)
                 if best_x_gt is not None else pd.DataFrame()
             )
-            print(f"  [GA-GT] Final units={meta_gt.get('units',0):,.0f}  "
+            print(f"  [Heuristic-GT] units={meta_gt.get('units',0):,.0f}  "
                   f"slack={meta_gt.get('slack',0):,.0f}  "
                   f"distinct SKUs="
-                  f"{int((best_y_gt.sum(axis=1)>0).sum()) if best_y_gt is not None else 0}")
+                  f"{int((best_y_gt.sum(axis=1)>0).sum())}  "
+                  f"y_sum={int(best_y_gt.sum())}")
 
             # Carcass demand from Stage2 only
             if not df_gt_alloc.empty:
@@ -2053,14 +2210,18 @@ class HybridDailyScheduler:
                     dem = float(carc_dem_map.get(sku, 0))
                     s1_mat[si, :] = dem / T_day
 
-                s1_locked = [(m, s) for m, s in locked.items() if m in s1_machines]
+                s1_locked    = [(m, s) for m, s in locked.items() if m in s1_machines]
                 allow_map_s1 = _filter_for_locks(allow_map)
-                ga2 = GeneticOptimiser(rng_seed=999 + d)
-                best_y_s1, best_x_s1, meta_s1 = ga2.optimise(
+
+                heuristic_s1 = DemandHeuristicAssigner()
+                y_s1 = heuristic_s1.assign(
                     s1_sku_list, s1_machines, allow_map_s1, s1_mat, ct_map,
-                    carc_inv_init, s1_locked, history_map,
-                    inv_cap=None, label="S1",
-                    co_time_map=co_time_map,
+                    history_map or {}, s1_locked, co_time_map=co_time_map,
+                )
+                lp_s1 = LPMinuteSolver()
+                best_x_s1, _, meta_s1 = lp_s1.solve(
+                    y_s1, s1_mat, ct_map, s1_sku_list, s1_machines,
+                    carc_inv_init, s1_locked, co_time_map=co_time_map,
                 )
                 if best_x_s1 is not None:
                     df_s1_alloc = lp_x_to_alloc(
@@ -2235,7 +2396,15 @@ class HybridDailyScheduler:
                     0.0, self._s1_remaining.get(sku, 0.0) - float(qty)
                 )
 
-            running = self._update_running(df_all, running)
+            # Only carry forward machine locks from Day 0 (the real-time DB snapshot).
+            # From Day 1 onward, all machines are free to be reassigned by the
+            # heuristic. Without this, all Unistage machines stay size-locked to
+            # their Day-0 end-SKU for the full 30-day horizon, starving SKUs of
+            # different sizes from using those machines.
+            if d == 0:
+                running = self._update_running(df_all, running)
+            else:
+                running = pd.DataFrame(columns=["Machine", "SKUCode"])
 
             print(f"  [Day {d+1}] EOD GT inv: {int(gt_inv['GT_Inventory'].sum()):,}  |  "
                   f"Carcass inv: {int(s1_inv['Carcass_Inventory'].sum()):,}")

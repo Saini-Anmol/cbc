@@ -100,11 +100,18 @@ class ConsumptionETL:
             df = pd.read_csv(path)
         else:
             df = pd.read_excel(path)
-        qty_col = "Updated_Requirement" if "Updated_Requirement" in df.columns else "Requirement"
-        df = (df.groupby("SKUCode")
-                .agg(Quantity=(qty_col, "sum"),
-                     Priority=("ConsolidatedPriorityScore", "max"))
-                .reset_index())
+        # Already normalised format (SKUCode, Quantity, Priority)
+        if "Quantity" in df.columns and "Priority" in df.columns:
+            df = df.groupby("SKUCode").agg(
+                Quantity=("Quantity", "sum"),
+                Priority=("Priority", "max"),
+            ).reset_index()
+        else:
+            qty_col = "Updated_Requirement" if "Updated_Requirement" in df.columns else "Requirement"
+            df = (df.groupby("SKUCode")
+                    .agg(Quantity=(qty_col, "sum"),
+                         Priority=("ConsolidatedPriorityScore", "max"))
+                    .reset_index())
         return df[df["Quantity"] > 0].copy()
 
     # -- adapted from curing_lp.ETL.load_cycle_times (lines 332-343) ----------

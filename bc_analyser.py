@@ -132,7 +132,8 @@ class BCAnalyser:
         print("  [Analyser] Loading curing schedule …")
         self.df_cur_shift  = _read_sheet(self.curing_path, "Shift Schedule",
                                          required_cols={"SKUCode", "Date", "Shift"})
-        self.df_gt_balance = _read_sheet(self.curing_path, "GT Balance")
+        self.df_gt_balance = _read_sheet(self.curing_path, "GT Balance",
+                                         required_cols={"Building_Output", "Curing_Consumption"})
         self.df_demand_ful = _read_sheet(self.curing_path, "Demand Fulfillment",
                                          required_cols={"SKUCode", "Demand_Qty"})
         self.df_daily_sum  = _read_sheet(self.curing_path, "Daily Summary",

@@ -71,12 +71,12 @@ os.makedirs(MAIN_OUT, exist_ok=True)
 # 1) Demand file. Drop the new demand workbook in data/input/ and point here.
 #    Required columns: SKUCode, Requirement (or Updated_Requirement),
 #    ConsolidatedPriorityScore. Everything else comes from the DB.
-DEMAND_FILE = os.path.join(IN, "demand_tomerji_june_normalized.xlsx")
+DEMAND_FILE = os.path.join(IN, "demand_may.xlsx")
 
 # 2) First shift of the plan (07:00 = shift-A start) and number of days.
-#    Building pre-start = 1 shift before this (May 31 Shift C for June plan).
-PLAN_START_DT = datetime(2026, 6, 1, 7, 0, 0)
-PLANNING_DAYS = 30
+#    Building pre-start = 1 shift before this (Apr 30 Shift C for May plan).
+PLAN_START_DT = datetime(2026, 5, 1, 7, 0, 0)
+PLANNING_DAYS = 31
 
 
 # ══════════════════════════════════════════════════════════════════════════════

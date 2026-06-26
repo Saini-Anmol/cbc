@@ -76,7 +76,9 @@ os.makedirs(MAIN_OUT, exist_ok=True)
 # Applied at module level so that all building.py classes that reference
 # Config.X pick up the B2C values when called through this module.
 Config.MAX_CHANGEOVERS_PER_DAY = 8   # new plant-wide daily cap
-Config.OVERBUILD_BUFFER_FRAC   = 0.0 # strict: build exactly what curing consumes
+# OVERBUILD_BUFFER_FRAC: inherits 0.2 from building.py Config — do NOT override
+# to 0.0 here. The 20% LP headroom prevents cap collapse on Days 2+ without
+# violating the "total build ≤ 30-day demand" ceiling enforced by gt_topup_target.
 # Building lead time: day D LP targets day D+1 curing demand (1 full day ahead).
 # Eliminates LP cap collapse on Day 2+ where same-day WIP blocks new building.
 # Default already 3 in Config; explicit here so operators can tune per-run.
@@ -251,12 +253,17 @@ def _make_synthetic_curing(
     df_consumption: pd.DataFrame,
     plan_start: datetime,
     planning_days: int,
+    nri_skus_to_build: set | None = None,
 ) -> pd.DataFrame:
     """
     Convert the consumption table into a df_curing-compatible DataFrame so
     the existing HybridDailyScheduler can consume it without modification.
 
     Produces one row per (SKU, shift) for the full planning horizon.
+
+    nri_skus_to_build: if provided, only NRI SKUs in this set get LP demand;
+    inactive NRI presses (no CO scheduled) are excluded to avoid wasting
+    building capacity on uncurable green tyres.
     """
     rows = []
     shift_hours = [
@@ -279,7 +286,10 @@ def _make_synthetic_curing(
             else:
                 target_qty = qty_ps
         elif cat == "Non-Runner-In" and dem_qty > 0:
-            # Spread total demand evenly so the LP sees steady need
+            # Only build NRI SKUs with a planned CO (active press); skip the rest
+            # to concentrate building capacity on Runner-In curing demand.
+            if nri_skus_to_build is not None and sku not in nri_skus_to_build:
+                continue
             target_qty = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
         else:
             continue  # Runner-Out: no building demand
@@ -547,11 +557,12 @@ def run_from_database_b2c(
     except Exception as _e:
         print(f"  [Config] CT load from DB failed ({_e}); using hardcoded fallback")
 
-    # ── B2C pre-start: 1 shift before first curing shift ─────────────────────
-    # CBC used 1 full day (LEAD_DAYS=1); B2C uses 1 shift (8 hours).
-    # plan_start = June 1 07:00 (Shift A) → build_start = May 31 23:00 (Shift C)
-    build_start = plan_start - timedelta(hours=Config.HOURS_PER_SHIFT)
-    print(f"  [Config] Plan start:  {plan_start}  |  Build start: {build_start}")
+    # ── B2C pre-start: 3 shifts before first curing shift ────────────────────
+    # Building gets a 3-shift head-start to build opening GT inventory.
+    # plan_start = May 1 07:00 (Shift A) → build_start = Apr 30 07:00 (Shift A)
+    PRE_START_SHIFTS = 3
+    build_start = plan_start - timedelta(hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS)
+    print(f"  [Config] Plan start:  {plan_start}  |  Build start: {build_start} ({PRE_START_SHIFTS} shifts early)")
     print(f"  [Config] Planning days: {Config.PLANNING_DAYS}")
 
     # ── ETL ──────────────────────────────────────────────────────────────────
@@ -586,7 +597,7 @@ def run_from_database_b2c(
     print("  [ETL] Loading running building machines (for continuity locks) …")
     df_running = etl.load_running_machines()
 
-    print("  [ETL] Loading history map (GA seed) …")
+    print("  [ETL] Loading history map (heuristic scoring) …")
     history_map = etl.load_history_map()
 
     print("  [ETL] Loading running curing moulds (for changeover planning) …")
@@ -622,21 +633,27 @@ def run_from_database_b2c(
     print("  [Synthetic] Building synthetic curing schedule from consumption table …")
     df_consumption_updated = df_consumption.copy()
 
+    # Only build NRI SKUs that have a scheduled CO (press activation planned).
+    # Inactive NRI presses waste building capacity on uncurable green tyres.
+    nri_with_co = (
+        set(df_co_plan["Target_SKU"].astype(str).tolist())
+        if df_co_plan is not None and not df_co_plan.empty and "Target_SKU" in df_co_plan.columns
+        else set()
+    )
     df_curing_synthetic = _make_synthetic_curing(
-        df_consumption_updated, plan_start, Config.PLANNING_DAYS
+        df_consumption_updated, plan_start, Config.PLANNING_DAYS,
+        nri_skus_to_build=nri_with_co,
     )
     n_skus = df_curing_synthetic["SKUCode"].nunique()
     print(f"  [Synthetic] {len(df_curing_synthetic)} rows | {n_skus} SKUs")
 
-    # Apply the 1-shift offset: the building plan's time window starts at build_start,
-    # not plan_start. Shift the synthetic curing times back by 1 shift so day 0
-    # of building covers the pre-start shift (May 31 Shift C → June 1 Shift A).
-    # The existing HybridDailyScheduler loops from build_start to build_start+N_DAYS.
+    # Shift synthetic curing times back by PRE_START_SHIFTS so the scheduler's
+    # day-0 window aligns with build_start (not plan_start).
     df_curing_synthetic["StartTime"] = df_curing_synthetic["StartTime"] - timedelta(
-        hours=Config.HOURS_PER_SHIFT
+        hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS
     )
     df_curing_synthetic["EndTime"] = df_curing_synthetic["EndTime"] - timedelta(
-        hours=Config.HOURS_PER_SHIFT
+        hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS
     )
 
     # ── Run the existing HybridDailyScheduler ────────────────────────────────
@@ -652,7 +669,7 @@ def run_from_database_b2c(
         co_map,
         sku_to_size,
         df_running,         # REAL running machine state
-        build_start,        # 1 shift before plan_start
+        build_start,        # PRE_START_SHIFTS before plan_start
         history_map=history_map,
     )
 

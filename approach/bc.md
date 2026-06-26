@@ -791,7 +791,8 @@ run_b2c(cfg):
 | `OPENING_CARCASS_INVENTORY` | **0 (cold start)** | Stage-2 blocked until Stage-1 produces carcasses in this plan |
 | `BUILDING_GT_CAP` | `min(press_consumption, demand/90)` | building output ≤ customer demand per SKU |
 | `BUILD_LEAD_SHIFTS` | **3** | building targets curing demand this many shifts ahead; 3 = 1 full day |
-| `OVERBUILD_BUFFER_FRAC` | 0.0 | fractional surplus allowed above net curing demand; 0 = exact match |
+| `TOPUP_LOOKAHEAD_DAYS_GT` | **1** | idle-tail TopUp only pre-builds for the next 1 day. Set to 1 (not 3) so TopUp targets the same Day+1 window as the LP — they complement instead of conflicting. Lookahead=3 pre-filled Days 2/3/4 on Day 1, making LP cap=0 on Day 2+. |
+| `OVERBUILD_BUFFER_FRAC` | **0.2** | fractional LP headroom above net curing demand per SKU per day. 0.0 caused LP cap to collapse to 0 on Days 2+ when TopUp pre-build partially covered the lead window; 0.2 keeps the LP active without violating the "total build ≤ 30-day demand" ceiling enforced by `gt_topup_target` |
 | `BUILDING_START_OFFSET_SHIFTS` | -3 | building pre-start = 3 shifts (1 day) before curing Shift A |
 | `BUILDING_PRE_SHIFT` | `Shift A of Day-1` | e.g. May 31 Shift A if curing starts June 1 |
 
