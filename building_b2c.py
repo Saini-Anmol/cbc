@@ -764,6 +764,41 @@ def run_from_database_b2c(
         demand_cap=demand_cap if demand_cap else None,
     )
 
+    # ── Patch GT_Demand → always use Demand_Qty from demand file ────────────
+    # The scheduler derives GT_Demand from curing_matrix.sum() = min(press_rate,
+    # demand_rate) × shifts. For slow presses this is < customer demand, causing
+    # the KPI to undercount. Override with Demand_Qty so the KPI always shows the
+    # true customer demand (694,973) regardless of press burn rate.
+    _dem_qty_map: dict = {}
+    if df_consumption_updated is not None and not df_consumption_updated.empty:
+        for _, _cr in df_consumption_updated.iterrows():
+            _s = str(_cr["SKUCode"])
+            _q = float(_cr.get("Demand_Qty", 0) or 0)
+            if _q > 0:
+                _dem_qty_map[_s] = int(_q)
+
+    if "demand_summary" in results and not results["demand_summary"].empty and _dem_qty_map:
+        _ds = results["demand_summary"].copy()
+        _old_gt = _ds.set_index("SKUCode")["GT_Demand"].to_dict()
+        _ds["GT_Demand"] = _ds["SKUCode"].astype(str).map(
+            lambda s: _dem_qty_map.get(s) or int(_old_gt.get(s, 0))
+        )
+        _ds["Net_GT_Demand"] = (
+            _ds["GT_Demand"] - _ds["GT_Inventory"]
+        ).clip(lower=0).astype(int)
+        _ds["Gap"] = (_ds["GT_Demand"] - _ds["Planned_GT"]).clip(lower=0)
+        _ds["Fulfillment_Pct"] = (
+            _ds["Planned_GT"] / _ds["GT_Demand"].replace(0, 1) * 100
+        ).round(1)
+        _ds["Status"] = _ds.apply(
+            lambda r: ("FULLY MET" if r["Planned_GT"] >= r["Net_GT_Demand"]
+                       else "PARTIAL" if r["Planned_GT"] > 0 else "UNMET"),
+            axis=1,
+        )
+        results["demand_summary"] = _ds
+        print(f"  [Summary] GT_Demand patched from demand file for "
+              f"{len(_dem_qty_map)} SKUs")
+
     # ── Augment demand_summary with ALL demand SKUs ───────────────────────────
     # scheduler.run() only includes LP-active SKUs (Runner-In + NRI-with-CO).
     # Add remaining demand SKUs so the Demand Summary sheet shows all 89.
