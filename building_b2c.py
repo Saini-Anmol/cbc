@@ -656,6 +656,41 @@ def run_from_database_b2c(
         hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS
     )
 
+    # ── UNISTAGE priority steering & idle-fill demand ────────────────────────
+    # priority_map: steer high-priority SKUs onto UNISTAGE machines in assigner.
+    if "Priority_Score" in df_consumption_updated.columns:
+        priority_map = dict(zip(
+            df_consumption_updated["SKUCode"].astype(str),
+            df_consumption_updated["Priority_Score"].fillna(0),
+        ))
+    else:
+        priority_map = {}
+
+    # extra_topup_demand: NRI SKUs excluded from LP (no planned CO) but
+    # eligible for UNISTAGE — lets TopUp fill idle UNISTAGE time with them.
+    unistage_set = set(map(str, Config.UNISTAGE))
+    allow_map_lookup = {}
+    for _, r in df_allow.iterrows():
+        allow_map_lookup[str(r["SKUCode"])] = set(map(str, r.get("Machines", [])))
+
+    qty_col = "Demand_Qty" if "Demand_Qty" in df_consumption_updated.columns else None
+    nri_no_co_mask = (
+        (df_consumption_updated["Category"] == "Non-Runner-In") &
+        (~df_consumption_updated["SKUCode"].astype(str).isin(nri_with_co))
+    )
+    extra_topup_demand = {}
+    for _, row in df_consumption_updated[nri_no_co_mask].iterrows():
+        sku = str(row["SKUCode"])
+        if allow_map_lookup.get(sku, set()) & unistage_set:
+            demand = float(row[qty_col]) if qty_col else 0.0
+            if demand > 0:
+                extra_topup_demand[sku] = demand
+
+    n_extra = len(extra_topup_demand)
+    extra_total = sum(extra_topup_demand.values())
+    print(f"  [UNISTAGE] {n_extra} NRI SKUs ({extra_total:,.0f} units) added to "
+          f"UNISTAGE idle-fill pool")
+
     # ── Run the existing HybridDailyScheduler ────────────────────────────────
     # Pass real GT/carcass inventory (NOT zeroed — B2C uses opening inventory).
     # Pass real running machine state (continuity locks active on Day 0).
@@ -671,6 +706,8 @@ def run_from_database_b2c(
         df_running,         # REAL running machine state
         build_start,        # PRE_START_SHIFTS before plan_start
         history_map=history_map,
+        priority_map=priority_map,
+        extra_topup_demand=extra_topup_demand if extra_topup_demand else None,
     )
 
     # ── Attach B2C-specific data to results ───────────────────────────────────

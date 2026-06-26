@@ -1693,7 +1693,8 @@ class DemandHeuristicAssigner:
     MAX_SKUS_PER_MACHINE = 4  # hard cap to limit CO overhead per machine
 
     def assign(self, sku_list, machines, allow_map, curing_matrix,
-               ct_map, history_map, locked_pairs, co_time_map=None):
+               ct_map, history_map, locked_pairs, co_time_map=None,
+               priority_map=None):
         """
         Build y[S, M] assignment matrix.
 
@@ -1707,6 +1708,8 @@ class DemandHeuristicAssigner:
         history_map   : dict {(machine, sku): count} — 3-month history score
         locked_pairs  : list[(machine, sku)] — currently-running pairs
         co_time_map   : unused (kept for API compatibility with GA)
+        priority_map  : dict {sku: float} — demand priority score (higher = more urgent)
+                        If provided, high-priority SKUs are steered to UNISTAGE first.
 
         Returns
         -------
@@ -1755,6 +1758,16 @@ class DemandHeuristicAssigner:
             return len([m for m in allow_map.get(sku, []) if m in m_idx])
         order = sorted(range(S), key=lambda si: (_elig_count(si), -sku_demand_mins[si]))
 
+        # Pre-compute priority steering: SKUs at or above median priority are
+        # "high-priority" and get UNISTAGE machines sorted first.
+        if priority_map:
+            pri_values = sorted(priority_map.get(s, 0) for s in sku_list)
+            pri_threshold = pri_values[len(pri_values) // 2] if pri_values else 0
+            unistage_set = set(Config.UNISTAGE)
+        else:
+            pri_threshold = None
+            unistage_set = set()
+
         for si in order:
             sku         = sku_list[si]
             demand_mins = float(sku_demand_mins[si])
@@ -1763,11 +1776,15 @@ class DemandHeuristicAssigner:
             if not elig:
                 continue
 
-            # Sort: balance load first, then prefer specialised machines
-            # (fewest total eligible SKUs → UNISTAGE before STAGE2-only),
-            # then history score, then stable index tiebreak.
+            is_high_pri = (pri_threshold is not None
+                           and priority_map.get(sku, 0) >= pri_threshold)
+
+            # Sort: balance load first; for high-priority SKUs prefer UNISTAGE
+            # machines over STAGE2-only; then specialised machines first,
+            # history score, stable index tiebreak.
             elig.sort(key=lambda m: (
                 int(y[:, m_idx[m]].sum()),
+                0 if (is_high_pri and m in unistage_set) else 1,
                 mach_elig_count.get(m, 0),
                 -history_map.get((m, sku), 0.0),
                 m_idx[m],
@@ -1842,7 +1859,7 @@ class HybridDailyScheduler:
 
     def run(self, df_curing, df_gt_inv, df_carcass_inv, df_allow, co_map,
             sku_to_size, df_running, plan_start,
-            history_map=None):
+            history_map=None, priority_map=None, extra_topup_demand=None):
         # Pipeline (once per day of horizon):
         #   1. Slice today's curing demand, subtract opening GT inv.
         #   2. Inch-lock Stage1/Unistage presses (coverage-then-balance).
@@ -1882,6 +1899,13 @@ class HybridDailyScheduler:
         self._gt_remaining = (
             df_curing.groupby("SKUCode")["Qty"].sum().to_dict()
         )
+        # Augment with NRI/other SKUs that UNISTAGE can produce but aren't
+        # in the active curing plan — lets TopUp fill idle UNISTAGE time.
+        if extra_topup_demand:
+            for sku, qty in extra_topup_demand.items():
+                self._gt_remaining[sku] = (
+                    self._gt_remaining.get(sku, 0) + qty
+                )
         # Stage1 topup target — approximated as horizon GT demand of SKUs
         # that will be produced on Stage2 downstream (they need carcass).
         # For simplicity, mirror the GT target initially and let stage1_roll
@@ -2162,6 +2186,7 @@ class HybridDailyScheduler:
             best_y_gt    = heuristic_gt.assign(
                 sku_list, gt_machines, allow_map_gt, cur_mat, ct_map,
                 history_map or {}, gt_locked, co_time_map=co_time_map,
+                priority_map=priority_map,
             )
             lp_gt = LPMinuteSolver()
             best_x_gt, _, meta_gt = lp_gt.solve(
