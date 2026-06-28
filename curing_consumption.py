@@ -95,23 +95,63 @@ class ConsumptionETL:
 
     # -- adapted from curing_lp.ETL.load_demand (lines 316-330) ---------------
     def load_demand(self, path: str) -> pd.DataFrame:
-        """Load demand file. Returns [SKUCode, Quantity, Priority]."""
+        """Load demand file. Returns [SKUCode, Quantity, Priority].
+
+        Handles multiple input formats:
+          - Normalised: SKUCode / Quantity / Priority
+          - JKT raw CSV: skuCode / requirement (no priority col)
+          - JKT normalised XLSX: SKUCode / Requirement / ConsolidatedPriorityScore
+          - Legacy: SKUCode / Updated_Requirement / ConsolidatedPriorityScore
+        """
         if str(path).lower().endswith(".csv"):
             df = pd.read_csv(path)
         else:
             df = pd.read_excel(path)
-        # Already normalised format (SKUCode, Quantity, Priority)
-        if "Quantity" in df.columns and "Priority" in df.columns:
-            df = df.groupby("SKUCode").agg(
-                Quantity=("Quantity", "sum"),
-                Priority=("Priority", "max"),
-            ).reset_index()
+
+        # Normalise column names (handle camelCase / lowercase variations)
+        col_map = {
+            "skuCode":  "SKUCode",
+            "sku_code": "SKUCode",
+            "sapcode":  "SKUCode",
+            "Sapcode":  "SKUCode",
+            "requirement":         "Requirement",
+            "updated_requirement":  "Updated_Requirement",
+        }
+        df = df.rename(columns={c: col_map[c] for c in df.columns if c in col_map})
+
+        if "SKUCode" not in df.columns:
+            raise KeyError(
+                f"Demand file {path!r} has no SKU column. "
+                f"Columns found: {df.columns.tolist()}"
+            )
+
+        df["SKUCode"] = df["SKUCode"].astype(str).str.strip()
+
+        # Resolve quantity column
+        if "Quantity" in df.columns:
+            qty_col = "Quantity"
+        elif "Updated_Requirement" in df.columns:
+            qty_col = "Updated_Requirement"
+        elif "Requirement" in df.columns:
+            qty_col = "Requirement"
         else:
-            qty_col = "Updated_Requirement" if "Updated_Requirement" in df.columns else "Requirement"
-            df = (df.groupby("SKUCode")
-                    .agg(Quantity=(qty_col, "sum"),
-                         Priority=("ConsolidatedPriorityScore", "max"))
-                    .reset_index())
+            raise KeyError(
+                f"Demand file {path!r} has no quantity column. "
+                f"Columns found: {df.columns.tolist()}"
+            )
+
+        # Resolve priority column; default 1.0 if absent
+        if "Priority" in df.columns:
+            pri_col = "Priority"
+        elif "ConsolidatedPriorityScore" in df.columns:
+            pri_col = "ConsolidatedPriorityScore"
+        else:
+            df["_priority"] = 1.0
+            pri_col = "_priority"
+
+        df = (df.groupby("SKUCode")
+                .agg(Quantity=(qty_col, "sum"), Priority=(pri_col, "max"))
+                .reset_index())
         return df[df["Quantity"] > 0].copy()
 
     # -- adapted from curing_lp.ETL.load_cycle_times (lines 332-343) ----------
@@ -254,7 +294,7 @@ class ConsumptionETL:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SKUClassifier:
-    """Classify SKUs into Runner-In, Runner-Out, and Non-Runner-In."""
+    """Classify demand SKUs into Runner-In and Non-Runner-In only."""
 
     def classify(
         self,
@@ -264,6 +304,9 @@ class SKUClassifier:
         """
         Returns DataFrame with columns:
           [SKUCode, Category, RunningPressCount, MouldLife_min]
+
+        Only demand SKUs are classified — presses running non-demand SKUs
+        (Runner-Out) are excluded from the consumption table entirely.
         """
         demand_skus  = set(df_demand["SKUCode"].str.strip())
         # Group running moulds by SKU to count active presses
@@ -278,17 +321,11 @@ class SKUClassifier:
         press_count["SKUCode"] = press_count["SKUCode"].str.strip()
         running_skus = set(press_count["SKUCode"])
 
-        all_skus = demand_skus | running_skus
+        # Only iterate demand SKUs — Runner-Out (non-demand) are not included
         rows = []
-        for sku in sorted(all_skus):
-            in_demand  = sku in demand_skus
+        for sku in sorted(demand_skus):
             is_running = sku in running_skus
-            if in_demand and is_running:
-                cat = "Runner-In"
-            elif not in_demand and is_running:
-                cat = "Runner-Out"
-            else:
-                cat = "Non-Runner-In"
+            cat = "Runner-In" if is_running else "Non-Runner-In"
 
             pc_row = press_count[press_count["SKUCode"] == sku]
             run_count  = int(pc_row["RunningPressCount"].values[0]) if len(pc_row) else 0
@@ -512,7 +549,6 @@ def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1):
     border    = _thin_border()
     cat_colors = {
         "Runner-In":     _GREEN,
-        "Runner-Out":    _AMBER,
         "Non-Runner-In": _BLUE,
     }
 
@@ -555,9 +591,8 @@ def export_consumption_table(
 
     # Category legend
     legend_text = (
-        "Runner-In (green): in demand + running    "
-        "Runner-Out (amber): not in demand + running    "
-        "Non-Runner-In (blue): in demand + not running"
+        "Runner-In (green): in demand + currently running on curing press    "
+        "Non-Runner-In (blue): in demand + no curing press currently running"
     )
     ws1.cell(row=1, column=1, value=legend_text).font = Font(italic=True, size=9)
     ws1.merge_cells(start_row=1, start_column=1,
@@ -567,7 +602,6 @@ def export_consumption_table(
 
     # Summary stats below
     n_ri  = (df_consumption["Category"] == "Runner-In").sum()
-    n_ro  = (df_consumption["Category"] == "Runner-Out").sum()
     n_nri = (df_consumption["Category"] == "Non-Runner-In").sum()
     total_gt = df_consumption.loc[
         df_consumption["Category"] == "Runner-In", "Total_GT_Per_Shift_Day0"
@@ -576,9 +610,8 @@ def export_consumption_table(
     last_row = len(df_consumption) + 5
     ws1.cell(row=last_row, column=1, value="SUMMARY").font = Font(bold=True)
     ws1.cell(row=last_row + 1, column=1, value=f"Runner-In SKUs: {n_ri}")
-    ws1.cell(row=last_row + 2, column=1, value=f"Runner-Out SKUs: {n_ro}")
-    ws1.cell(row=last_row + 3, column=1, value=f"Non-Runner-In SKUs: {n_nri}")
-    ws1.cell(row=last_row + 4, column=1,
+    ws1.cell(row=last_row + 2, column=1, value=f"Non-Runner-In SKUs: {n_nri}")
+    ws1.cell(row=last_row + 3, column=1,
              value=f"Total GT consumed/shift (Runner-In): {total_gt:,}")
 
     # ── Sheet 2: GT Inventory ─────────────────────────────────────────────────
@@ -679,9 +712,8 @@ def build_consumption_table(
     classifier = SKUClassifier()
     df_classify = classifier.classify(df_demand, df_running)
     ri  = (df_classify["Category"] == "Runner-In").sum()
-    ro  = (df_classify["Category"] == "Runner-Out").sum()
     nri = (df_classify["Category"] == "Non-Runner-In").sum()
-    print(f"        Runner-In: {ri}  |  Runner-Out: {ro}  |  Non-Runner-In: {nri}")
+    print(f"        Runner-In: {ri}  |  Non-Runner-In: {nri}")
 
     # Resolve cycle times
     all_skus = df_classify["SKUCode"].tolist()

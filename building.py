@@ -617,11 +617,13 @@ class ScheduleBuilder:
 
     def _co_mins(self, machine, sku_from, sku_to, sku_to_size):
         if sku_from is None or sku_from == sku_to:
-            return 0.0
+            return 0.0, ""
         co = self.co_map.get(str(machine), {"same":40,"diff":60})
         sz_f = sku_to_size.get(str(sku_from))
         sz_t = sku_to_size.get(str(sku_to))
-        return co["same"] if sz_f == sz_t else co["diff"]
+        if sz_f == sz_t:
+            return co["same"], "building_same_size_CO"
+        return co["diff"], "building_diff_size_CO"
 
     def build(self, machine_sequences, locked_skus, locked_end_times,
               sku_to_size, stage_label="PRODUCTION"):
@@ -630,12 +632,12 @@ class ScheduleBuilder:
             cursor   = locked_end_times.get(str(mach), self.plan_start)
             last_sku = locked_skus.get(str(mach))
             for sku, units, ct_min in campaigns:
-                co_dur = self._co_mins(mach, last_sku, sku, sku_to_size)
+                co_dur, co_type = self._co_mins(mach, last_sku, sku, sku_to_size)
                 if co_dur > 0:
                     co_end = cursor + timedelta(minutes=co_dur)
                     rows.extend(self._split_row(
                         cursor, co_end, mach, "CHANGEOVER", 0, 0.0,
-                        f"C/O → {sku}"
+                        f"{co_type} → {sku}", co_type=co_type,
                     ))
                     cursor = co_end
                 prod_mins = units * ct_min
@@ -657,7 +659,7 @@ class ScheduleBuilder:
             df = df.sort_values(["Machine","StartTime"]).reset_index(drop=True)
         return df
 
-    def _split_row(self, start, end, machine, sku, total_units, ct_min, remarks):
+    def _split_row(self, start, end, machine, sku, total_units, ct_min, remarks, co_type=""):
         rows, curr, rem = [], start, total_units
         total_dur = max((end - start).total_seconds() / 60.0, 1e-6)
         while curr < end:
@@ -683,6 +685,7 @@ class ScheduleBuilder:
                 "StartTime": curr, "EndTime": slice_end,
                 "Qty": qty, "CT_Min": round(ct_min, 2),
                 "Remarks": remarks,
+                "CO_Type": co_type,
             })
             rem -= qty
             curr = slice_end
@@ -809,14 +812,23 @@ def build_util(df_sched, machines):
             Total_Units= ("Qty","sum"),
             SKUs_Count = ("SKUCode","nunique"),
         ).reset_index()
-        co_grp = (
-            df_sched[df_sched["SKUCode"]=="CHANGEOVER"]
-            .groupby("Machine").size().reset_index(name="Changeovers")
-        )
+
+        # CO_Mins: actual time spent in changeovers — shown separately so
+        # utilization % = productive time only (CO time is not wasted, but
+        # it is setup time, not production).
+        co_df = df_sched[df_sched["SKUCode"] == "CHANGEOVER"].copy()
+        co_df["Elapsed"] = (
+            pd.to_datetime(co_df["EndTime"]) - pd.to_datetime(co_df["StartTime"])
+        ).dt.total_seconds() / 60.0
+        co_grp = co_df.groupby("Machine").agg(
+            CO_Mins    = ("Elapsed", "sum"),
+            Changeovers= ("Elapsed", "count"),
+        ).reset_index()
+
         grp = grp.merge(co_grp, on="Machine", how="left").fillna(0)
     else:
         grp = pd.DataFrame(
-            columns=["Machine","Used_Mins","Total_Units","SKUs_Count","Changeovers"]
+            columns=["Machine","Used_Mins","Total_Units","SKUs_Count","CO_Mins","Changeovers"]
         )
     cap  = float(Config.SHIFT_MINS * Config.total_shifts())
     df_u = (
@@ -824,10 +836,12 @@ def build_util(df_sched, machines):
         .merge(grp, on="Machine", how="left").fillna(0)
     )
     df_u["Available_Mins"]  = cap
-    df_u["Idle_Mins"]       = cap - df_u["Used_Mins"]
+    # Idle_Mins = available − production − changeover (actual idle, not setup)
+    df_u["Idle_Mins"]       = cap - df_u["Used_Mins"] - df_u["CO_Mins"]
+    # Utilization = productive minutes only (CO time correctly excluded)
     df_u["Utilization_Pct"] = (df_u["Used_Mins"] / cap * 100).round(2)
     return df_u[[
-        "Machine","Available_Mins","Used_Mins","Idle_Mins",
+        "Machine","Available_Mins","Used_Mins","CO_Mins","Idle_Mins",
         "Utilization_Pct","SKUs_Count","Total_Units","Changeovers"
     ]].sort_values("Utilization_Pct", ascending=False)
 
@@ -1222,7 +1236,7 @@ class ExcelExporter:
                 df_ug.assign(Stage="GT/Unistage"),
                 df_us.assign(Stage="Stage1"),
             ], ignore_index=True)
-            c6 = ["Stage","Machine","Available_Mins","Used_Mins","Idle_Mins",
+            c6 = ["Stage","Machine","Available_Mins","Used_Mins","CO_Mins","Idle_Mins",
                   "Utilization_Pct","SKUs_Count","Total_Units","Changeovers"]
             df_util_all[[c for c in c6 if c in df_util_all.columns]].to_excel(
                 writer, sheet_name="Machine Utilization", index=False
@@ -1232,7 +1246,7 @@ class ExcelExporter:
             self._title(ws6, "PRESS UTILIZATION — Hybrid v8",
                         f"Avg: {avg_u}% | Machines: {len(df_util_all)}", len(c6))
             self._hdr(ws6, 3, len(c6))
-            for ci,w in enumerate([14,12,15,14,14,14,12,14,14], 1):
+            for ci,w in enumerate([14,12,15,14,12,14,14,12,14,14], 1):
                 ws6.column_dimensions[get_column_letter(ci)].width = w
             for ri in range(4, ws6.max_row+1):
                 u  = ws6.cell(ri,6).value or 0
@@ -1322,7 +1336,7 @@ class LPMinuteSolver:
 
     def solve(self, y, curing_matrix, ct_map, sku_list, machines,
               inv_init, locked_pairs, inv_cap=None, co_time_map=None,
-              cap_on_gross=False):
+              cap_on_gross=False, per_sku_ceiling=None):
         S, M, T = len(sku_list), len(machines), self.T
         if S == 0 or M == 0:
             return None, float("inf"), {}
@@ -1481,6 +1495,23 @@ class LPMinuteSolver:
                     for t in range(T):
                         r[0, xi(si, mi, t)] = 1.0 / ct
             rows.append(r); bvals.append(cap_units)
+
+        # Hard per-SKU ceiling: Σ_{m,t} x[s,m,t]/ct ≤ ceiling[sku].
+        # Ensures total LP production for a SKU never exceeds remaining demand
+        # regardless of OVERBUILD_BUFFER_FRAC. Applied on top of the gross×buf
+        # cap so the binding constraint is whichever is tighter.
+        if per_sku_ceiling:
+            for si, sku in enumerate(sku_list):
+                ceil_val = per_sku_ceiling.get(sku)
+                if ceil_val is not None:
+                    r = new_row()
+                    for mi, mach in enumerate(machines):
+                        ct = ct_map.get(mach, 2.0)
+                        if ct > 0:
+                            for t in range(T):
+                                r[0, xi(si, mi, t)] = 1.0 / ct
+                    rows.append(r)
+                    bvals.append(max(0.0, float(ceil_val)))
 
         bounds = [(0.0, ub[i]) for i in range(n_vars)]
 
@@ -1682,6 +1713,19 @@ class GeneticOptimiser:
 #
 # Returns y[S, M] binary matrix, which is passed directly to LPMinuteSolver.
 # ~100 lines vs ~600 lines of GA; deterministic, debuggable, demand-driven.
+# Dominant inch per machine (confirmed from May Inch-Run Study).
+# Used as TIER 0 in machine sort: machines whose dominant inch matches
+# the SKU's inch are preferred over off-inch machines.
+# Source: CLAUDE.md §Inch-Run Study, bc.md §7.0a
+_MACHINE_DOMINANT_INCH: dict[str, str] = {
+    "6001": "14", "6002": "15", "6003": "17", "6004": "16",
+    "7001": "16", "7002": "14", "7003": "15", "7004": "14",
+    "7101": "15", "7102": "15", "7103": "13", "7104": "15",
+    "7105": "13", "7106": "13", "7201": "16",
+    "7501": "12", "7502": "13", "7503": "13",
+}
+
+
 class DemandHeuristicAssigner:
     """
     Demand-driven heuristic machine assignment — replaces GeneticOptimiser.
@@ -1693,7 +1737,7 @@ class DemandHeuristicAssigner:
 
     def assign(self, sku_list, machines, allow_map, curing_matrix,
                ct_map, history_map, locked_pairs, co_time_map=None,
-               priority_map=None):
+               priority_map=None, sku_to_size=None):
         """
         Build y[S, M] assignment matrix.
 
@@ -1773,6 +1817,13 @@ class DemandHeuristicAssigner:
             pri_threshold = None
             unistage_set = set()
 
+        # Per-inch demand-minutes tracker: routes same-inch SKUs to the machine
+        # with the least total assigned demand-minutes for that inch, so high-
+        # volume and low-volume SKUs spread evenly across siblings (e.g. 6001/7002/
+        # 7004 all dominant 14"). Count-based rotation fails when demand sizes
+        # differ wildly between SKUs; demand-minutes balancing is demand-aware.
+        _inch_mach_dmins: dict[tuple, float] = {}  # (inch_str, machine) → demand-mins
+
         for si in order:
             sku         = sku_list[si]
             demand_mins = float(sku_demand_mins[si])
@@ -1794,12 +1845,18 @@ class DemandHeuristicAssigner:
             else:
                 demand_frac = 0.0
 
+            # TIER 0: prefer machines whose dominant inch matches the SKU's inch.
+            # This routes 15" SKUs to BJ machines first (not VMIMAXX 16"/17"),
+            # and 16" SKUs to VMIMAXX 7001/6004 first (not BJ 15" machines).
+            # Reduces diff_size COs and fixes 6002/7001 inch misassignment.
+            sku_inch_for_sort = (sku_to_size or {}).get(sku, "")
             elig.sort(key=lambda m: (
-                int(y[:, m_idx[m]].sum()),
-                (-demand_frac if m in unistage_set else 0.0),
-                mach_elig_count.get(m, 0),
-                -history_map.get((m, sku), 0.0),
-                m_idx[m],
+                (0 if _MACHINE_DOMINANT_INCH.get(str(m)) == sku_inch_for_sort
+                   and sku_inch_for_sort != "" else 1),    # TIER 0: inch match first
+                _inch_mach_dmins.get((sku_inch_for_sort, m), 0.0),  # TIER 1: fewest demand-mins
+                (-demand_frac if m in unistage_set else 0.0),  # TIER 2: demand bias
+                mach_elig_count.get(m, 0),                 # TIER 3: machine versatility
+                m_idx[m],                                  # TIER 4: stable index tiebreaker
             ))
 
             # Machines needed to cover demand (at least MIN, at most MAX).
@@ -1826,6 +1883,10 @@ class DemandHeuristicAssigner:
                     continue            # lock already set this entry
                 y[si, mi] = 1
                 already  += 1
+                # Update per-inch demand-mins so same-inch siblings balance by volume
+                if sku_inch_for_sort:
+                    key = (sku_inch_for_sort, m)
+                    _inch_mach_dmins[key] = _inch_mach_dmins.get(key, 0.0) + demand_mins
 
         return y
 
@@ -1935,11 +1996,32 @@ class HybridDailyScheduler:
         # Per-machine representative changeover time (min). LP reserves
         # co_time × (y_sum[m] − 1) minutes out of machine capacity so what
         # it plans survives the ScheduleBuilder inserting CHANGEOVER rows.
+        #
+        # VMI machines (VMIMAXX group: 6001-6004, 7001-7004) use "same" CO
+        # time (20 min) because their dominant inch policy means most COs will
+        # be same-size. Using the low value makes the LP see VMI as having more
+        # free capacity → LP naturally assigns SKU switches to VMI first.
+        # All other machines use "diff" (conservative worst case).
+        _vmi_machines = {str(m) for m in Config.UNISTAGE
+                         if str(m) in {"6001","6002","6003","6004",
+                                       "7001","7002","7003","7004"}}
         co_time_map = {}
+        _s2_machines = {str(m) for m in Config.STAGE2}
         for m in Config.STAGE1 | Config.STAGE2 | Config.UNISTAGE:
             entry = co_map.get(str(m), {"same": 40, "diff": 60})
-            # use "diff" as a conservative worst case — safer vs starvation
-            co_time_map[str(m)] = float(entry.get("diff", 60))
+            if str(m) in _vmi_machines:
+                # VMI: prefer same-size COs — represent LP cost as "same"
+                co_time_map[str(m)] = float(entry.get("same", 20))
+            elif str(m) in _s2_machines:
+                # Stage-2 diff-size CO = 88 min.  In the latest run, machines
+                # 8302/8301/8502 each had 50-99 diff-size COs costing 4-9k min.
+                # Doubling the LP reserve (88 × 2 = 176 min) makes the LP see
+                # Stage-2 as more capacity-constrained per CO, so the GA evolves
+                # chromosomes with fewer SKUs per Stage-2 machine.
+                co_time_map[str(m)] = float(entry.get("diff", 88)) * 2.0
+            else:
+                # All others: conservative "diff" worst case
+                co_time_map[str(m)] = float(entry.get("diff", 60))
 
         agg = {k: [] for k in (
             "gt_allocation","s1_allocation",
@@ -2020,6 +2102,16 @@ class HybridDailyScheduler:
             if extra:
                 sku_list = sku_list + extra
                 cur_mat = np.vstack([cur_mat, np.zeros((len(extra), cur_mat.shape[1]))])
+
+            # 100% demand cap: clip daily LP target to per-SKU remaining demand.
+            # Prevents LP from building for SKUs already at 100% fulfillment and
+            # prevents the gross×buf LP cap from inflating above what's still owed.
+            if demand_cap:
+                for si, sku in enumerate(sku_list):
+                    rem = max(0.0, self._gt_remaining.get(sku, 0.0))
+                    daily = float(cur_mat[si].sum())
+                    if daily > 0 and daily > rem:
+                        cur_mat[si, :] *= (rem / daily)
 
             # Inch-lock for Stage1 + Unistage
             #   - machine_size from currently-running SKU
@@ -2206,13 +2298,19 @@ class HybridDailyScheduler:
             best_y_gt    = heuristic_gt.assign(
                 sku_list, gt_machines, allow_map_gt, cur_mat, ct_map,
                 history_map or {}, gt_locked, co_time_map=co_time_map,
-                priority_map=priority_map,
+                priority_map=priority_map, sku_to_size=sku_to_size,
+            )
+            _lp_ceiling = (
+                {sku: max(0.0, self._gt_remaining.get(sku, 0.0))
+                 for sku in sku_list}
+                if demand_cap else None
             )
             lp_gt = LPMinuteSolver()
             best_x_gt, _, meta_gt = lp_gt.solve(
                 best_y_gt, cur_mat, ct_map, sku_list, gt_machines,
                 gt_inv_for_cap, gt_locked, co_time_map=co_time_map,
                 cap_on_gross=True,
+                per_sku_ceiling=_lp_ceiling,
             )
             df_gt_alloc = (
                 lp_x_to_alloc(best_x_gt, sku_list, gt_machines, ct_map)
@@ -2506,7 +2604,7 @@ class HybridDailyScheduler:
         }
 
     @staticmethod
-    def _split_row(start, end, machine, sku, total_units, ct_min, remarks):
+    def _split_row(start, end, machine, sku, total_units, ct_min, remarks, co_type=""):
         """Split a (start, end) block into per-shift rows (mirrors
         ScheduleBuilder._split_row so topup rows match the existing format)."""
         rows, curr, rem = [], start, total_units
@@ -2532,6 +2630,7 @@ class HybridDailyScheduler:
                 "StartTime": curr, "EndTime": slice_end,
                 "Qty": qty, "CT_Min": round(ct_min, 2),
                 "Remarks": remarks,
+                "CO_Type": co_type,
             })
             rem -= qty
             curr = slice_end
@@ -2637,16 +2736,23 @@ class HybridDailyScheduler:
 
             cursor = last_end
             if co_dur > 0:
+                topup_co_type = (
+                    "building_same_size_CO"
+                    if last_sku_size == best_sku_size and last_sku_size != ""
+                    else "building_diff_size_CO"
+                )
                 co_end = cursor + timedelta(minutes=co_dur)
                 new_rows.extend(self._split_row(
                     cursor, co_end, mach, "CHANGEOVER", 0, 0.0,
-                    f"C/O → {best_sku} (TOPUP)"
+                    f"{topup_co_type} → {best_sku} (TOPUP)",
+                    co_type=topup_co_type,
                 ))
                 cursor = co_end
 
             prod_end = cursor + timedelta(minutes=prod_min)
             new_rows.extend(self._split_row(
                 cursor, prod_end, mach, best_sku, units, ct, stage_label,
+                co_type="",
             ))
 
             # Update the scratch copy only — so the next machine this
@@ -2782,6 +2888,8 @@ class HybridDailyScheduler:
         u_gt = df_util_gt["Utilization_Pct"].mean() if not df_util_gt.empty else 0.0
         u_s1 = df_util_s1["Utilization_Pct"].mean() if not df_util_s1.empty else 0.0
 
+        met = min(tp, td)
+        pct = round(met / td * 100, 1) if td else 0.0
         print(f"\n  Net GT demand        : {td:>10,}")
         print(f"  Demand met (capped)  : {met:>10,}  ({pct}%)")
         print(f"  Total built          : {tp:>10,}  (+{over:,} over-build: topup/rounding)")

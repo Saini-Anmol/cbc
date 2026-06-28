@@ -21,7 +21,7 @@ the curing schedule is **fully derived** from it. Direction is the reverse of C2
 | Scheduling order | Curing first → building follows | Building first → curing derived |
 | Bottleneck | Building couldn't feed curing plan | Eliminated — curing is sized to building |
 | GT flow | Building tries to satisfy curing LP | Curing consumes exactly what building produces |
-| Starvation risk | Frequent (root cause of redesign) | Zero by design |
+| Starvation risk | Frequent (root cause of redesign) | Zero — **only when Phase 4 (Curing Derivation) is active**; Phase 1 with synthetic curing plan can still show starvation events |
 | Waste GT | Possible (building over-runs) | Zero — building output capped to consumption |
 
 ---
@@ -128,16 +128,21 @@ Spare-minutes check — a machine with leftover minutes is only FREE for a new S
  │                                 ↓                                       │
  │  PHASE 1 ── Building Schedule  [current pipeline stop point]            │
  │             Phase 1a: Runner-In (Stage-1/Stage-2/Unistage)             │
+ │               └─ Mould-constrained priority boost (1+curr_days/31,≤4x)│
  │             Phase 1b + 2a: Joint Priority Pool (NRI + RO CO)           │
+ │               └─ NRI demand front-loaded 70% pre-CO / 30% post-CO     │
  │             Phase 2b: Changeover scheduling (max 8/day)                │
+ │               └─ CO Rescue pass: spare-press donation for stranded NRI │
  │             Phase 3: Dynamic target lock                                │
  │             Output: bc_building_schedule.xlsx                           │
  │                                 ↓                                       │
- │  [DEFERRED] PHASE 2 ── Curing Schedule Derivation                      │
- │             100% deterministic from building GT output                  │
- │             Approach to be decided after reviewing building schedule    │
+ │  [DEFERRED] PHASE 4 ── Curing Schedule Derivation (TRUE ZERO STARV.)  │
+ │             Derive actual curing plan FROM building output.             │
+ │             ★ Zero starvation guaranteed ONLY when Phase 4 is active.  │
+ │             Phase 1 uses a synthetic curing plan — starvation events   │
+ │             in the validator reflect build-vs-synthetic-plan gaps.      │
  │                                 ↓                                       │
- │  [DEFERRED] PHASE 3 ── Analysis & KPI Report                           │
+ │  [DEFERRED] PHASE 5 ── Analysis & KPI Report                           │
  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -206,7 +211,8 @@ This default silently applies — no remark, SKU proceeds to planning normally.
 
 | File | Phase | Contents |
 |------|-------|----------|
-| `curing_consumption_table.xlsx` | Phase 0 | Per-SKU: category, press count, effective CT, GT/shift |
+| `curing_consumption_table.xlsx` | Phase 0 | Per-SKU: category, press count, effective CT, GT/shift (Day 0 snapshot) |
+| `curing_consumption_31day.xlsx` | Phase 0 Extended | 31-sheet workbook: one day per sheet (Day_01–Day_31) + CO_Schedule + Day0_Summary |
 | `bc_building.xlsx` | Phase 1a/1b | Per building machine, per shift: SKU, qty, status, stage |
 | `curing_changeover_plan.xlsx` | Phase 2a/2b | Per press: from SKU → to SKU, changeover shift |
 | `bc_curing.xlsx` | Phase 4 | Per curing press, per shift: SKU, qty, status |
@@ -262,7 +268,7 @@ Non-Runner-In:
 
 ### 6.3a GT Building Target — Demand Cap Rule
 
-> **Building output for any SKU must NEVER exceed customer demand.**
+> **Building output for any SKU must NEVER exceed 100% of customer demand. Hard limit — no overproduction under any circumstance.**
 
 ```
 demand_per_shift(SKU) = Demand_Qty(SKU) / (planning_days × SHIFTS_PER_DAY)
@@ -279,12 +285,66 @@ When `demand_per_shift < total_GT_per_shift` (demand is met before month-end):
 
 For Non-Runner-In SKUs: building target = `demand_per_shift` (same formula, press consumption = 0 initially).
 
+### 6.3c Hard 100% Demand Cap — Three-Layer Enforcement
+
+The demand cap is enforced at three layers to guarantee total production ≤ 100% of `Demand_Qty` per SKU across the full 30-day horizon.
+
+**Layer 1 — Horizon remaining tracker (`_gt_remaining`)**
+```
+At plan start:  _gt_remaining[SKU] = min(curing_plan_total, Demand_Qty[SKU])
+After each day: _gt_remaining[SKU] -= actual_GT_produced_today[SKU]
+                (clamped to 0, never negative)
+```
+TopUp idle-fill uses `_gt_remaining` as its target — once it reaches 0 for a SKU,
+TopUp builds nothing more for that SKU. This has been in place since the initial B2C design.
+
+**Layer 2 — Daily LP `cur_mat` clip (new)**
+```
+Before each day's LP run, per SKU:
+  remaining = _gt_remaining[SKU]
+  daily_target = cur_mat[SKU].sum()
+  if daily_target > remaining:
+      cur_mat[SKU, :] *= (remaining / daily_target)   ← scale down proportionally
+```
+Effect: LP never *sees* demand beyond what's still owed. A SKU at 100% fulfillment
+gets `cur_mat = 0` → machines that were serving it become available for other SKUs
+rather than idling or overbuilding.
+
+**Layer 3 — LP hard per-SKU ceiling constraint (new)**
+```
+For each SKU: Σ_{m,t} x[SKU, m, t] / CT_m  ≤  _gt_remaining[SKU]
+```
+Enforced as an additional LP inequality constraint alongside the existing `gross × buf` cap.
+The binding constraint is whichever is tighter:
+- Early days: `gross × 1.2` binds (normal buffer operation)
+- Late days / tail: `_gt_remaining` binds (hard 100% ceiling)
+
+This prevents the `OVERBUILD_BUFFER_FRAC = 0.2` LP headroom from accumulating
+beyond customer demand on the last production days of each SKU.
+
+**Why all three layers are needed:**
+| Layer | What it prevents |
+|-------|-----------------|
+| Layer 1 (TopUp tracker) | TopUp from stockpiling beyond demand |
+| Layer 2 (cur_mat clip) | LP from targeting phantom demand for fulfilled SKUs |
+| Layer 3 (LP ceiling) | LP's 1.2× buffer from producing >100% on tail days |
+
+Together they guarantee: `Σ_days GT_built[SKU] ≤ Demand_Qty[SKU]` for every SKU.
+
 ### 6.3b NRI SKU Building Start
 
 Non-Runner-In SKUs do **not** wait for a curing press changeover confirmation before building starts.
 Building machines are assigned to NRI SKUs immediately (including Unistage machines 7001/7002/7003).
 Curing press changeovers for NRI SKUs are planned in parallel and limited to 8/day.
 GT built for NRI SKUs before their curing press CO will sit in GT inventory until the press is ready.
+
+**NRI demand front-loading (70/30 split):** When the CO schedule provides a confirmed
+`CO_Day_Index` for an NRI SKU, 70% of demand is spread uniformly over the pre-CO window
+and 30% over the post-CO window. The LP sees higher urgency (larger per-shift target) before
+the CO day and pre-builds a GT buffer. When the curing CO fires on Shift C of `CO_Day`,
+2 full shifts of GT inventory are already available → eliminates Day-1 starvation for new-press
+SKUs. If no confirmed CO day is found, demand is spread uniformly across the full horizon.
+Implemented via `co_day_map` in `_make_synthetic_curing()` in `building_b2c.py`.
 
 ### 6.4 Dynamic Press Count Initialisation
 
@@ -311,6 +371,54 @@ All per-shift building targets and curing consumption use this table.
 | `Unit_GT_Per_Press` | Non-Runner-In sizing |
 | `Demand_Qty` | demand file |
 | `Priority_Score` | `ConsolidatedPriorityScore` |
+
+### 6.6 Phase 0 Extended — 31-Day Dynamic Curing Consumption Pre-Computation
+
+**File:** `curing_consumption_dynamic.py`
+**Output:** `data/output/curing_consumption_31day.xlsx`
+
+Pre-computes how curing consumption evolves across all 31 days of May using a
+two-pass approach that is fully independent of the building scheduler.
+
+#### Pass 1 — CO Schedule (`COScheduler`)
+
+Compute the full changeover plan from Day 0 data alone:
+
+1. **Runner-Out presses** → eligible for CO from Day 1.
+2. **Runner-In presses** → eligible for CO on the day `Updated_Demand_Qty` hits 0.
+3. **NRI targets** ranked by two-level urgency score (§8 CO urgency):
+   - Class A (CRITICAL): `current_production_days > horizon_left` — demand cannot be met without this CO.
+   - Class B (HELPFUL): already fulfillable with existing presses.
+   - Sort: `(class ASC, −Priority_Score, after_co_days ASC)`
+4. **Max 8 COs per day** (plant hard limit); excess deferred to next day.
+5. CO takes effect same day (new SKU's press count updates on CO day; Shift C produces for new SKU).
+6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
+   in the main loop are sorted by the same urgency score. For each, search for an RI press
+   with `n_presses > 1` whose RI SKU can still meet demand with `n−1` presses
+   (`ri_days_without ≤ planning_days`). If found, donate one press to the NRI SKU
+   (counts toward the 8/day cap; deferred to Day D+1 if cap is full). NRI SKUs with no
+   compatible spare press remain unscheduled and are logged. Implemented in
+   `COScheduler.schedule()` in `curing_consumption_dynamic.py`.
+
+#### Pass 2 — Day Simulation (`DaySimulator`)
+
+Simulate 31 days using the CO schedule from Pass 1:
+
+| Per-day update | Detail |
+|----------------|--------|
+| Apply CO events | `Running_Press_Count` ±1; CO'd NRI SKU category flips to Runner-In |
+| Build day sheet | All columns per §6.5 plus `Total_GT_Per_Shift_DayN`, `Updated_Demand_Qty`, `Production_Days` |
+| Drain demand | `Updated_Demand_Qty -= Running_Press_Count × Qty_Per_Press_Per_Shift × 3` |
+
+`Production_Days` = blank if `Running_Press_Count = 0` (NRI before its CO fires).
+
+#### Excel workbook structure
+
+| Sheet | Contents |
+|-------|----------|
+| `Day0_Summary` | Mirrors `curing_consumption_table.xlsx` (snapshot at plan start) |
+| `CO_Schedule` | All CO events: Day, Press, Old_SKU → New_SKU + day-level count summary |
+| `Day_01` … `Day_31` | Per-day consumption table; colour-coded by category (green=RI, orange=RO, yellow=NRI) |
 
 ---
 
@@ -348,6 +456,104 @@ Unistage  (Independent GT machines — 18 machines)
   Output  : Completed GT tyre — fully independent (no Stage-1 dependency)
   SKUs    : 94 demand SKUs
   Demand  : ~397,722 GTs
+```
+
+### 7.0a Inch Study — Machine Group Inch Policies (from May Plant Data)
+
+> **Source: Inch-Run Study Report (May production, 30 building machines, 32 days).**
+> These are confirmed plant behaviours — the scheduler must encode them as constraints,
+> not suggestions.
+
+**Inch demand distribution (plant-wide):**
+15" (34%) › 13" (21%) › 14" (14%) ≈ 12" (14%) › 16" (12%) › 17"/18" (tail ~5%)
+
+**Four machine groups with distinct inch policies:**
+
+| MG Group | Building machines | Allowed inches | Policy | Dominant-inch lock strength |
+|----------|------------------|----------------|--------|-----------------------------|
+| VMIMAXX | 6001–6004, 7001–7004 | 14"–18" | Flexible overflow absorber | 60–90% (4–7 inches per machine) |
+| BJ | 7101–7106, 7201 | 13", 14", 15", 16" | Well-locked per machine | 83–99% dominant |
+| TWO STAGE TBM | Stage-1 + Stage-2 machines | 12", 15", 13" | ~Half single-inch | 62–100% dominant |
+| UNISTAGE | 7501, 7502, 7503 | **12", 13" ONLY** | **Perfectly inch-locked** | **97–100% dominant** |
+
+**Per-machine dominant inch (from study — use as soft-lock seed):**
+
+| Machine | Group | Dom. inch | Dom. share |
+|---------|-------|-----------|-----------|
+| 7104 | BJ | 15" | 99% |
+| 7105 | BJ | 13" | 99% |
+| 7101 | BJ | 15" | 98% |
+| 7201 | BJ | 16" | 94% |
+| 7103 | BJ | 13" | 89% |
+| 7106 | BJ | 13" | 84% |
+| 7102 | BJ | 15" | 83% |
+| 7502 | UNISTAGE | 13" | 100% |
+| 7503 | UNISTAGE | 13" | 100% |
+| 7501 | UNISTAGE | 12" | 97% |
+| 6004 | VMIMAXX | 16" | 90% |
+| 6001 | VMIMAXX | 14" | 89% |
+| 7004 | VMIMAXX | 14" | 86% |
+| 6002 | VMIMAXX | 15" | 83% |
+| 6003 | VMIMAXX | 17" | 80% |
+| 7003 | VMIMAXX | 15" | 80% |
+| 7002 | VMIMAXX | 14" | 73% |
+| 7001 | VMIMAXX | 16" | 60% |
+
+**Scheduling rules derived from the study:**
+
+```
+1. HARD inch constraint — UNISTAGE (7501/7502/7503):
+   Never assign a 14"+ SKU to these machines. Hard filter BEFORE heuristic assigner.
+
+2. Group routing priority — prefer locked groups for their dominant inch:
+   12" demand  → TWO STAGE TBM first → UNISTAGE second
+   13" demand  → UNISTAGE first → BJ second → TWO STAGE TBM last
+   14" demand  → VMIMAXX first (their dominant); 7102/7104 carry 14" in BJ for
+                 2 BJ-exclusive 14" RI SKUs (1325218614088HURL0, 1325217514082TVECH)
+   15" demand  → BJ first → TWO STAGE TBM second → VMIMAXX last
+   16"/17"/18" → VMIMAXX only
+
+3. VMIMAXX as overflow absorber:
+   VMIMAXX machines absorb demand that BJ/TBM cannot cover.
+   Do NOT pre-fill VMIMAXX with high-volume primary-inch demand
+   if a more inch-locked group can serve it — this causes unnecessary COs on VMIMAXX.
+
+4. Per-machine dominant inch as soft-lock seed:
+   In the heuristic assigner, prefer SKUs of the machine's dominant inch.
+   Same-dominant-inch SKUs score higher than off-inch SKUs with equal demand.
+   This replaces randomness in the history_map seed with a plant-confirmed preference.
+
+5. Root cause of 7001–7004 low utilisation (25–28%):
+   These VMIMAXX machines carry 5–7 different inches each month → 30–32 COs → 45% time in CO.
+   Fix: restrict each machine to its dominant inch (7001→16", 7002→14", 7003→15", 7004→14").
+   Expected utilisation improvement: 25% → 75%+.
+6. HARD per-machine dominant-inch lock (_MACHINE_HARD_INCH in building_b2c.py):
+   Applied after group inch policy filter, before heuristic assigner.
+   Each machine filtered to its dominant inch(es) only:
+     VMIMAXX: 7001→{16}, 7002→{14}, 7004→{14}, 6001→{14}
+              6002→{15}, 7003→{15}, 6003→{17,18}, 6004→{16}
+     BJ:      7101→{15}, 7102→{14,15}, 7103→{13}, 7104→{14,15}
+              7105→{13}, 7106→{13}, 7201→{16}
+     UNISTAGE:7501→{12}, 7502→{13}, 7503→{13}
+   7001 locked to {16} only (not {16,17,18}) so TIER-3 mach_elig_count matches
+   6004/7201 and 7001 competes fairly for 16" SKUs.
+   Result: 6001 util 3%→58%, 7001 util 8%→45%, BJ avg 73%→83%.
+```
+
+**Priority-first machine reservation for Unistage group (new logic):**
+
+```
+Pass 1 — Reserve machines for top-priority SKUs:
+  - Sort all demand SKUs by Priority_Score DESC
+  - For each top-priority SKU (top 30% by score):
+      Pick the eligible machine with best dominant-inch match
+      Reserve that machine (LOCKED_TO_PRIORITY flag)
+  - True UNISTAGE (7501/7502/7503): dedicate one machine per top 12"/13" SKU
+    → zero COs on those machines, maximum output for highest-priority small tyres
+
+Pass 2 — Fill remaining machines with lower-priority SKUs:
+  - Normal heuristic assign over non-reserved machines
+  - LOCKED_TO_PRIORITY machines are not available to lower-priority SKUs
 ```
 
 **Capacity note (building CT ≠ curing CT):**
@@ -448,7 +654,39 @@ Unistage machines: no Stage-1 assignment. Produce GT directly from pre-shift onw
 
 ### 7.3 Stage-2 + Unistage GT Assignment
 
-For each Runner-In SKU (sorted by `Priority_Score DESC`):
+**Mould-constrained priority boost (applied before heuristic assignment):**
+```
+For each Runner-In SKU with Running_Press_Count > 0 and Demand_Qty > 0:
+  rate_day    = Qty_Per_Press_Per_Shift × SHIFTS_PER_DAY
+  current_days = Demand_Qty / (Running_Press_Count × rate_day)
+  multiplier   = min(1.0 + current_days / PLANNING_DAYS, 4.0)
+  priority_map[SKU] *= multiplier   (if multiplier > 1.01)
+```
+A SKU with few presses and high demand has large `current_days` → multiplied priority →
+LP assigns building machines to it first. Prevents late discovery that a slow-throughput
+SKU cannot meet demand within the horizon. Implemented in `building_b2c.py` after
+`priority_map` construction.
+
+**DemandHeuristicAssigner sort key (5 tiers — history bias removed):**
+
+| Tier | Sort key | Purpose |
+|------|----------|---------|
+| TIER 0 | `0 if dominant_inch(m) == sku_inch else 1` | Route by inch first — VMI gets 16", BJ gets 15"/13", etc. |
+| TIER 1 | `_inch_mach_dmins[(inch, m)]` | Per-inch demand-minutes balance: siblings share volume not count |
+| TIER 2 | `−demand_frac` (UNISTAGE only) | High-demand high-priority SKUs prefer UNISTAGE |
+| TIER 3 | `mach_elig_count(m)` | More specialised machines served first |
+| TIER 4 | `m_idx[m]` | Stable tiebreaker |
+
+History bias (`−history_map[(m, sku)]`) **removed** — old run history encoded wrong-inch
+routing and caused 6001 to receive only low-demand fragments of 14" pool.
+
+`_inch_mach_dmins`: dict of (inch_str, machine) → cumulative demand-minutes assigned.
+After each SKU-machine assignment, `demand_mins` for that SKU is added. Same-inch siblings
+(e.g. 6001/7002/7004 for 14") receive equal total demand-minutes load, so high-volume
+and low-volume 14" SKUs distribute evenly rather than all large-volume SKUs landing on
+one sibling.
+
+For each Runner-In SKU (sorted by `Priority_Score DESC` after boost):
 
 ```
 1. eligible_machines(SKU) = building_allowable[SKU] ∩ currently_running_machines[SKU]
@@ -495,18 +733,54 @@ Step 4: Select target T* = highest Priority_Score among viable targets.
 Step 5: Add (P → T*, priority = Priority_Score(T*)) to JOINT POOL (§9).
 ```
 
+**CO target urgency score (replaces simple Priority_Score sort):**
+
+When a freed press (Runner-Out or fulfilled Runner-In) is assigned to an NRI target,
+the target is selected by a two-level urgency score:
+
+```
+For each candidate NRI target SKU T:
+  n     = current Running_Press_Count[T]
+  rate  = Qty_Per_Press_Per_Day[T]  =  Qty_Per_Press_Per_Shift[T] × 3
+  rem   = Updated_Demand_Qty[T]
+  horizon_left = planning_days − current_day
+
+  current_days = rem / (n × rate)      if n > 0 else ∞
+  after_days   = rem / ((n+1) × rate)
+
+  urgency_class:
+    Class A (CRITICAL)  — current_days > horizon_left
+                          demand CANNOT be met without this CO
+    Class B (HELPFUL)   — current_days ≤ horizon_left
+                          demand can be met with existing presses
+
+Sort candidates: (urgency_class ASC, −Priority_Score, after_days ASC)
+  → Class A first; within class: highest priority, then fewest days after CO
+```
+
+**Objective**: fulfill demand on time AND by priority.
+- Class A SKUs are always served before Class B (missing their deadline is worse than serving lower priority)
+- Among same-class SKUs, Priority_Score breaks ties
+- `after_days` breaks final ties: prefer the assignment that makes the SKU fulfillable soonest
+
 **Changeover scheduling:**
 ```
-Sort JOINT POOL by: Priority_Score DESC, mould_life_remaining ASC
+Sort JOINT POOL by urgency score (see above)
 Assign greedily per day: up to 8 total changeovers/day (plant-wide hard limit)
-Changeover always in Shift A of assigned day:
+CO fires INSTANTLY when demand is fulfilled for a Runner-In SKU (same day, Shift A).
+If Day D's 8-CO budget is full, defer to Day D+1.
+
+Changeover always starts Shift A of assigned day:
   Shift A → CHANGEOVER (300 min, press OCCUPIED whole shift)
   Shift B → MOULD_CLEAN (120 min, press OCCUPIED whole shift)
   Shift C → new SKU production begins
+  Building machine → starts producing GT for new SKU simultaneously with Shift A
+                     (2 full shifts of GT pre-built before curing fires up)
 
 On assignment of (P → T*, Day D):
   active_press_count(T*, shift ≥ Day D Shift C) += 1
   active_press_count(old_SKU, shift ≥ Day D Shift A) -= 1
+  building_machine(T*) → start Shift A of Day D  ← simultaneous with CO
 ```
 
 **Shared-feeder contention:** if two changeover candidates need the same building
@@ -686,16 +960,18 @@ For each curing shift S, each press P:
 - Stage-1 carcass capacity: 2,459/shift; Stage-2 demand: 2,215/shift → 11% headroom
 - Curing at CT=17 min default: **56 tyres/press/shift**
 
-**Impact of the 4 updates:**
+**Impact of the 5 updates:**
 - Update 1 (opening GT inventory): Day-1 buffer; no change to daily/monthly rate
 - Update 2 (relaxed S constraint): Stage-2 startup cost eliminated (+2,215 units)
 - Update 3 (1 day pre-start): building day D targets day D+1 curing → LP sees full demand every day, eliminates Day-2+ idle
 - Update 4 (BUILD_LEAD_SHIFTS WIP cap fix): `gt_inv_for_cap = wip0 − today_cure` prevents LP cap collapse in steady state
+- Update 5 (hard 100% demand cap): Three-layer enforcement — `_gt_remaining` tracker + daily `cur_mat` clip + LP per-SKU ceiling constraint. Guarantees total production ≤ `Demand_Qty` per SKU. Freed capacity redistributed to under-served SKUs by TopUp.
 
 | KPI | C2B | B2C | Confidence |
 |-----|-----|-----|------------|
-| Starvation events | Frequent | **0** | Architectural guarantee |
+| Starvation events | Frequent | **0 (Phase 4) / reduced (Phase 1)** | Phase 4 = architectural guarantee; Phase 1 synthetic plan → starvation Modes A/B/C (see §18.5) |
 | Waste GT | Possible | **0** | Architectural guarantee |
+| Overproduction per SKU | Uncontrolled | **0% — hard 100% cap** | Per update 5 (3-layer LP enforcement) |
 | Max changeovers/day | Uncontrolled | **≤ 8** | Hard constraint |
 | Opening GT inventory used | Ignored | **From DB** | Per update 1 |
 | Stage-2 startup idle shifts | 0 | **0** (relaxed rule, S allowed) | Per update 2 |
@@ -789,7 +1065,8 @@ run_b2c(cfg):
 | `MOULD_CLEAN_MIN` | 120 | mould clean (press OCCUPIED whole shift) |
 | `OPENING_GT_INVENTORY` | from DB | loaded from `gt_inventory_manual` at plan start |
 | `OPENING_CARCASS_INVENTORY` | **0 (cold start)** | Stage-2 blocked until Stage-1 produces carcasses in this plan |
-| `BUILDING_GT_CAP` | `min(press_consumption, demand/90)` | building output ≤ customer demand per SKU |
+| `BUILDING_GT_CAP` | `min(press_consumption, demand/90)` | building output ≤ customer demand per SKU (per-shift target cap — Layer 1 of 3-layer enforcement) |
+| `PER_SKU_DEMAND_CEILING` | `_gt_remaining[SKU]` (dynamic) | Hard LP constraint: Σ production ≤ remaining demand. Updates each day as production is drained. Prevents `OVERBUILD_BUFFER_FRAC` from allowing >100% fulfillment (Layer 3 of 3-layer enforcement) |
 | `BUILD_LEAD_SHIFTS` | **3** | building targets curing demand this many shifts ahead; 3 = 1 full day |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **1** | idle-tail TopUp only pre-builds for the next 1 day. Set to 1 (not 3) so TopUp targets the same Day+1 window as the LP — they complement instead of conflicting. Lookahead=3 pre-filled Days 2/3/4 on Day 1, making LP cap=0 on Day 2+. |
 | `OVERBUILD_BUFFER_FRAC` | **0.2** | fractional LP headroom above net curing demand per SKU per day. 0.0 caused LP cap to collapse to 0 on Days 2+ when TopUp pre-build partially covered the lead window; 0.2 keeps the LP active without violating the "total build ≤ 30-day demand" ceiling enforced by `gt_topup_target` |
@@ -906,3 +1183,93 @@ NRI SKUs can have zero production for two distinct reasons:
 | Curing CO deferred past horizon | `NRI: curing CO deferred — 8 CO/day cap reached` | Extend horizon or allow more COs in early days |
 
 NRI SKUs that ARE produced but partially: building machines are assigned, but the LP allocates less than total demand because higher-priority Runner-In SKUs claim the capacity first.
+
+---
+
+### 18.5 Starvation Root Cause Analysis — Synthetic Curing Plan
+
+> **Architecture clarification:** "Zero starvation by design" holds ONLY in a
+> fully-derived B2C (Phase 4), where the curing schedule is derived FROM the
+> building output. The current implementation (Phase 1) uses a **synthetic**
+> curing plan as the building target. Building must match it shift-by-shift.
+> Any gap between building output and the synthetic plan appears as starvation
+> in `StarvationValidator`. This is not a scheduler bug — it is a consequence
+> of deferring Phase 4.
+
+**Three starvation failure modes (from May baseline — 1,241 starvation events at 65.3% avg util):**
+
+| Mode | Root Cause | Description | Fix |
+|------|-----------|-------------|-----|
+| Mode A — Machine idle | LP heuristic assigns machine to nothing | Some machines (7001, 7003, 6004) are not assigned to any SKU; they sit idle while curing runs its synthetic demand. Building output = 0 for those shifts → validator sees deficit. | Mould-constrained priority boost (implemented) forces LP to assign mould-limited SKUs first. |
+| Mode B — Physical constraint | Too few building machines for the curing volume | E.g. 24 curing presses consume `24 × qps / shift` but only 3 building machines are assigned to that SKU → structural output gap. Even at 100% util, building can't match curing. | Assign more building machines to under-served SKUs; or implement Phase 4 (curing derives FROM building — physical constraint becomes the schedule, not a starvation). |
+| Mode C — NRI CO timing gap | 2-shift buffer at CO start is insufficient | Building starts Shift A of CO Day; curing starts Shift C. That gives only 2 shifts of pre-built GT. If diff-size building CO (180 min) consumes most of Shift A, buffer shrinks and any LP under-production on those 2 shifts starves the press in Shift C. | NRI demand front-loading (implemented): 70% of demand targets the pre-CO window → LP urgently pre-builds GT buffer before CO day. |
+
+**Why small building CT doesn't fix Mode A or B:**
+Building CT is ~2–3 min/tyre vs curing CT ~17 min — building is 6–8× faster per machine.
+Speed is not the problem. A machine producing at 100% speed but assigned to **no SKU** (Mode A)
+or **too few machines assigned** (Mode B) still produces zero for those SKUs. Building CT only
+determines per-shift output once a machine IS assigned to a SKU.
+
+**Path to true zero starvation:**
+Implement Phase 4 (Curing Derivation). Curing schedule is derived after building completes —
+a curing press runs only when GT is available in inventory. By construction:
+`Cure_Qty(shift S) ≤ GT_inventory(shift S)` always → WIP balance ≥ 0 → zero starvation events.
+Modes A and B become throughput constraints (lower production), not starvation events.
+
+---
+
+## 18. Demand Skew & KPI Ceiling Analysis (May 2026)
+
+### 18.1 Machine group definitions (39 total building machines)
+
+| Group | Machines | Count | Output | Inch constraint |
+|-------|----------|-------|--------|-----------------|
+| VMIMAXX | 6001–6004, 7001–7004 | 8 | GT direct | 14"–18" (hard-locked per machine to dominant) |
+| BJ | 7101–7106, 7201 | 7 | GT direct | 13"/14"/15"/16" (hard-locked per machine) |
+| UNI\_NARROW | 7501–7503 | 3 | GT direct | 12"/13" ONLY |
+| STAGE2 | 8201, 8301, 8302, 8501, 8502, 7301 | 6 | GT (needs carcass) | Mixed |
+| STAGE1 | 6801, 6802, 6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 | 15 | Carcass only | Mixed |
+
+### 18.2 Exclusive demand bucket assignment
+
+Rule: each SKU assigned to ONE bucket by priority VMIMAXX > BJ > UNI\_NARROW > STAGE2 > none.
+Total must equal 694,973.
+
+| Bucket | Machines | SKUs | Demand | Built GT | Gap | Coverage | Avg Util |
+|--------|----------|------|--------|----------|-----|----------|----------|
+| VMIMAXX | 8 | 39 | 239,156 | 211,808 | 27,348 | 88.6% | 55.3% |
+| BJ | 7 | 22 | 249,633 | 228,931 | 20,702 | 91.7% | 83.2% |
+| UNI\_NARROW | 3 | 7 | 56,717 | 44,193 | 12,524 | 77.9% | 58.4% |
+| STAGE2 | 6 | 14 | 89,549 | 85,684 | 3,865 | 95.7% | 81.2% |
+| No machine data | — | 7 | 59,918 | 8,417 | 51,501 | 14.0% | — |
+| **TOTAL** | **39** | **89** | **694,973** | **579,033** | **115,940** | **83.3%** | |
+
+Note: 8,417 built for "no machine data" = 2 Runner-In SKUs served via fallback path.
+
+### 18.3 Structural ceiling analysis
+
+| Group | Demand | Theoretical capacity | Demand/cap ratio | Status |
+|-------|--------|---------------------|-----------------|--------|
+| VMIMAXX (8) | 239,156 | ~357,120 (at 1.0 min CT) | 67% | Undersubscribed — spare capacity exists |
+| BJ (7) | 249,633 | ~184,000 (at 1.7 min CT) | **136%** | **Oversubscribed — hard ceiling** |
+| UNI\_NARROW (3) | 56,717 | ~89,280 (at 1.5 min CT) | 64% | Undersubscribed |
+| STAGE2 (6) | 89,549 | ~107,136 (at 2.5 min CT) | 84% | Near-full |
+
+BJ is the only group where demand physically exceeds machine capacity. The 20,702 BJ gap
+is structural: even at 100% utilisation BJ machines can produce at most ~184k units.
+The scheduler already offloads ~43k of BJ-bucket SKU production to Stage-2 (for SKUs
+also eligible on Stage-2). The remaining gap needs either more BJ presses or VMI certification.
+
+### 18.4 KPI improvement ceiling
+
+| Source of gap | Gap units | Max recoverable by scheduler | Required fix |
+|---------------|-----------|------------------------------|--------------|
+| VMIMAXX scheduling overhead | 27,348 | ~10–15k | Longer campaigns, fewer COs |
+| BJ structural capacity | 20,702 | ~5k | New BJ presses / VMI certification |
+| UNI\_NARROW scheduling | 12,524 | ~5–8k | Better 12"/13" campaign allocation |
+| STAGE2 (near ceiling) | 3,865 | ~1–2k | Marginal |
+| No machine data | 51,501 | 0 | Master data certification only |
+| **Total gap** | **115,940** | **~21–30k** | |
+
+**Scheduler ceiling:** ~600–610k / 694,973 ≈ **86–88%** coverage
+**True ceiling (all master data fixed):** ~630k+ / 694,973 ≈ **91%+** coverage

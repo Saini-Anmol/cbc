@@ -12,9 +12,4 @@ __pycache__/
 # macOS
 .DS_Store
 
-# now, our bc.py file will generate the both building schedule from the demand and curing schedule from the building? 
-
-# now both building & curing schedule output is ready, please do a very detailed analysis where the bottleneck are coming, why building is producing less Qty and why the curing was not able to fulfill the building demand, if the building is designed as per the curing consumption. Also check machine utilization sheet and then made analysis made on that. And, how we can increase the KPIs now for building and curing now. Check the latest output now. 
-# Now, as per our latest approach, our KPIs for building schedule will increase from the last output generated or not? If yes, then how much? 
-
-#we have to shift to the full 742k demand: you wants to change the LP approach completely to heuristic approach. Go for the best approach, but we have to produce the 742k unit. 
+# 

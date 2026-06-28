@@ -83,6 +83,13 @@ Config.MAX_CHANGEOVERS_PER_DAY = 8   # new plant-wide daily cap
 # Eliminates LP cap collapse on Day 2+ where same-day WIP blocks new building.
 # Default already 3 in Config; explicit here so operators can tune per-run.
 Config.BUILD_LEAD_SHIFTS       = 3   # 3 shifts = 1 day ahead of curing
+# Minimum campaign length per (SKU, machine) pair.
+# Raised from building.py default (45) to 120 min — forces longer production
+# runs before switching SKU.  With 45 min, machines thrash across many short
+# campaigns (machine 7004 reached 173 COs / month).  At 120 min each campaign
+# is at least a quarter-shift, limiting daily SKU count per machine and
+# reducing CO overhead in proportion.
+Config.MIN_CAMPAIGN_MINS       = 120
 # Remove CURING_PLAN_FILE — not used in B2C (we use consumption table)
 Config.CURING_PLAN_FILE = None
 
@@ -113,7 +120,7 @@ class B2C_ETL(ETL):
         df["SKUCode"] = df["SKUCode"].astype(str).str.strip()
         # Drop legend/summary rows that the Excel reader picks up as data
         df = df[df["SKUCode"].notna() & (df["SKUCode"] != "") & (df["SKUCode"] != "nan")]
-        _valid_cats = {"Runner-In", "Runner-Out", "Non-Runner-In"}
+        _valid_cats = {"Runner-In", "Non-Runner-In"}
         if "Category" in df.columns:
             df = df[df["Category"].isin(_valid_cats)]
         df = df.reset_index(drop=True)
@@ -139,7 +146,6 @@ class B2C_DemandDeriver:
 
     Runner-In:      curing_matrix[s, t] = Total_GT_Per_Shift_Day0[s]  (constant demand)
     Non-Runner-In:  curing_matrix[s, t] = 0 initially (no press yet; demand from file)
-    Runner-Out:     excluded (changeover target planning handled separately)
     """
 
     def derive_from_consumption(
@@ -254,6 +260,7 @@ def _make_synthetic_curing(
     plan_start: datetime,
     planning_days: int,
     nri_skus_to_build: set | None = None,
+    co_day_map: dict | None = None,
 ) -> pd.DataFrame:
     """
     Convert the consumption table into a df_curing-compatible DataFrame so
@@ -290,7 +297,38 @@ def _make_synthetic_curing(
             # to concentrate building capacity on Runner-In curing demand.
             if nri_skus_to_build is not None and sku not in nri_skus_to_build:
                 continue
-            target_qty = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
+            # Front-load building demand before the CO day so the LP pre-builds
+            # a buffer of GT before the curing press fires on CO Shift C.
+            # 70% of demand distributed over shifts 0 … co_day*3-1 (pre-CO),
+            # 30% over shifts co_day*3 … end (post-CO running phase).
+            # If CO day is unknown / Day 0, use flat distribution.
+            co_day = (co_day_map.get(sku) if co_day_map else None)
+            total_shifts = planning_days * Config.SHIFTS_PER_DAY
+            if co_day is not None and 0 < co_day < planning_days:
+                n_pre  = co_day * Config.SHIFTS_PER_DAY
+                n_post = total_shifts - n_pre
+                pre_rate  = (0.7 * dem_qty) / n_pre   if n_pre  > 0 else 0.0
+                post_rate = (0.3 * dem_qty) / n_post  if n_post > 0 else 0.0
+            else:
+                pre_rate = post_rate = dem_qty / total_shifts
+
+            for day_offset in range(planning_days):
+                base_date = plan_start + timedelta(days=day_offset)
+                shift_qty = pre_rate if (co_day is not None and day_offset < co_day) else post_rate
+                for sh_h in shift_hours:
+                    sh_start = datetime(
+                        base_date.year, base_date.month, base_date.day, sh_h % 24, 0, 0
+                    )
+                    if sh_h >= 24:
+                        sh_start += timedelta(days=1)
+                    sh_end = sh_start + timedelta(hours=Config.HOURS_PER_SHIFT)
+                    rows.append({
+                        "SKUCode":   sku,
+                        "StartTime": sh_start,
+                        "EndTime":   sh_end,
+                        "Qty":       shift_qty,
+                    })
+            continue   # NRI loop handled inline above — skip shared append below
         else:
             continue  # Runner-Out: no building demand
 
@@ -347,17 +385,19 @@ class ChangeoverScheduler:
         nri_skus = df_consumption[df_consumption["Category"] == "Non-Runner-In"].copy()
         nri_skus = nri_skus.sort_values("Priority_Score", ascending=False)
 
-        # RO presses: candidate for changeover to a high-priority NRI target
-        ro_skus  = df_consumption[df_consumption["Category"] == "Runner-Out"].copy()
+        # CO-candidate presses: any curing press currently running a non-demand SKU.
+        # Runner-Out SKUs are no longer in df_consumption (only demand SKUs are
+        # classified), so we find candidate presses directly from the live mould data.
+        demand_skus_in_plan = set(df_consumption["SKUCode"].astype(str))
 
         # Build a candidate list: (priority, press_or_sku, old_sku, target_sku, mould_life)
         candidates = []
 
-        # Simple pairing: assign highest priority NRI SKU to each available RO press
+        # Simple pairing: assign highest priority NRI SKU to each available CO press
         ro_presses = {}
         if df_running_moulds_curing is not None and len(df_running_moulds_curing) > 0:
             ro_press_df = df_running_moulds_curing[
-                df_running_moulds_curing["SKUCode"].isin(ro_skus["SKUCode"].tolist())
+                ~df_running_moulds_curing["SKUCode"].isin(demand_skus_in_plan)
             ]
             for _, pr in ro_press_df.iterrows():
                 ro_presses[str(pr["Machine"])] = {
@@ -464,9 +504,10 @@ class DynamicTargetLock:
                 day_idx     = int(co["CO_Day_Index"])
                 target_sku  = str(co["Target_SKU"])
                 old_sku     = str(co["Old_SKU"])
-                # CO day shift A = 0 (blocked), shift B = 1 (blocked)
-                # Production with new SKU starts shift C = day*3+2
-                first_prod_shift = day_idx * Config.SHIFTS_PER_DAY + 2
+                # Building starts simultaneously with CO (Shift A of CO day).
+                # Curing press: Shift A = CO, Shift B = Mould Clean, Shift C = production.
+                # Building pre-builds 2 full shifts of GT by the time curing fires up.
+                first_prod_shift = day_idx * Config.SHIFTS_PER_DAY
 
                 # Old SKU loses one press from CO shift A onward
                 old_first_blocked = day_idx * Config.SHIFTS_PER_DAY
@@ -507,23 +548,28 @@ def run_from_database_b2c(
     output_path: str | None = None,
     engine=None,
     planning_days: int | None = None,
+    external_co_schedule: list | None = None,
 ) -> dict:
     """
     Run the B2C building scheduler.
 
     Args:
-        plan_start:       First curing shift (building starts 1 shift earlier).
-        consumption_path: Path to curing_consumption_table.xlsx from Phase 0.
-        output_path:      Where to write bc_building_schedule.xlsx.
-        engine:           SQLAlchemy engine (created from .env if None).
-        planning_days:    Override Config.PLANNING_DAYS if provided.
+        plan_start:            First curing shift (building starts 1 shift earlier).
+        consumption_path:      Path to curing_consumption_table.xlsx from Phase 0.
+        output_path:           Where to write bc_building_schedule.xlsx.
+        engine:                SQLAlchemy engine (created from .env if None).
+        planning_days:         Override Config.PLANNING_DAYS if provided.
+        external_co_schedule:  Optional list of CO events from curing_consumption_dynamic.
+                               Each dict: {day: int (1-based), press: str,
+                               old_sku: str, new_sku: str}.
+                               When provided, skips ChangeoverScheduler entirely.
 
     Returns dict with same keys as building.run_from_database_hybrid().
     """
     from cbc_env import make_engine as _mk
 
     if plan_start is None:
-        plan_start = datetime(2026, 6, 1, 7, 0, 0)
+        plan_start = datetime(2026, 5, 1, 7, 0, 0)
     if output_path is None:
         output_path = os.path.join(
             MAIN_OUT,
@@ -557,10 +603,15 @@ def run_from_database_b2c(
     except Exception as _e:
         print(f"  [Config] CT load from DB failed ({_e}); using hardcoded fallback")
 
-    # ── B2C pre-start: 3 shifts before first curing shift ────────────────────
-    # Building gets a 3-shift head-start to build opening GT inventory.
-    # plan_start = May 1 07:00 (Shift A) → build_start = Apr 30 07:00 (Shift A)
-    PRE_START_SHIFTS = 3
+    # ── B2C pre-start: 2 shifts before first curing shift ───────────────────
+    # Building starts April 30 Shift B (15:00) — two shifts before May 1 curing.
+    # This gives the LP one full extra shift to pre-build GT for RI SKUs that
+    # enter May with zero opening inventory but active curing presses.
+    # With PRE_START_SHIFTS=1 (Apr 30 Shift C), those SKUs starved in the very
+    # first shift because there was no pre-build time. With PRE_START_SHIFTS=2,
+    # Shift B (15:00-23:00) builds the buffer, eliminating Shift C starvation.
+    # plan_start = May 1 07:00 (Shift A) → build_start = Apr 30 15:00 (Shift B)
+    PRE_START_SHIFTS = 2
     build_start = plan_start - timedelta(hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS)
     print(f"  [Config] Plan start:  {plan_start}  |  Build start: {build_start} ({PRE_START_SHIFTS} shifts early)")
     print(f"  [Config] Planning days: {Config.PLANNING_DAYS}")
@@ -633,6 +684,145 @@ def run_from_database_b2c(
     print(f"  [Allow] +{extra_pairs} machine-SKU pairs from historical data "
           f"({len(new_hist_rows)} new SKUs unlocked via production history)")
 
+    # ── Inch-group restriction for UNISTAGE machines (Inch-Run Study) ───────
+    # Source: CLAUDE.md §Inch-Run Study — Machine Group Inch Policies
+    #
+    # Three UNISTAGE sub-groups each have hard or soft inch constraints:
+    #   VMIMAXX  (6001-6004, 7001-7004) : 14"-18" group range
+    #   BJ       (7101-7106, 7201)       : 13", 15", 16" only
+    #   UNISTAGE (7501-7503)             : 12", 13" HARD — never 14"+
+    #
+    # Machines 7004/7003 reached 173/120 COs in a month because they were
+    # assigned 25/23 different SKUs spanning multiple inch sizes.  Restricting
+    # each group to its allowed inches eliminates cross-inch (diff-size) COs
+    # and bounds daily SKU variety per machine.
+    #
+    # Stage-1 and Stage-2 are NOT restricted here — their inch mix is managed
+    # by the LP and the Stage-2 CO-time multiplier (Fix 3).
+    _UNISTAGE_INCH_POLICY: dict[str, set] = {
+        # VMIMAXX — 14" to 18" allowed
+        "6001": {"14","15","16","17","18"},
+        "6002": {"14","15","16","17","18"},
+        "6003": {"14","15","16","17","18"},
+        "6004": {"14","15","16","17","18"},
+        "7001": {"14","15","16","17","18"},
+        "7002": {"14","15","16","17","18"},
+        "7003": {"14","15","16","17","18"},
+        "7004": {"14","15","16","17","18"},
+        # BJ — 13", 14", 15", 16" allowed (14" added: plant master data confirms
+        # 14" SKUs run on BJ machines; "well-locked" means 83-99% dominant inch,
+        # not a hard prohibition on 14")
+        "7101": {"13","14","15","16"},
+        "7102": {"13","14","15","16"},
+        "7103": {"13","14","15","16"},
+        "7104": {"13","14","15","16"},
+        "7105": {"13","14","15","16"},
+        "7106": {"13","14","15","16"},
+        "7201": {"13","14","15","16"},
+        # UNISTAGE — 12" and 13" HARD (never 14"+)
+        "7501": {"12","13"},
+        "7502": {"12","13"},
+        "7503": {"12","13"},
+    }
+
+    removed_pairs = 0
+    for idx, row in df_allow.iterrows():
+        sku       = str(row["SKUCode"])
+        mach_list = list(row.get("Machines", []) or [])
+        sku_inch  = str(sku_to_size.get(sku, "")).strip().replace('"', "")
+        if not sku_inch:
+            continue  # unknown inch — keep as-is
+        filtered = []
+        for m in mach_list:
+            allowed = _UNISTAGE_INCH_POLICY.get(str(m))
+            if allowed is None:
+                filtered.append(m)   # Stage-1/Stage-2 — no inch restriction
+            elif sku_inch in allowed:
+                filtered.append(m)   # inch within group policy → keep
+            else:
+                removed_pairs += 1   # inch violates group policy → drop
+        df_allow.at[idx, "Machines"] = filtered
+
+    print(f"  [Inch] Removed {removed_pairs} machine-SKU pairs violating "
+          f"group inch policies (VMIMAXX:14-18, BJ:13/14/15/16, UNISTAGE:12-13)")
+
+    # ── Per-machine hard inch allocation (demand-driven, replaces history bias) ──
+    # Demand analysis (May): 14"=77k VMI-eligible, 15"=70k VMI + 142k BJ,
+    # 16"=57k VMI, 17"=26k VMI, 13"=86k BJ, 12"=22k UNISTAGE.
+    # Each machine is locked to its dominant inch (± one overflow inch) so that:
+    #   - Same-inch demand is shared fairly across sibling machines (no history winner)
+    #   - No machine bleeds into a neighbour's inch pool and dilutes their demand
+    #   - 7102/7104 retain 14" so the 2 BJ-exclusive 14" RI SKUs keep machines
+    _MACHINE_HARD_INCH: dict[str, set] = {
+        # VMIMAXX — strict dominant inch; demand analysis shows each inch pool
+        # is under-capacity when shared, so sibling machines must not dilute each other
+        "7001": {"16"},               # dominant=16"; strict {16} so TIER-3 elig_count
+                                      # matches 6004/7201 — enables fair 3-way split
+        "6001": {"14"},               # dominant=14"
+        "7002": {"14"},               # dominant=14"
+        "7004": {"14"},               # dominant=14"
+        "6002": {"15"},               # dominant=15"
+        "7003": {"15"},               # dominant=15"
+        "6003": {"17", "18"},         # dominant=17"; 18" demand (840 units) added
+        "6004": {"16"},               # dominant=16"
+        # BJ — strict dominant inch; 15" demand (142k BJ-eligible) > BJ capacity → all
+        # 15"-dominant BJ machines run full; 13" demand (86k) fills 3 BJ machines
+        "7101": {"15"},               # dominant=15"
+        "7102": {"14", "15"},         # dominant=15"; 14" kept for BJ-exclusive 14" RI SKUs
+        "7103": {"13"},               # dominant=13"
+        "7104": {"14", "15"},         # dominant=15"; 14" kept for BJ-exclusive 14" RI SKUs
+        "7105": {"13"},               # dominant=13"
+        "7106": {"13"},               # dominant=13"
+        "7201": {"16"},               # dominant=16"
+        # UNISTAGE — 12" and 13" split cleanly; 7501 takes all 12" demand
+        "7501": {"12"},               # dominant=12" HARD (EXISTING)
+        "7502": {"13"},               # dominant=13"
+        "7503": {"13"},               # dominant=13"
+    }
+    removed_hard = 0
+    for idx, row in df_allow.iterrows():
+        sku       = str(row["SKUCode"])
+        mach_list = list(row.get("Machines", []) or [])
+        sku_inch  = str(sku_to_size.get(sku, "")).strip().replace('"', "")
+        if not sku_inch:
+            continue
+        filtered = [
+            m for m in mach_list
+            if str(m) not in _MACHINE_HARD_INCH
+            or sku_inch in _MACHINE_HARD_INCH[str(m)]
+        ]
+        removed_hard += len(mach_list) - len(filtered)
+        df_allow.at[idx, "Machines"] = filtered
+    print(f"  [Inch] Removed {removed_hard} machine-SKU pairs via per-machine "
+          f"hard inch allocation (VMI+BJ+UNISTAGE dominant-inch locking)")
+
+    # ── Diagnostic: RI SKUs with zero eligible building machines ─────────────
+    # These will produce 0 GT even if they have curing presses — starvation source.
+    # Root cause: either master data gap OR inch filter removed all their machines.
+    _allow_map_diag = {str(r["SKUCode"]): list(r.get("Machines", []) or [])
+                       for _, r in df_allow.iterrows()}
+    _ri_zero_bld = []
+    for _, _r in df_consumption.iterrows():
+        if str(_r.get("Category", "")).strip() != "Runner-In":
+            continue
+        _s = str(_r["SKUCode"])
+        _mlist = _allow_map_diag.get(_s, [])
+        _press = float(_r.get("Running_Press_Count", 0) or 0)
+        if _press > 0 and len(_mlist) == 0:
+            _inch = sku_to_size.get(_s, "?")
+            _ri_zero_bld.append((_s, _inch, _press))
+    if _ri_zero_bld:
+        print(f"  [WARN] {len(_ri_zero_bld)} Runner-In SKUs have 0 eligible building "
+              f"machines after inch filter — these will cause starvation:")
+        for _s, _inch, _press in _ri_zero_bld:
+            _orig = [str(m) for _, _row in df_allow.iterrows()
+                     if str(_row["SKUCode"]) == _s
+                     for m in (_row.get("Machines") or [])]
+            print(f"    SKU {_s}  inch={_inch}  presses={int(_press)}  "
+                  f"machines_after_filter={len(_allow_map_diag.get(_s, []))}")
+    else:
+        print("  [OK] All Runner-In SKUs with active presses have ≥1 eligible building machine")
+
     print("  [ETL] Loading running curing moulds (for changeover planning) …")
     try:
         from curing_consumption import ConsumptionETL
@@ -643,15 +833,36 @@ def run_from_database_b2c(
         df_running_curing = None
 
     # ── Changeover planning ───────────────────────────────────────────────────
-    print("\n  [CO Plan] Scheduling changeovers for Non-Runner-In SKUs …")
-    co_scheduler = ChangeoverScheduler()
-    df_co_plan = co_scheduler.schedule(
-        df_consumption,
-        df_running_curing,
-        plan_start,
-        Config.PLANNING_DAYS,
-        max_co_per_day=getattr(Config, "MAX_CHANGEOVERS_PER_DAY", 8),
-    )
+    if external_co_schedule is not None:
+        # Use the pre-computed CO schedule from curing_consumption_dynamic.py.
+        # Convert from {day (1-based), press, old_sku, new_sku} to
+        # the DynamicTargetLock format: [Press, Old_SKU, Target_SKU,
+        # CO_Day_Index (0-based), Status].
+        print(f"\n  [CO Plan] Using external CO schedule ({len(external_co_schedule)} events) …")
+        if external_co_schedule:
+            df_co_plan = pd.DataFrame([
+                {
+                    "Press":        ev["press"],
+                    "Old_SKU":      ev["old_sku"],
+                    "Target_SKU":   ev["new_sku"],
+                    "CO_Day_Index": int(ev["day"]) - 1,   # convert 1-based → 0-based
+                    "Status":       "SCHEDULED",
+                }
+                for ev in external_co_schedule
+            ])
+        else:
+            df_co_plan = pd.DataFrame(columns=["Press", "Old_SKU", "Target_SKU", "CO_Day_Index", "Status"])
+        print(f"  [CO Plan] {len(df_co_plan)} CO rows loaded from external schedule")
+    else:
+        print("\n  [CO Plan] Scheduling changeovers for Non-Runner-In SKUs …")
+        co_scheduler = ChangeoverScheduler()
+        df_co_plan = co_scheduler.schedule(
+            df_consumption,
+            df_running_curing,
+            plan_start,
+            Config.PLANNING_DAYS,
+            max_co_per_day=getattr(Config, "MAX_CHANGEOVERS_PER_DAY", 8),
+        )
 
     # ── Dynamic target lock ───────────────────────────────────────────────────
     print("  [Lock] Computing dynamic per-shift building targets …")
@@ -673,9 +884,18 @@ def run_from_database_b2c(
         if df_co_plan is not None and not df_co_plan.empty and "Target_SKU" in df_co_plan.columns
         else set()
     )
+    # Build CO day map (NRI SKU → 0-based CO day) for front-loading NRI demand
+    co_day_map: dict = {}
+    if df_co_plan is not None and not df_co_plan.empty:
+        for _, _co in df_co_plan.iterrows():
+            tgt = str(_co.get("Target_SKU", "")).strip()
+            if tgt and str(_co.get("Status", "")) == "SCHEDULED":
+                co_day_map[tgt] = int(_co.get("CO_Day_Index", 0))
+
     df_curing_synthetic = _make_synthetic_curing(
         df_consumption_updated, plan_start, Config.PLANNING_DAYS,
         nri_skus_to_build=nri_with_co,
+        co_day_map=co_day_map,
     )
     n_skus = df_curing_synthetic["SKUCode"].nunique()
     print(f"  [Synthetic] {len(df_curing_synthetic)} rows | {n_skus} SKUs")
@@ -698,6 +918,50 @@ def run_from_database_b2c(
         ))
     else:
         priority_map = {}
+
+    # Mould-constrained RI SKU priority boost.
+    # A Runner-In SKU with few presses relative to its demand needs more building
+    # days (current_days > horizon) — it must start building FIRST to avoid being
+    # discovered late. Multiply its priority_map value by a constraint factor so
+    # the LP heuristic assigns building machines to it preferentially.
+    # Multiplier = 1 + current_days / PLANNING_DAYS, clamped to [1, 4].
+    _mould_boosted = 0
+    for _, _row in df_consumption_updated.iterrows():
+        _sku = str(_row["SKUCode"])
+        if str(_row.get("Category", "")).strip() != "Runner-In":
+            continue
+        _n_press = float(_row.get("Running_Press_Count", 0) or 0)
+        _qpp     = float(_row.get("Qty_Per_Press_Per_Shift", 0) or 0)
+        _dem     = float(_row.get("Demand_Qty", 0) or 0)
+        if _n_press > 0 and _qpp > 0 and _dem > 0:
+            _rate_day   = _qpp * Config.SHIFTS_PER_DAY
+            _curr_days  = _dem / (_n_press * _rate_day)
+            _multiplier = min(1.0 + _curr_days / Config.PLANNING_DAYS, 4.0)
+            if _multiplier > 1.01:
+                priority_map[_sku] = priority_map.get(_sku, 1.0) * _multiplier
+                _mould_boosted += 1
+    print(f"  [Priority] Mould-constrained boost applied to {_mould_boosted} RI SKUs")
+
+    # NRI SKUs with a confirmed CO in co_day_map can have very low
+    # ConsolidatedPriorityScore (e.g. 0.008), causing the heuristic to process
+    # them last — by which time all building machines are at MAX_SKUS_PER_MACHINE
+    # cap and these NRI SKUs get no machine assignment despite having a CO.
+    # Guarantee a minimum priority so they compete for machines before the cap bites.
+    _MIN_NRI_CO_PRIORITY = 0.05   # above typical median; tune if too aggressive
+    _nri_co_boosted = 0
+    for _sku_nri, _co_day in co_day_map.items():
+        _cat_rows = df_consumption_updated[
+            df_consumption_updated["SKUCode"].astype(str) == _sku_nri
+        ]
+        if _cat_rows.empty:
+            continue
+        if str(_cat_rows.iloc[0].get("Category", "")).strip() != "Non-Runner-In":
+            continue
+        if priority_map.get(_sku_nri, 0.0) < _MIN_NRI_CO_PRIORITY:
+            priority_map[_sku_nri] = _MIN_NRI_CO_PRIORITY
+            _nri_co_boosted += 1
+    print(f"  [Priority] NRI-with-CO minimum priority ({_MIN_NRI_CO_PRIORITY}) "
+          f"applied to {_nri_co_boosted} low-priority NRI SKUs")
 
     # extra_topup_demand: ALL demand SKUs eligible for UNISTAGE that are NOT
     # already in the active LP synthetic curing plan (i.e., not in _gt_remaining).
