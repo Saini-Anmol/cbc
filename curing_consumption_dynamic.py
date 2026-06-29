@@ -77,7 +77,7 @@ OUT_DIR = cbc_env.OUTPUT_DIR
 
 PLANNING_DAYS       = 31           # May has 31 days
 SHIFTS_PER_DAY      = 3
-MAX_CO_PER_DAY      = 8            # plant-wide hard limit
+MAX_CO_PER_DAY      = 170            # plant-wide hard limit
 PLAN_START          = datetime(2026, 5, 1, 7, 0, 0)   # May 1, Shift A
 
 _NAVY  = "1F3864"
@@ -1038,10 +1038,35 @@ class DynamicExporter:
             ws = wb.create_sheet()
             self._write_day_sheet(ws, df_day, day_idx)
 
+        # curing_daily_cons — total curing production per day across all SKUs
+        ws_dc = wb.create_sheet("curing_daily_cons")
+        hdr = self._hdr_style()
+        for c_idx, label in enumerate(["Day", "Total_Curing_Production"], start=1):
+            cell = ws_dc.cell(row=1, column=c_idx, value=label)
+            for k, v in hdr.items():
+                setattr(cell, k, v)
+        ws_dc.row_dimensions[1].height = 20
+        grand_total = 0
+        for day_idx, df_day in enumerate(daily_sheets, start=1):
+            demand_mask = df_day["Category"].isin({"Runner-In", "Non-Runner-In"})
+            daily_total = int(df_day.loc[demand_mask, "Total_GT_Per_Shift_DayN"].sum() * SHIFTS_PER_DAY)
+            grand_total += daily_total
+            ws_dc.cell(row=day_idx + 1, column=1, value=f"Day {day_idx:02d}").alignment = Alignment(horizontal="center")
+            ws_dc.cell(row=day_idx + 1, column=2, value=daily_total).alignment = Alignment(horizontal="center")
+        total_row = len(daily_sheets) + 2
+        total_label = ws_dc.cell(row=total_row, column=1, value="Total")
+        total_label.font = Font(bold=True)
+        total_label.alignment = Alignment(horizontal="center")
+        total_val = ws_dc.cell(row=total_row, column=2, value=grand_total)
+        total_val.font = Font(bold=True)
+        total_val.alignment = Alignment(horizontal="center")
+        ws_dc.column_dimensions["A"].width = 12
+        ws_dc.column_dimensions["B"].width = 24
+
         wb.save(output_path)
         print(f"  [Export] Saved → {output_path}")
         print(f"  [Export] Sheets: Summary + Day0_Summary + CO_Schedule + "
-              f"{len(daily_sheets)} day sheets")
+              f"{len(daily_sheets)} day sheets + curing_daily_cons")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
