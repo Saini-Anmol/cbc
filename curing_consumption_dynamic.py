@@ -77,7 +77,7 @@ OUT_DIR = cbc_env.OUTPUT_DIR
 
 PLANNING_DAYS       = 31           # May has 31 days
 SHIFTS_PER_DAY      = 3
-MAX_CO_PER_DAY      = 170            # plant-wide hard limit
+MAX_CO_PER_DAY      = 8          # plant-wide hard limit
 PLAN_START          = datetime(2026, 5, 1, 7, 0, 0)   # May 1, Shift A
 
 _NAVY  = "1F3864"
@@ -1038,6 +1038,50 @@ class DynamicExporter:
             ws = wb.create_sheet()
             self._write_day_sheet(ws, df_day, day_idx)
 
+        # demand_drawdown — demand remaining after each day's curing (RI + NRI only)
+        # Day 0 = opening available demand (excludes excluded NRI + Runner-Out)
+        # Daily_Consumed = prev_remaining - curr_remaining
+        ws_dd = wb.create_sheet("demand_drawdown")
+        hdr_dd = self._hdr_style()
+        for c_idx, label in enumerate(["Day", "Remaining_Demand", "Daily_Consumed"], start=1):
+            cell = ws_dd.cell(row=1, column=c_idx, value=label)
+            for k, v in hdr_dd.items():
+                setattr(cell, k, v)
+        ws_dd.row_dimensions[1].height = 20
+
+        demand_cats = {"Runner-In", "Non-Runner-In"}
+        # Day 0 opening: sum Demand_Qty for RI + NRI, exclude rows with Skip_Reason
+        d0_mask = df_day0["Category"].isin(demand_cats)
+        if "Skip_Reason" in df_day0.columns:
+            d0_mask &= df_day0["Skip_Reason"].isna() | (df_day0["Skip_Reason"].astype(str).str.strip() == "")
+        day0_remaining = int(df_day0.loc[d0_mask, "Demand_Qty"].sum())
+
+        ws_dd.cell(row=2, column=1, value="Opening (Day 0)").alignment = Alignment(horizontal="center")
+        ws_dd.cell(row=2, column=2, value=day0_remaining).alignment = Alignment(horizontal="center")
+        ws_dd.cell(row=2, column=3, value="—").alignment = Alignment(horizontal="center")
+
+        prev_remaining = day0_remaining
+        total_consumed = 0
+        for day_idx, df_day in enumerate(daily_sheets, start=1):
+            dmask = df_day["Category"].isin(demand_cats)
+            curr_remaining = int(df_day.loc[dmask, "Updated_Demand_Qty"].sum())
+            consumed = prev_remaining - curr_remaining
+            total_consumed += consumed
+            r = day_idx + 2
+            ws_dd.cell(row=r, column=1, value=f"Day {day_idx:02d}").alignment = Alignment(horizontal="center")
+            ws_dd.cell(row=r, column=2, value=curr_remaining).alignment = Alignment(horizontal="center")
+            ws_dd.cell(row=r, column=3, value=consumed).alignment = Alignment(horizontal="center")
+            prev_remaining = curr_remaining
+
+        total_row = len(daily_sheets) + 3
+        for col, val in [(1, "Total Consumed"), (2, ""), (3, total_consumed)]:
+            cell = ws_dd.cell(row=total_row, column=col, value=val)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        ws_dd.column_dimensions["A"].width = 18
+        ws_dd.column_dimensions["B"].width = 20
+        ws_dd.column_dimensions["C"].width = 18
+
         # curing_daily_cons — total curing production per day across all SKUs
         ws_dc = wb.create_sheet("curing_daily_cons")
         hdr = self._hdr_style()
@@ -1066,7 +1110,7 @@ class DynamicExporter:
         wb.save(output_path)
         print(f"  [Export] Saved → {output_path}")
         print(f"  [Export] Sheets: Summary + Day0_Summary + CO_Schedule + "
-              f"{len(daily_sheets)} day sheets + curing_daily_cons")
+              f"{len(daily_sheets)} day sheets + demand_drawdown + curing_daily_cons")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

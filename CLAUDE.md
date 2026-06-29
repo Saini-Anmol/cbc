@@ -375,14 +375,17 @@ machines assigned (Mode B). Speed only helps once a machine IS assigned.
 
 | Parameter | Current value | What it controls |
 |-----------|--------------|-----------------|
-| `MIN_CAMPAIGN_MINS` | 45 min | Shortest allowed production run. Lower = more SKU switches. |
+| `MIN_CAMPAIGN_MINS` | **120 min** (overridden in `building_b2c.py`) | Shortest allowed production run. Base value in `building.py` is 45; overridden to 120 to prevent CO explosion when many NRI SKUs activate simultaneously. |
 | `MIN_CAMPAIGN_UNITS` | 40 | Minimum units per campaign. |
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | 1 | How many days ahead TopUp pre-builds. 1 prevents LP cap collapse. |
-| `MAX_CURING_CHANGEOVERS_PER_DAY` | 8 (hard) | Curing CO only. Building COs: unlimited. |
+| `MAX_CURING_CHANGEOVERS_PER_DAY` | **8 (hard)** | Curing CO only. Building COs: unlimited. Defined at `curing_consumption_dynamic.py:80` as `MAX_CO_PER_DAY = 8`. Change only this constant to experiment with CO limits. |
+| `CO_CLASS_FILTER` | **Class A only** | COScheduler fires only Class A (critical: `current_days > horizon_left`) COs. Class B (helpful) skipped. Prevents over-activating NRI SKUs building cannot supply simultaneously. |
+| `PRE_START_SHIFTS` | **2** (set in `building_b2c.py`) | Building pre-starts N shifts before plan_start. 2 = Apr 30 Shift B (15:00) → 1 extra shift of GT pre-build before curing starts Shift C May 1. Prevents zero-inventory starvation for RI SKUs on Day 1. |
 | `BUILD_LEAD_SHIFTS` | 3 (= 1 full day) | Building targets curing demand this many shifts ahead. |
 | `GT_SHELF_LIFE_DAYS` | 3 | TopUp won't pre-build GT more than 3 days ahead. |
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | TopUp won't pre-build carcass more than 1 day ahead. |
+| `Stage-2 CO time multiplier` | **2.0×** (applied in `building.py`) | Stage-2 `co_time_map` uses `diff × 2.0` (88 min → 176 min) to discourage LP from overloading Stage-2 with SKU switches. Configured in `HybridDailyScheduler.run()`. |
 
 ---
 
@@ -390,7 +393,7 @@ machines assigned (Mode B). Speed only helps once a machine IS assigned.
 
 ```
 Phase 0  → Curing Consumption Table (classification + press counts + per-shift targets)
-Phase 0+ → CO Schedule: urgency-ranked Pass 1 (Class A/B, max 8/day)
+Phase 0+ → CO Schedule: urgency-ranked Pass 1 (Class A ONLY, max 8/day)
               └─ CO Rescue pass: spare-press donation for NRI SKUs without any CO
 Phase 1a → Runner-In building (Stage-1, Stage-2, Unistage) — highest priority
               └─ Mould-constrained priority boost: priority × (1 + curr_days/31), capped 4×
@@ -424,10 +427,11 @@ When the user brings a logic/approach question, reason through it along these ax
 
 | File | Role |
 |------|------|
+| [b2c_pipeline.py](b2c_pipeline.py) | **CORRECT ENTRY POINT** — runs curing consumption → building in one command (`python b2c_pipeline.py`). Do NOT run `building_b2c.py` directly; its `__main__` uses June 1 plan_start and static consumption table. |
 | [building_b2c.py](building_b2c.py) | B2C building scheduler — Phase 1a/1b/2a/2b/3 |
 | [curing_consumption.py](curing_consumption.py) | Phase 0 — Day 0 snapshot consumption table + press counts. `load_demand()` handles raw CSV (`skuCode`/`requirement`) and normalized XLSX (`SKUCode`/`Requirement`/`ConsolidatedPriorityScore`); missing Priority defaults to 1.0 |
-| [curing_consumption_dynamic.py](curing_consumption_dynamic.py) | Phase 0 Extended — 31-day pre-computed curing consumption for May. Two-pass: Pass 1 = CO schedule (urgency score); Pass 2 = simulate 31 days. Output: `curing_consumption_31day.xlsx` (33 sheets) |
-| [building.py](building.py) | Base building machinery (GA + LP engine) reused by B2C |
+| [curing_consumption_dynamic.py](curing_consumption_dynamic.py) | Phase 0 Extended — 31-day pre-computed curing consumption for May. Two-pass: Pass 1 = CO schedule (Class A only, max 8/day); Pass 2 = simulate 31 days. Output: `curing_consumption_31day.xlsx` (34 sheets incl. `curing_daily_cons`) |
+| [building.py](building.py) | Base building machinery (LP engine + DemandHeuristicAssigner) reused by B2C |
 | [approach/bc.md](approach/bc.md) | Full B2C architecture spec (authoritative) |
 | [ARCHITECTURE_DETAILED.md](ARCHITECTURE_DETAILED.md) | C2B architecture (legacy; B2C supersedes) |
 | [cbc.py](cbc.py) | Orchestrator (C2B mode) |

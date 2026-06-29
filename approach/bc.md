@@ -388,9 +388,10 @@ Compute the full changeover plan from Day 0 data alone:
 2. **Runner-In presses** → eligible for CO on the day `Updated_Demand_Qty` hits 0.
 3. **NRI targets** ranked by two-level urgency score (§8 CO urgency):
    - Class A (CRITICAL): `current_production_days > horizon_left` — demand cannot be met without this CO.
-   - Class B (HELPFUL): already fulfillable with existing presses.
+   - Class B (HELPFUL): already fulfillable with existing presses — **SKIPPED** (Class A only filter active).
    - Sort: `(class ASC, −Priority_Score, after_co_days ASC)`
-4. **Max 8 COs per day** (plant hard limit); excess deferred to next day.
+   - Rationale for Class A only: firing Class B COs activates too many NRI SKUs simultaneously, causing building CO explosion (1,958 building COs observed vs 1,458 baseline). Building cannot supply all newly-activated presses → starvation events increase.
+4. **Max 8 COs per day** (plant hard limit, `MAX_CO_PER_DAY = 8` at `curing_consumption_dynamic.py:80`); excess deferred to next day.
 5. CO takes effect same day (new SKU's press count updates on CO day; Shift C produces for new SKU).
 6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
    in the main loop are sorted by the same urgency score. For each, search for an RI press
@@ -416,8 +417,10 @@ Simulate 31 days using the CO schedule from Pass 1:
 
 | Sheet | Contents |
 |-------|----------|
+| `Summary` | Coverage KPIs: total demand, built GT, curing coverage %, day-31 remaining by SKU |
 | `Day0_Summary` | Mirrors `curing_consumption_table.xlsx` (snapshot at plan start) |
 | `CO_Schedule` | All CO events: Day, Press, Old_SKU → New_SKU + day-level count summary |
+| `curing_daily_cons` | Two-column table: Day 01…31 + Total. Each row = total curing consumption supplied to building (RI + NRI SKUs only, Runner-Out excluded). Total should match ~634k for May. |
 | `Day_01` … `Day_31` | Per-day consumption table; colour-coded by category (green=RI, orange=RO, yellow=NRI) |
 
 ---
@@ -1072,6 +1075,9 @@ run_b2c(cfg):
 | `OVERBUILD_BUFFER_FRAC` | **0.2** | fractional LP headroom above net curing demand per SKU per day. 0.0 caused LP cap to collapse to 0 on Days 2+ when TopUp pre-build partially covered the lead window; 0.2 keeps the LP active without violating the "total build ≤ 30-day demand" ceiling enforced by `gt_topup_target` |
 | `BUILDING_START_OFFSET_SHIFTS` | -3 | building pre-start = 3 shifts (1 day) before curing Shift A |
 | `BUILDING_PRE_SHIFT` | `Shift A of Day-1` | e.g. May 31 Shift A if curing starts June 1 |
+| `PRE_START_SHIFTS` | **2** (set in `building_b2c.py`) | Building starts 2 shifts before plan_start = Apr 30 Shift B (15:00). Gives 1 extra shift of GT pre-build vs PRE_START_SHIFTS=1 (Shift C). Prevents zero-inventory Day-1 starvation for RI SKUs with 0 opening inventory. |
+| `MIN_CAMPAIGN_MINS` | **120** (overridden in `building_b2c.py`; base in `building.py` = 45) | Minimum production minutes per SKU campaign. Raised from 45→120 to prevent building CO explosion when many NRI SKUs activate simultaneously. |
+| `Stage-2 CO multiplier` | **2.0×** (`building.py HybridDailyScheduler`) | `co_time_map` for Stage-2 machines uses `diff_CO_time × 2.0` (88 min → 176 min). Discourages LP from over-assigning SKU switches to Stage-2; routes CO-intensive work to VMI (20 min same-size CO) instead. |
 
 ---
 
@@ -1250,7 +1256,7 @@ Note: 8,417 built for "no machine data" = 2 Runner-In SKUs served via fallback p
 
 | Group | Demand | Theoretical capacity | Demand/cap ratio | Status |
 |-------|--------|---------------------|-----------------|--------|
-| VMIMAXX (8) | 239,156 | ~357,120 (at 1.0 min CT) | 67% | Undersubscribed — spare capacity exists |
+| VMIMAXX (8) | 239,156 | **364,560** (6001–6004 at CT=1.0 min → 44,640 each; 7001–7004 at CT=0.96 min → 46,500 each) | 66% | Undersubscribed — spare capacity exists |
 | BJ (7) | 249,633 | ~184,000 (at 1.7 min CT) | **136%** | **Oversubscribed — hard ceiling** |
 | UNI\_NARROW (3) | 56,717 | ~89,280 (at 1.5 min CT) | 64% | Undersubscribed |
 | STAGE2 (6) | 89,549 | ~107,136 (at 2.5 min CT) | 84% | Near-full |
