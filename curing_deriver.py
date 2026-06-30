@@ -191,7 +191,7 @@ class PressStateTracker:
       - df_co_plan        : scheduled changeover events
 
     Runner-Out presses → IDLE immediately; RUNNING target SKU after CO.
-    Presses not in Daily_Running_Moulds → IDLE (no initial SKU).
+    Presses not in testing_Daily_Running_Moulds → IDLE (no initial SKU).
     """
 
     def __init__(
@@ -739,17 +739,17 @@ def _load_running_moulds(engine) -> pd.DataFrame:
 def _load_all_curing_press_ids(engine) -> set:
     """
     Return the set of ALL curing press IDs (running + idle) from:
-      1. Daily_Running_Moulds  — same machine-ID derivation as ConsumptionETL
+      1. testing_Daily_Running_Moulds  — same machine-ID derivation as ConsumptionETL
       2. Master_Curing_Allowable_Machines_source — numeric column names are press IDs
     """
     db = DeriverConfig.DB_NAME
     press_ids: set = set()
 
-    # ── From Daily_Running_Moulds (all rows, not just those with active SKU) ──
+    # ── From testing_Daily_Running_Moulds (all rows, not just those with active SKU) ──
     try:
         import numpy as np
         wc_master = pd.read_sql(f"SELECT wcID, WCNAME FROM {db}.Master_WC_Master", engine)
-        df_rm = pd.read_sql(f"SELECT WCNAME, Side FROM {db}.Daily_Running_Moulds", engine)
+        df_rm = pd.read_sql(f"SELECT WCNAME, Side FROM {db}.testing_Daily_Running_Moulds", engine)
         df_rm["WCNAME"] = (
             df_rm["WCNAME"].str.replace(r"(LH|RH)$", "", regex=True).str.strip()
         )
@@ -758,7 +758,7 @@ def _load_all_curing_press_ids(engine) -> set:
             str(m).strip() for m in df_rm["curing_machine"].dropna() if str(m).strip()
         )
     except Exception as exc:
-        print(f"  ⚠️  Could not load all Daily_Running_Moulds presses: {exc}")
+        print(f"  ⚠️  Could not load all testing_Daily_Running_Moulds presses: {exc}")
 
     # ── From Master_Curing_Allowable_Machines_source (press IDs = numeric cols) ──
     try:
@@ -843,7 +843,7 @@ def derive_curing_schedule(
     # ── Load running moulds (press → SKU snapshot) ────────────────────────────
     print("  [ETL] Loading curing running moulds …")
     df_running_moulds = _load_running_moulds(engine)
-    print(f"        {len(df_running_moulds)} active curing presses in Daily_Running_Moulds")
+    print(f"        {len(df_running_moulds)} active curing presses in testing_Daily_Running_Moulds")
 
     # ── Load ALL curing press IDs ─────────────────────────────────────────────
     print("  [ETL] Loading all curing press IDs …")

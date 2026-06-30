@@ -20,6 +20,7 @@ import pandas as pd
 import cbc_env
 from curing_consumption_dynamic import run_dynamic_consumption
 from building_b2c import run_from_database_b2c
+from bc import MAX_CHANGEOVERS_PER_DAY, MIN_CAMPAIGN_MINS, BUILD_LEAD_SHIFTS
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)
@@ -64,6 +65,7 @@ def run_pipeline(
         output_path=cc_output,
         plan_start=plan_start,
         planning_days=planning_days,
+        max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -100,6 +102,9 @@ def run_pipeline(
             output_path=build_output,
             planning_days=planning_days,
             external_co_schedule=co_events,
+            max_changeovers_per_day=MAX_CHANGEOVERS_PER_DAY,
+            min_campaign_mins=MIN_CAMPAIGN_MINS,
+            build_lead_shifts=BUILD_LEAD_SHIFTS,
         )
     finally:
         os.unlink(tmp.name)

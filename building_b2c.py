@@ -73,25 +73,11 @@ MAIN_OUT = os.path.join(OUT_DIR, "main_output")
 os.makedirs(MAIN_OUT, exist_ok=True)
 
 # ── B2C-specific config overrides ────────────────────────────────────────────
-# Applied at module level so that all building.py classes that reference
-# Config.X pick up the B2C values when called through this module.
-Config.MAX_CHANGEOVERS_PER_DAY = 8   # new plant-wide daily cap
-# OVERBUILD_BUFFER_FRAC: inherits 0.2 from building.py Config — do NOT override
-# to 0.0 here. The 20% LP headroom prevents cap collapse on Days 2+ without
-# violating the "total build ≤ 30-day demand" ceiling enforced by gt_topup_target.
-# Building lead time: day D LP targets day D+1 curing demand (1 full day ahead).
-# Eliminates LP cap collapse on Day 2+ where same-day WIP blocks new building.
-# Default already 3 in Config; explicit here so operators can tune per-run.
-Config.BUILD_LEAD_SHIFTS       = 3   # 3 shifts = 1 day ahead of curing
-# Minimum campaign length per (SKU, machine) pair.
-# Raised from building.py default (45) to 120 min — forces longer production
-# runs before switching SKU.  With 45 min, machines thrash across many short
-# campaigns (machine 7004 reached 173 COs / month).  At 120 min each campaign
-# is at least a quarter-shift, limiting daily SKU count per machine and
-# reducing CO overhead in proportion.
-Config.MIN_CAMPAIGN_MINS       = 120
-# Remove CURING_PLAN_FILE — not used in B2C (we use consumption table)
-Config.CURING_PLAN_FILE = None
+# MAX_CHANGEOVERS_PER_DAY, MIN_CAMPAIGN_MINS, BUILD_LEAD_SHIFTS are no longer
+# hardcoded here. They are passed as parameters to run_from_database_b2c() and
+# set on Config inside that function. Edit them in bc.py (single source of truth).
+# OVERBUILD_BUFFER_FRAC: inherits 0.2 from building.py Config — do NOT override.
+Config.CURING_PLAN_FILE = None  # not used in B2C (we use consumption table)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # B2C ETL  (extends building ETL with consumption table reader)
@@ -549,6 +535,9 @@ def run_from_database_b2c(
     engine=None,
     planning_days: int | None = None,
     external_co_schedule: list | None = None,
+    max_changeovers_per_day: int = 10,
+    min_campaign_mins: int = 120,
+    build_lead_shifts: int = 3,
 ) -> dict:
     """
     Run the B2C building scheduler.
@@ -581,6 +570,9 @@ def run_from_database_b2c(
         engine = _mk()
     if planning_days is not None:
         Config.PLANNING_DAYS = planning_days
+    Config.MAX_CHANGEOVERS_PER_DAY = max_changeovers_per_day
+    Config.MIN_CAMPAIGN_MINS       = min_campaign_mins
+    Config.BUILD_LEAD_SHIFTS       = build_lead_shifts
 
     print("\n" + "=" * 70)
     print("  B2C Phase 1 — Building Scheduler")

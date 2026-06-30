@@ -77,7 +77,7 @@ OUT_DIR = cbc_env.OUTPUT_DIR
 
 PLANNING_DAYS       = 31           # May has 31 days
 SHIFTS_PER_DAY      = 3
-MAX_CO_PER_DAY      = 8          # plant-wide hard limit
+MAX_CO_PER_DAY      = 10         # plant-wide hard limit (default; set in bc.py)
 PLAN_START          = datetime(2026, 5, 1, 7, 0, 0)   # May 1, Shift A
 
 _NAVY  = "1F3864"
@@ -166,6 +166,7 @@ class COScheduler:
         df_allowable: pd.DataFrame,
         df_running_moulds: pd.DataFrame,
         ct_map: dict[str, float],
+        max_co_per_day: int = MAX_CO_PER_DAY,
     ) -> list[dict]:
         """Returns sorted list of CO events."""
 
@@ -236,7 +237,7 @@ class COScheduler:
                         ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
                     updated_demand[sku] = max(0.0, updated_demand[sku] - n * rate)
 
-            if co_used >= MAX_CO_PER_DAY:
+            if co_used >= max_co_per_day:
                 continue
 
             # Identify free presses this day:
@@ -377,7 +378,7 @@ class COScheduler:
                         continue  # donating this press would strand the RI SKU
                     # Schedule CO on earliest available day
                     for day in range(1, PLANNING_DAYS + 1):
-                        if daily_co_used.get(day, 0) < MAX_CO_PER_DAY:
+                        if daily_co_used.get(day, 0) < max_co_per_day:
                             co_events.append({
                                 "day":     day,
                                 "press":   press,
@@ -402,7 +403,7 @@ class COScheduler:
                      if still_missing else ""))
 
         # ── Summary ───────────────────────────────────────────────────────────
-        total_slots = MAX_CO_PER_DAY * PLANNING_DAYS
+        total_slots = max_co_per_day * PLANNING_DAYS
         used_slots  = len(co_events)
         co_by_day   = {}
         for ev in co_events:
@@ -1122,6 +1123,7 @@ def run_dynamic_consumption(
     output_path: str | None = None,
     plan_start: datetime = PLAN_START,
     planning_days: int = PLANNING_DAYS,
+    max_co_per_day: int = MAX_CO_PER_DAY,
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1271,7 +1273,7 @@ def run_dynamic_consumption(
     print("\n  [Pass 1] Computing CO schedule …")
     scheduler = COScheduler()
     co_events = scheduler.schedule(
-        df_day0, df_demand, df_allowable, df_running, ct_map
+        df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day
     )
 
     # Pass 2: 31-day simulation

@@ -369,7 +369,7 @@ class ETL:
         wc_master = self._sql(f"SELECT * FROM {Config.DB_NAME}.Master_WC_Master")
         wc_master = wc_master[['wcID', 'WCNAME']]
 
-        df = self._sql(f"SELECT * FROM {Config.DB_NAME}.Daily_Running_Moulds")
+        df = self._sql(f"SELECT * FROM {Config.DB_NAME}.testing_Daily_Running_Moulds")
         df = df.drop(columns=["updatedAt"])
 
         dff = df[['WCNAME', 'Side','Sapcode', 'Current MouldNo', 'Mould life']]

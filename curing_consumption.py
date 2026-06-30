@@ -187,7 +187,7 @@ class ConsumptionETL:
         wc_master = self._sql(f"SELECT * FROM {self.db}.Master_WC_Master")
         wc_master = wc_master[["wcID", "WCNAME"]]
 
-        df = self._sql(f"SELECT * FROM {self.db}.Daily_Running_Moulds")
+        df = self._sql(f"SELECT * FROM {self.db}.testing_Daily_Running_Moulds")
         if "updatedAt" in df.columns:
             df = df.drop(columns=["updatedAt"])
 
@@ -274,18 +274,18 @@ class ConsumptionETL:
             return set()
 
     def load_curing_history_skus(self) -> set:
-        """SKUs seen in Daily_Running_Moulds (current/historical curing press state)."""
+        """SKUs seen in testing_Daily_Running_Moulds (current/historical curing press state)."""
         _sentinels = {"CHANGEOVER", "MOULD_CLEAN", "MOULDCLEAN", "CO", "CLEAN", "NAN", ""}
         try:
             df = self._sql(
                 f"SELECT DISTINCT Sapcode AS SKUCode "
-                f"FROM {self.db}.Daily_Running_Moulds "
+                f"FROM {self.db}.testing_Daily_Running_Moulds "
                 f"WHERE Sapcode IS NOT NULL AND Sapcode != ''"
             )
             raw = set(df["SKUCode"].astype(str).str.strip())
             return {s for s in raw if s.upper() not in _sentinels}
         except Exception as exc:
-            print(f"  ⚠  Curing history (Daily_Running_Moulds) unavailable: {exc}")
+            print(f"  ⚠  Curing history (testing_Daily_Running_Moulds) unavailable: {exc}")
             return set()
 
 
@@ -458,7 +458,7 @@ class SKUEligibilityFilter:
 
     Eligibility rules:
       - Building OK  : SKU in (Master_Building_Allowable OR Building_Stage1/2_History)
-      - Curing OK    : SKU in (Master_Curing_Allowable  OR Daily_Running_Moulds history)
+      - Curing OK    : SKU in (Master_Curing_Allowable  OR testing_Daily_Running_Moulds history)
       - BOTH must be OK; failing either → excluded with remark
 
     CT missing is NOT an exclusion criterion — default CT = 17 min is used instead.

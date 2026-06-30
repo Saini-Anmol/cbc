@@ -67,6 +67,9 @@ os.makedirs(MAIN_OUT, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USER SETTINGS  —  edit these for each planning run, then `python3 bc.py`
+# All scheduling params live here and are imported by building_b2c.py,
+# curing_consumption_dynamic.py, and b2c_pipeline.py — do NOT hardcode them
+# in those files.
 # ══════════════════════════════════════════════════════════════════════════════
 # 1) Demand file. Drop the new demand workbook in data/input/ and point here.
 #    Required columns: SKUCode, Requirement (or Updated_Requirement),
@@ -77,6 +80,11 @@ DEMAND_FILE = os.path.join(IN, "demand_may.xlsx")
 #    Building pre-start = 1 shift before this (Apr 30 Shift C for May plan).
 PLAN_START_DT = datetime(2026, 5, 1, 7, 0, 0)
 PLANNING_DAYS = 31
+
+# 3) Changeover & campaign params — single source of truth for all pipeline stages.
+MAX_CHANGEOVERS_PER_DAY = 10   # curing press CO hard cap per day (plant limit)
+MIN_CAMPAIGN_MINS       = 120  # building: minimum production run before SKU switch
+BUILD_LEAD_SHIFTS       = 3    # building: shifts ahead to target curing demand
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,6 +99,11 @@ class BCConfig:
     # Plan horizon
     PLAN_START:    datetime = field(default_factory=lambda: PLAN_START_DT)
     PLANNING_DAYS: int      = PLANNING_DAYS
+
+    # Scheduling params (imported by building_b2c & curing_consumption_dynamic)
+    MAX_CHANGEOVERS_PER_DAY: int = MAX_CHANGEOVERS_PER_DAY
+    MIN_CAMPAIGN_MINS:       int = MIN_CAMPAIGN_MINS
+    BUILD_LEAD_SHIFTS:       int = BUILD_LEAD_SHIFTS
 
     # Phase 0 output
     CONSUMPTION_OUTPUT: str = os.path.join(OUT, "curing_consumption_table.xlsx")
@@ -162,11 +175,14 @@ def phase1_building(cfg: BCConfig, consumption: dict, engine) -> dict:
     print("▓" * 72)
 
     results = run_from_database_b2c(
-        plan_start       = cfg.PLAN_START,
-        consumption_path = cfg.CONSUMPTION_OUTPUT,
-        output_path      = cfg.BUILDING_OUTPUT,
-        engine           = engine,
-        planning_days    = cfg.PLANNING_DAYS,
+        plan_start              = cfg.PLAN_START,
+        consumption_path        = cfg.CONSUMPTION_OUTPUT,
+        output_path             = cfg.BUILDING_OUTPUT,
+        engine                  = engine,
+        planning_days           = cfg.PLANNING_DAYS,
+        max_changeovers_per_day = cfg.MAX_CHANGEOVERS_PER_DAY,
+        min_campaign_mins       = cfg.MIN_CAMPAIGN_MINS,
+        build_lead_shifts       = cfg.BUILD_LEAD_SHIFTS,
     )
 
     ss = results.get("shift_schedule")
