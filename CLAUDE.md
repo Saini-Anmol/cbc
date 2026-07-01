@@ -401,19 +401,22 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 > **NEW ARCHITECTURE (approved, not yet implemented):** Day-by-day rolling loop.
 > The current 3-step sequential pipeline is the LEGACY approach. Full spec in `approach/bc.md` §19.
 
-### Legacy pipeline (current code — run: `python b2c_pipeline.py`)
+### Legacy pipeline (--legacy flag — run: `python b2c_pipeline.py --legacy`)
 
 ```
 Step 1: curing_consumption_dynamic.py
   Phase 0  → Curing Consumption Table (classification + press counts + per-shift targets)
   Phase 0+ → CO Schedule: urgency-ranked Pass 1 (Class A ONLY, max MAX_CHANGEOVERS_PER_DAY/day)
                 └─ CO Rescue pass: spare-press donation for NRI SKUs without any CO
+             CO candidates sort: min-CT target first → exclusive press first (§19.5)
 
 Step 2: building_b2c.py
   Phase 1a → Runner-In building (Stage-1, Stage-2, Unistage) — highest priority
                 └─ Mould-constrained priority boost: priority × (1 + curr_days/31), capped 4×
+                └─ RI SKUs with no eligible building machines SKIPPED in synthetic curing plan
   Phase 1b + 2a → Joint Priority Pool (NRI building + Runner-Out CO eligibility) — residual capacity
                 └─ NRI synthetic demand: 70% pre-CO / 30% post-CO (co_day_map front-loading)
+                └─ NRI CO priority floor: 0.05 (ensures NRI with CO always get machines)
   Phase 2b → Pending CO scheduling (max MAX_CHANGEOVERS_PER_DAY/day)
   Phase 3  → Dynamic target lock (per-shift building caps frozen)
 
@@ -422,34 +425,67 @@ Step 3: curing_b2c.py  [ACTIVE — Phase 4 implemented]
   → Press state from testing_Daily_Running_Moulds (167 presses, WCNAME format)
   → CO transitions from building Changeover Plan sheet
   → Pre-plan-start building GT credited to opening balance
-  → Output: bc_curing_b2c.xlsx (6 sheets: Demand Fulfillment, Machine Utilization,
-             Shift Schedule, Mould Tracker, Machine Schedule, Daily Summary)
+  → Output: bc_curing_b2c.xlsx (6 sheets)
 ```
 
-### New pipeline (target architecture — day-by-day rolling loop)
+### Rolling pipeline (NEW DEFAULT — run: `python b2c_pipeline.py`)
+
+**Architecture:** Day-by-day loop — building and curing planned simultaneously from actual state.
+No synthetic 31-day curing plan. Gap between building and curing collapses to CO windows only.
 
 ```
-for day D in 1..31:
-  Step 1: Curing consumption for Day D
-          Input: press_state(D), gt_inventory(D), demand_remaining(D)
+Pre-computation (once):
+  CO schedule    → COScheduler (which press COs on which day, Class A only)
+  Allow map      → MACHINE_HARD_INCH filter applied
+  CT map         → ConsumptionETL (curing), _BLD_CT_SEC (building)
+  Press state    → testing_Daily_Running_Moulds (167 presses)
+  GT inventory   → opening balance from DB
+  Demand         → demand file
 
-  Step 2: Building schedule for Day D  [simultaneous with Step 3]
-          • Starts Shift A of Day D (same time as curing — no pre-build wait)
-          • Max 2 COs per building machine per day (prefer same_size_CO)
-          • COs must be same-inch wherever possible (20 min VMI, 45 min BJ)
-          • Campaign split proportional to curing press count per target SKU
-          • Min 80% utilisation per machine per shift (≥ 384 min production)
-          • TOPUP_LOOKAHEAD = 1 shift only
+for Day D in 1..31:
 
-  Step 3: Curing schedule for Day D  [simultaneous with Step 2]
-          • Building CT ≈ 2 min → GT available almost instantly
-          • Curing presses consume from live GT pool (CT ≈ 17 min)
-          • 1 building machine → ~240 GT/shift → feeds ≈ 4.3 curing presses
-          • CO pre-start still applies: building starts Shift A of CO day;
-            curing press starts Shift C (2-shift GT buffer already in pool)
+  Step 1 — Curing demand for Day D
+    curing_demand[sku] = press_count[sku] × qty_per_shift × shifts_active
+    (CO presses: Shift A=CHANGEOVER, Shift B=MOULD_CLEAN → Shift C only = 1 shift)
 
-  Step 4: Update state: gt_inventory(D+1), demand_remaining(D+1), press_state(D+1)
+  Step 2 — GT deficit
+    deficit[sku] = max(0, curing_demand[sku] × GT_BUFFER_SHIFTS − gt_inventory[sku])
+    capped at demand_remaining[sku]
+
+  Step 3 — Greedy building assignment (_assign_building_day)
+    For each machine M:
+      1. Serve current SKU first (no CO cost)
+      2. CO to next-highest-deficit eligible SKU if:
+           CO_cost ≤ 20% remaining shift time
+           AND remaining_after_CO ≥ MIN_CAMPAIGN_MINS
+           prefer same_size_CO (20 min VMI, 45 min BJ)
+      3. Max 2 COs per shift × 3 shifts = 6 per day
+
+  Step 4 — Distribute build across shifts (evenly: qty // 3 per shift)
+
+  Step 5 — Per-shift simulation (A, B, C):
+    gt_inventory[sku] += build_this_shift[sku]     # GT added at start of shift
+    for each press:
+      RUNNING:       cured = min(capacity, gt_available); gt_inventory -= cured
+      CHANGEOVER/
+      MOULD_CLEAN:   press idle (CO day Shift A/B)
+
+  Step 6 — Update state:
+    press_count[old_sku] -= 1; press_count[new_sku] += 1
+    press_state[press] = {sku: new_sku, status: RUNNING}
+    machine_current_sku[machine] = last_sku_produced
 ```
+
+**Key differences from legacy:**
+
+| Property | Legacy | Rolling |
+|----------|--------|---------|
+| Building plan | 31-day LP upfront | Greedy per-day from actual state |
+| Curing target | Synthetic 31-day plan | Actual press_count × qty_per_shift |
+| GT buffer | TOPUP_LOOKAHEAD_DAYS_GT = 3 days | GT_BUFFER_SHIFTS = 1 shift |
+| Building CO | LP penalty discourage | Dynamic: only when deficit exists |
+| Starvation | Possible (synthetic plan mismatch) | Impossible by construction |
+| Building-curing gap | 60-70k (surplus inventory) | CO windows only (~2 shifts/CO event) |
 
 ### In-shift building CO pattern (confirmed from plant data)
 
@@ -470,7 +506,6 @@ CO math per shift for VMI same-inch (plant currently avg 0.57 CO/shift/machine):
   2 CO × 20 min = 8.3% overhead → 91.7% production  ✓ (max — when 2 press groups need feeding)
   2 diff_size_CO × 120 min each → 50% overhead      ✗ BLOCKED (violates 80% floor)
 Full KPI comparison (old vs new architecture): see `approach/bc.md` §20.
-
 ---
 
 ## How to think about a "should we change X" question

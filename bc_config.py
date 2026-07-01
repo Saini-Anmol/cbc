@@ -219,3 +219,4 @@ BUILDING_OUTPUT    = os.path.join(_MAIN_OUT, f"bc_building_schedule_{PLAN_START.
 CURING_OUTPUT      = os.path.join(_MAIN_OUT, "bc_curing_schedule.xlsx")
 CURING_B2C_OUTPUT  = os.path.join(_MAIN_OUT, "bc_curing_b2c.xlsx")
 ANALYSIS_OUTPUT    = os.path.join(_MAIN_OUT, "bc_analysis.xlsx")
+ROLLING_OUTPUT     = os.path.join(_MAIN_OUT, "bc_rolling_schedule.xlsx")

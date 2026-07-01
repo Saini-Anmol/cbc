@@ -1672,15 +1672,66 @@ Per shift:
 
 ---
 
-### 19.12 Implementation Scope
+### 19.12 Implementation Status — COMPLETED
 
-| File | Change required |
-|------|----------------|
-| `curing_consumption_dynamic.py` | Per-day function; re-score CO urgency daily using `horizon_left = 31 - D`; use previous day's actual curing output as input |
-| `building_b2c.py` | Per-shift scheduler; section 19.6 dynamic CO trigger; section 19.7 CO pre-build logic; GT_BUFFER_SHIFTS instead of TOPUP_LOOKAHEAD; MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2 |
-| `curing_b2c.py` | Per-shift simulation; section 19.9 starvation prevention; shift-level GT carry-over |
-| `b2c_pipeline.py` | Rolling loop: `for day in range(31): for shift in [A,B,C]:` |
-| `bc_config.py` | Add `GT_BUFFER_SHIFTS = 1`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2`, `MIN_SHIFT_UTILISATION = 0.80`; update comments |
+| File | Status | What was done |
+|------|--------|---------------|
+| `b2c_pipeline.py` | **DONE** | `run_rolling_pipeline()` added — day-by-day loop, greedy building assignment, per-shift curing simulation. New CLI default; `--legacy` flag runs old LP pipeline |
+| `building_b2c.py` | **DONE** | `_make_synthetic_curing()` now skips RI SKUs with no eligible building machines (Fix 3); NRI CO priority boost already in place |
+| `curing_consumption_dynamic.py` | **DONE** | CO candidates sort updated: min-CT target first → exclusive press first (§19.5 priority) |
+| `bc_config.py` | **DONE** | Added `GT_BUFFER_SHIFTS = 1`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2`, `MIN_SHIFT_UTILISATION = 0.80`, `BUILDING_CO_SAME_SIZE`, `BUILDING_CO_DIFF_SIZE`, curing CO timing constants |
+| `curing_b2c.py` | **Pre-existing** | `cured = min(capacity, gt_available)` — starvation prevention already implemented |
+
+### 19.13 Rolling Pipeline — Implementation Details (`b2c_pipeline.py`)
+
+**Entry point:** `python b2c_pipeline.py` (rolling, new default) or `python b2c_pipeline.py --legacy`
+
+**Pre-computation (once before the loop):**
+- CO schedule via existing `COScheduler` — which press COs on which day
+- Machine allowable map + `_MACHINE_HARD_INCH` filter
+- Curing CT map from DB (`ConsumptionETL`)
+- Opening GT inventory from DB
+- Initial press state from running moulds
+- Demand remaining from demand file
+
+**Rolling loop helper functions (all in `b2c_pipeline.py`):**
+
+```python
+_bld_qty_per_shift(machine)      # floor(480 / ct_min) — building units per shift
+_cure_qty_per_shift(ct_min)      # floor(480 / ct_min) × 2 cavities — curing units per shift
+_co_cost(machine, from_inch, to_inch)  # same_size_CO or diff_size_CO from bc_config
+_assign_building_day(deficit, machine_skus, machine_current_sku, sku_inch, demand_remaining)
+```
+
+**`_assign_building_day()` greedy algorithm:**
+```
+For each GT building machine M (GT machines before Stage-1):
+  1. Serve current SKU first (zero CO cost):
+     build_mins = min(day_remaining, deficit[cur_sku] / rate)
+  2. CO to next-highest-deficit eligible SKU:
+     only if CO_cost <= 20% of remaining shift time
+     AND remaining_after_CO >= MIN_CAMPAIGN_MINS
+     prefer same_size_CO (same inch) — costs 20 min VMI, 45 min BJ
+  3. Max COs per day = MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT × 3
+```
+
+**Per-day loop steps:**
+```
+for day D in 1..31:
+  1. curing_demand[sku] = press_count[sku] × qty_per_shift × shifts_active
+     (CO presses: Shift A=CO, Shift B=MOULD_CLEAN → only Shift C counted)
+  2. deficit[sku] = max(0, curing_demand[sku] × GT_BUFFER_SHIFTS − gt_inventory[sku])
+  3. daily_plan = _assign_building_day(deficit, ...)
+  4. Split daily_plan evenly across 3 shifts (qty // 3 per shift)
+  5. Per shift (A, B, C):
+       gt_inventory[sku] += build_this_shift[sku]    # GT added at start of shift
+       for each press:
+         if RUNNING: cured = min(capacity, gt_available); gt_inventory -= cured
+         if CHANGEOVER/MOULD_CLEAN: idle
+  6. Apply CO transitions at end of day:
+       press_count[old_sku] -= 1; press_count[new_sku] += 1
+       press_state[press] = {sku: new_sku, status: RUNNING}
+```
 
 ---
 
