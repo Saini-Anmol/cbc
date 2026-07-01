@@ -1,12 +1,15 @@
 """
 b2c_pipeline.py — End-to-end B2C scheduling pipeline.
 
-Orchestrates two stages:
-  1. Curing Consumption (dynamic) — generates 31-day CO schedule
-  2. Building Scheduler (B2C)     — uses CO schedule to assign building machines
+Orchestrates three stages:
+  1. Curing Consumption (dynamic) — 31-day CO schedule + press state
+  2. Building Scheduler (B2C)     — shift-wise GT production plan
+  3. Curing Schedule (B2C)        — shift-wise curing plan derived from GT output
+
+All parameters are read from bc_config.py — edit there, not here.
 
 Usage:
-    python b2c_pipeline.py                          # auto-detect demand file
+    python b2c_pipeline.py                           # uses bc_config.py defaults
     python b2c_pipeline.py data/input/demand_may.xlsx
 """
 
@@ -20,39 +23,51 @@ import pandas as pd
 import cbc_env
 from curing_consumption_dynamic import run_dynamic_consumption
 from building_b2c import run_from_database_b2c
-from bc import MAX_CHANGEOVERS_PER_DAY, MIN_CAMPAIGN_MINS, BUILD_LEAD_SHIFTS
+from curing_b2c import run_curing_b2c
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)
-PLANNING_DAYS = 31
-OUT_DIR       = cbc_env.OUTPUT_DIR
-IN_DIR        = cbc_env.INPUT_DIR
-
-CC_OUTPUT     = os.path.join(OUT_DIR, "curing_consumption_31day.xlsx")
-BUILD_OUTPUT  = os.path.join(OUT_DIR, "main_output", "bc_building_schedule_2026-05-01.xlsx")
-DEMAND_FILE   = os.path.join(IN_DIR, "demand_may.xlsx")
+# ── All params from bc_config (single source of truth) ────────────────────────
+from bc_config import (
+    PLAN_START,
+    PLANNING_DAYS,
+    DEMAND_FILE,
+    MAX_CHANGEOVERS_PER_DAY,
+    MIN_CAMPAIGN_MINS,
+    BUILD_LEAD_SHIFTS,
+    DYNAMIC_CC_OUTPUT  as CC_OUTPUT,
+    BUILDING_OUTPUT    as BUILD_OUTPUT,
+    CURING_B2C_OUTPUT  as CURING_OUTPUT,
+)
 
 
 def run_pipeline(
-    demand_path: str | None = None,
-    cc_output: str | None = None,
-    build_output: str | None = None,
-    plan_start: datetime | None = None,
+    demand_path:   str | None = None,
+    cc_output:     str | None = None,
+    build_output:  str | None = None,
+    curing_output: str | None = None,
+    plan_start:    datetime | None = None,
     planning_days: int | None = None,
 ) -> dict:
     """
-    Run the full B2C pipeline: curing consumption → building schedule.
+    Run the full B2C pipeline:
+      Step 1 — Curing Consumption (dynamic)
+      Step 2 — Building Schedule (B2C)
+      Step 3 — Curing Schedule (B2C, derived from GT output)
+
+    All paths default to bc_config.py values.
 
     Returns a dict with:
-        co_events    : list of CO event dicts from the curing step
-        n_co         : total changeovers scheduled
-        cc_output    : path to curing consumption Excel
-        build_output : path to building schedule Excel
-        build_result : return value of run_from_database_b2c()
+        co_events      : list of CO event dicts from the curing consumption step
+        n_co           : total changeovers scheduled
+        cc_output      : path to curing consumption Excel
+        build_output   : path to building schedule Excel
+        curing_output  : path to curing schedule Excel
+        build_result   : return value of run_from_database_b2c()
+        curing_result  : return value of run_curing_b2c()
     """
     demand_path   = demand_path   or DEMAND_FILE
     cc_output     = cc_output     or CC_OUTPUT
     build_output  = build_output  or BUILD_OUTPUT
+    curing_output = curing_output or CURING_OUTPUT
     plan_start    = plan_start    or PLAN_START
     planning_days = planning_days or PLANNING_DAYS
 
@@ -111,21 +126,42 @@ def run_pipeline(
 
     print(f"\n  [Pipeline] Step 2 complete — output: {os.path.basename(build_output)}")
 
+    # ── Step 3: Curing Schedule (B2C) ─────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("  PIPELINE — Step 3: Curing Schedule (B2C)")
+    print("=" * 70)
+    curing_result = run_curing_b2c(
+        building_path = build_output,
+        output_path   = curing_output,
+        demand_path   = demand_path,
+        plan_start    = plan_start,
+        planning_days = planning_days,
+    )
+    total_cured = sum(curing_result["daily_cured"].values())
+    print(f"\n  [Pipeline] Step 3 complete — Total cured: {total_cured:,.0f}  "
+          f"output: {os.path.basename(curing_output)}")
+
     return {
-        "co_events":    co_events,
-        "n_co":         len(co_events),
-        "cc_output":    cc_output,
-        "build_output": build_output,
-        "build_result": build_result,
+        "co_events":     co_events,
+        "n_co":          len(co_events),
+        "cc_output":     cc_output,
+        "build_output":  build_output,
+        "curing_output": curing_output,
+        "build_result":  build_result,
+        "curing_result": curing_result,
     }
 
 
 if __name__ == "__main__":
     _demand = sys.argv[1] if len(sys.argv) > 1 else None
     result = run_pipeline(demand_path=_demand)
-    print("\n" + "=" * 70)
+    print("\n" + "█" * 70)
     print("  PIPELINE COMPLETE")
-    print("=" * 70)
+    print("█" * 70)
     print(f"  Changeovers scheduled : {result['n_co']}")
-    print(f"  Curing consumption    : {result['cc_output']}")
-    print(f"  Building schedule     : {result['build_output']}")
+    print(f"  1. Curing consumption : {result['cc_output']}")
+    print(f"  2. Building schedule  : {result['build_output']}")
+    print(f"  3. Curing schedule    : {result['curing_output']}")
+    total = sum(result["curing_result"]["daily_cured"].values())
+    print(f"  Total cured (month)   : {total:,.0f} tyres")
+    print("█" * 70)

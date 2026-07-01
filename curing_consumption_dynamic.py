@@ -75,10 +75,13 @@ OUT_DIR = cbc_env.OUTPUT_DIR
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLANNING_DAYS       = 31           # May has 31 days
-SHIFTS_PER_DAY      = 3
-MAX_CO_PER_DAY      = 10         # plant-wide hard limit (default; set in bc.py)
-PLAN_START          = datetime(2026, 5, 1, 7, 0, 0)   # May 1, Shift A
+# ── All scheduling params imported from bc_config (single source of truth) ───
+from bc_config import (
+    PLAN_START,
+    PLANNING_DAYS,
+    MAX_CHANGEOVERS_PER_DAY as MAX_CO_PER_DAY,
+    SHIFTS_PER_DAY,
+)
 
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
@@ -290,11 +293,17 @@ class COScheduler:
                     )
                     candidates.append((key, p, old_sku, target))
 
-            candidates.sort(key=lambda x: x[0])
+            _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+            candidates.sort(key=lambda x: (
+                x[0][0],                                           # Class A (0) before Class B (1)
+                ct_map.get(x[3], _dct),                            # min CT target first (max throughput)
+                x[0][1], x[0][2],                                  # −priority, after_days
+                len(press_to_demand_targets.get(x[1], [])),         # exclusive press first (fewer targets)
+            ))
 
             assigned: set = set()
             for key, p, old_sku, new_sku in candidates:
-                if co_used >= MAX_CO_PER_DAY:
+                if co_used >= max_co_per_day:
                     break
                 if p in assigned:
                     continue
@@ -366,36 +375,47 @@ class COScheduler:
                     n_ri = press_count.get(current_sku, 0)
                     if n_ri <= 1:
                         continue  # can't spare — only press for that RI SKU
-                    # Verify that RI SKU can still meet its own demand with n−1 presses
-                    ri_ct   = ct_map.get(current_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
-                    ri_rate = _qty_per_press_per_day(ri_ct)
-                    ri_rem  = updated_demand.get(current_sku, 0)
-                    if ri_rate > 0 and (n_ri - 1) > 0:
-                        ri_days_without = ri_rem / ((n_ri - 1) * ri_rate)
-                    else:
-                        ri_days_without = float("inf")
-                    if ri_days_without > PLANNING_DAYS:
-                        continue  # donating this press would strand the RI SKU
-                    # Schedule CO on earliest available day
-                    for day in range(1, PLANNING_DAYS + 1):
-                        if daily_co_used.get(day, 0) < max_co_per_day:
-                            co_events.append({
-                                "day":     day,
-                                "press":   press,
-                                "old_sku": current_sku,
-                                "new_sku": nri_sku,
-                            })
-                            press_to_sku[press] = nri_sku
-                            press_count[current_sku] = max(0, n_ri - 1)
-                            press_count[nri_sku] = press_count.get(nri_sku, 0) + 1
-                            daily_co_used[day] = daily_co_used.get(day, 0) + 1
-                            demand_running_presses.add(press)
-                            pending_ro_presses.discard(press)
-                            scheduled = True
-                            n_rescued += 1
-                            break
-                    if scheduled:
-                        break
+                    # Verify that RI SKU can still meet its FULL demand with n−1 presses.
+                    # Previous bug: used updated_demand (= 0 after simulation with all
+                    # n presses) which always passed the check — allowing COs even when
+                    # n−1 presses cannot cover full demand across the horizon.
+                    # Fix: use original demand_map value and compute actual capacity
+                    # accounting for when the CO fires (earliest budget-available day).
+                    ri_ct          = ct_map.get(current_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
+                    ri_rate        = _qty_per_press_per_day(ri_ct)
+                    ri_full_demand = float(demand_map.get(current_sku, 0))
+
+                    # Find earliest day with CO budget (needed for capacity check)
+                    _co_day = next(
+                        (d for d in range(1, PLANNING_DAYS + 1)
+                         if daily_co_used.get(d, 0) < max_co_per_day),
+                        None,
+                    )
+                    if _co_day is None:
+                        continue  # no CO budget anywhere in horizon
+
+                    # Capacity: n_ri presses run days 1.._co_day, then n_ri−1 for rest
+                    cap_before = n_ri * ri_rate * _co_day
+                    cap_after  = max(0, n_ri - 1) * ri_rate * (PLANNING_DAYS - _co_day)
+                    if (cap_before + cap_after) < ri_full_demand:
+                        continue  # CO would leave RI SKU demand unmet
+
+                    # Schedule CO on the earliest available day found above
+                    co_events.append({
+                        "day":     _co_day,
+                        "press":   press,
+                        "old_sku": current_sku,
+                        "new_sku": nri_sku,
+                    })
+                    press_to_sku[press] = nri_sku
+                    press_count[current_sku] = max(0, n_ri - 1)
+                    press_count[nri_sku] = press_count.get(nri_sku, 0) + 1
+                    daily_co_used[_co_day] = daily_co_used.get(_co_day, 0) + 1
+                    demand_running_presses.add(press)
+                    pending_ro_presses.discard(press)
+                    scheduled = True
+                    n_rescued += 1
+                    break
 
             still_missing = len(rescue_nri) - n_rescued
             print(f"  [CO Rescue] Rescued {n_rescued} NRI SKUs via spare-press donation"

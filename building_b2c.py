@@ -247,6 +247,7 @@ def _make_synthetic_curing(
     planning_days: int,
     nri_skus_to_build: set | None = None,
     co_day_map: dict | None = None,
+    building_allow_map: dict | None = None,
 ) -> pd.DataFrame:
     """
     Convert the consumption table into a df_curing-compatible DataFrame so
@@ -257,6 +258,7 @@ def _make_synthetic_curing(
     nri_skus_to_build: if provided, only NRI SKUs in this set get LP demand;
     inactive NRI presses (no CO scheduled) are excluded to avoid wasting
     building capacity on uncurable green tyres.
+    building_allow_map: if provided, RI SKUs with no eligible building machines are skipped.
     """
     rows = []
     shift_hours = [
@@ -272,6 +274,10 @@ def _make_synthetic_curing(
         dem_qty  = float(row.get("Demand_Qty", 0))
 
         if cat == "Runner-In":
+            # Skip RI SKUs with no eligible building machines — they generate LP demand
+            # that can never be built, producing phantom starvation events in the report.
+            if building_allow_map is not None and not building_allow_map.get(sku, []):
+                continue
             # Cap synthetic curing target at customer demand — same cap as demand deriver.
             if dem_qty > 0:
                 demand_spread = dem_qty / (planning_days * Config.SHIFTS_PER_DAY)
@@ -291,29 +297,45 @@ def _make_synthetic_curing(
             co_day = (co_day_map.get(sku) if co_day_map else None)
             total_shifts = planning_days * Config.SHIFTS_PER_DAY
             if co_day is not None and 0 < co_day < planning_days:
-                n_pre  = co_day * Config.SHIFTS_PER_DAY
-                n_post = total_shifts - n_pre
-                pre_rate  = (0.7 * dem_qty) / n_pre   if n_pre  > 0 else 0.0
-                post_rate = (0.3 * dem_qty) / n_post  if n_post > 0 else 0.0
+                # GT built earlier than GT_SHELF_LIFE_DAYS before CO day spoils before
+                # the press starts — concentrate pre-CO building in the shelf-life window.
+                shelf_life   = getattr(Config, "TOPUP_LOOKAHEAD_DAYS_GT", 3)
+                build_start  = max(0, co_day - shelf_life)
+                n_pre_buffer = max(0, co_day - build_start) * Config.SHIFTS_PER_DAY
+                n_post       = max(0, planning_days - co_day) * Config.SHIFTS_PER_DAY
+                total_window = n_pre_buffer + n_post
+                build_rate   = dem_qty / total_window if total_window > 0 else 0.0
+                pre_rate     = build_rate   # same rate in buffer window and post-CO
+                post_rate    = build_rate
             else:
                 pre_rate = post_rate = dem_qty / total_shifts
+                build_start = 0
 
             for day_offset in range(planning_days):
                 base_date = plan_start + timedelta(days=day_offset)
-                shift_qty = pre_rate if (co_day is not None and day_offset < co_day) else post_rate
-                for sh_h in shift_hours:
-                    sh_start = datetime(
-                        base_date.year, base_date.month, base_date.day, sh_h % 24, 0, 0
-                    )
-                    if sh_h >= 24:
-                        sh_start += timedelta(days=1)
-                    sh_end = sh_start + timedelta(hours=Config.HOURS_PER_SHIFT)
-                    rows.append({
-                        "SKUCode":   sku,
-                        "StartTime": sh_start,
-                        "EndTime":   sh_end,
-                        "Qty":       shift_qty,
-                    })
+                if co_day is not None and 0 < co_day < planning_days:
+                    if day_offset < build_start:
+                        shift_qty = 0.0   # too early — GT would spoil before press starts
+                    elif day_offset < co_day:
+                        shift_qty = pre_rate
+                    else:
+                        shift_qty = post_rate
+                else:
+                    shift_qty = pre_rate
+                if shift_qty > 0:   # skip zero-demand shifts (pre-build-start window)
+                    for sh_h in shift_hours:
+                        sh_start = datetime(
+                            base_date.year, base_date.month, base_date.day, sh_h % 24, 0, 0
+                        )
+                        if sh_h >= 24:
+                            sh_start += timedelta(days=1)
+                        sh_end = sh_start + timedelta(hours=Config.HOURS_PER_SHIFT)
+                        rows.append({
+                            "SKUCode":   sku,
+                            "StartTime": sh_start,
+                            "EndTime":   sh_end,
+                            "Qty":       shift_qty,
+                        })
             continue   # NRI loop handled inline above — skip shared append below
         else:
             continue  # Runner-Out: no building demand
@@ -535,9 +557,9 @@ def run_from_database_b2c(
     engine=None,
     planning_days: int | None = None,
     external_co_schedule: list | None = None,
-    max_changeovers_per_day: int = 10,
-    min_campaign_mins: int = 120,
-    build_lead_shifts: int = 3,
+    max_changeovers_per_day: int | None = None,
+    min_campaign_mins: int | None = None,
+    build_lead_shifts: int | None = None,
 ) -> dict:
     """
     Run the B2C building scheduler.
@@ -555,24 +577,36 @@ def run_from_database_b2c(
 
     Returns dict with same keys as building.run_from_database_hybrid().
     """
+    import bc_config as _cfg
     from cbc_env import make_engine as _mk
 
+    # Resolve defaults from bc_config (single source of truth)
+    if max_changeovers_per_day is None:
+        max_changeovers_per_day = _cfg.MAX_CHANGEOVERS_PER_DAY
+    if min_campaign_mins is None:
+        min_campaign_mins = _cfg.MIN_CAMPAIGN_MINS
+    if build_lead_shifts is None:
+        build_lead_shifts = _cfg.BUILD_LEAD_SHIFTS
+
     if plan_start is None:
-        plan_start = datetime(2026, 5, 1, 7, 0, 0)
+        plan_start = _cfg.PLAN_START
     if output_path is None:
-        output_path = os.path.join(
-            MAIN_OUT,
-            f"bc_building_schedule_{plan_start.date()}.xlsx",
-        )
+        output_path = _cfg.BUILDING_OUTPUT
     if consumption_path is None:
-        consumption_path = os.path.join(cbc_env.OUTPUT_DIR, "curing_consumption_table.xlsx")
+        consumption_path = _cfg.CONSUMPTION_OUTPUT
     if engine is None:
         engine = _mk()
     if planning_days is not None:
         Config.PLANNING_DAYS = planning_days
-    Config.MAX_CHANGEOVERS_PER_DAY = max_changeovers_per_day
-    Config.MIN_CAMPAIGN_MINS       = min_campaign_mins
-    Config.BUILD_LEAD_SHIFTS       = build_lead_shifts
+
+    # Apply all tunable params to the shared Config object
+    Config.MAX_CHANGEOVERS_PER_DAY       = max_changeovers_per_day
+    Config.MIN_CAMPAIGN_MINS             = min_campaign_mins
+    Config.BUILD_LEAD_SHIFTS             = build_lead_shifts
+    Config.OVERBUILD_BUFFER_FRAC         = _cfg.OVERBUILD_BUFFER_FRAC
+    Config.TOPUP_LOOKAHEAD_DAYS_GT       = _cfg.TOPUP_LOOKAHEAD_DAYS_GT
+    Config.TOPUP_LOOKAHEAD_DAYS_CARCASS  = _cfg.TOPUP_LOOKAHEAD_DAYS_CARCASS
+    Config.MIN_CAMPAIGN_UNITS            = _cfg.MIN_CAMPAIGN_UNITS
 
     print("\n" + "=" * 70)
     print("  B2C Phase 1 — Building Scheduler")
@@ -603,7 +637,7 @@ def run_from_database_b2c(
     # first shift because there was no pre-build time. With PRE_START_SHIFTS=2,
     # Shift B (15:00-23:00) builds the buffer, eliminating Shift C starvation.
     # plan_start = May 1 07:00 (Shift A) → build_start = Apr 30 15:00 (Shift B)
-    PRE_START_SHIFTS = 2
+    PRE_START_SHIFTS = _cfg.PRE_START_SHIFTS
     build_start = plan_start - timedelta(hours=Config.HOURS_PER_SHIFT * PRE_START_SHIFTS)
     print(f"  [Config] Plan start:  {plan_start}  |  Build start: {build_start} ({PRE_START_SHIFTS} shifts early)")
     print(f"  [Config] Planning days: {Config.PLANNING_DAYS}")
@@ -888,6 +922,7 @@ def run_from_database_b2c(
         df_consumption_updated, plan_start, Config.PLANNING_DAYS,
         nri_skus_to_build=nri_with_co,
         co_day_map=co_day_map,
+        building_allow_map=_allow_map_diag,
     )
     n_skus = df_curing_synthetic["SKUCode"].nunique()
     print(f"  [Synthetic] {len(df_curing_synthetic)} rows | {n_skus} SKUs")
@@ -973,12 +1008,20 @@ def run_from_database_b2c(
     ) if not df_curing_synthetic.empty else set()
 
     extra_topup_demand = {}
+    _skipped_nri_no_co = 0
     for _, row in df_consumption_updated.iterrows():
         sku = str(row["SKUCode"])
         if sku in lp_active_skus:
             continue  # already tracked in _gt_remaining via synthetic curing
         if not (allow_map_lookup.get(sku, set()) & unistage_set):
             continue  # not eligible for any UNISTAGE machine
+        # NRI SKUs without a scheduled CO have no curing press — building their
+        # GT via TopUp produces uncurable inventory (sits in gt_bal forever,
+        # widens the building→curing gap).  Only RI or NRI-with-CO SKUs here.
+        cat = str(row.get("Category", "")).strip()
+        if cat == "Non-Runner-In" and sku not in nri_with_co:
+            _skipped_nri_no_co += 1
+            continue
         demand = float(row[qty_col]) if qty_col else 0.0
         if demand > 0:
             extra_topup_demand[sku] = demand
@@ -986,7 +1029,8 @@ def run_from_database_b2c(
     n_extra = len(extra_topup_demand)
     extra_total = sum(extra_topup_demand.values())
     print(f"  [UNISTAGE] {n_extra} SKUs ({extra_total:,.0f} units) added to "
-          f"UNISTAGE idle-fill pool (not in active LP plan)")
+          f"UNISTAGE idle-fill pool  |  {_skipped_nri_no_co} NRI-no-CO SKUs "
+          f"excluded (no press → GT would be uncurable)")
 
     # Customer demand cap: prevents TopUp from building beyond what the
     # customer ordered, freeing machine time for under-served SKUs instead.
@@ -1607,14 +1651,12 @@ def _append_b2c_sheets(
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    _PLAN_START       = datetime(2026, 6, 1, 7, 0, 0)
-    _CONSUMPTION_PATH = os.path.join(cbc_env.OUTPUT_DIR, "curing_consumption_table.xlsx")
-    _OUTPUT_PATH      = os.path.join(MAIN_OUT, "bc_building_schedule.xlsx")
+    import bc_config as _cfg
 
     results = run_from_database_b2c(
-        plan_start       = _PLAN_START,
-        consumption_path = _CONSUMPTION_PATH,
-        output_path      = _OUTPUT_PATH,
+        plan_start       = _cfg.PLAN_START,
+        consumption_path = _cfg.CONSUMPTION_OUTPUT,
+        output_path      = _cfg.BUILDING_OUTPUT,
     )
 
     # Quick summary

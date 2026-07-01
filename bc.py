@@ -59,32 +59,23 @@ from building_b2c       import run_from_database_b2c
 from curing_deriver     import derive_curing_schedule
 from bc_analyser        import run_analysis
 
-HERE     = os.path.dirname(os.path.abspath(__file__))
-IN       = cbc_env.INPUT_DIR
-OUT      = cbc_env.OUTPUT_DIR
-MAIN_OUT = os.path.join(OUT, "main_output")
-os.makedirs(MAIN_OUT, exist_ok=True)
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USER SETTINGS  —  edit these for each planning run, then `python3 bc.py`
-# All scheduling params live here and are imported by building_b2c.py,
-# curing_consumption_dynamic.py, and b2c_pipeline.py — do NOT hardcode them
-# in those files.
+# ALL PARAMETERS LIVE IN bc_config.py — edit there, not here.
 # ══════════════════════════════════════════════════════════════════════════════
-# 1) Demand file. Drop the new demand workbook in data/input/ and point here.
-#    Required columns: SKUCode, Requirement (or Updated_Requirement),
-#    ConsolidatedPriorityScore. Everything else comes from the DB.
-DEMAND_FILE = os.path.join(IN, "demand_may.xlsx")
-
-# 2) First shift of the plan (07:00 = shift-A start) and number of days.
-#    Building pre-start = 1 shift before this (Apr 30 Shift C for May plan).
-PLAN_START_DT = datetime(2026, 5, 1, 7, 0, 0)
-PLANNING_DAYS = 31
-
-# 3) Changeover & campaign params — single source of truth for all pipeline stages.
-MAX_CHANGEOVERS_PER_DAY = 10   # curing press CO hard cap per day (plant limit)
-MIN_CAMPAIGN_MINS       = 120  # building: minimum production run before SKU switch
-BUILD_LEAD_SHIFTS       = 3    # building: shifts ahead to target curing demand
+from bc_config import (
+    PLAN_START,
+    PLANNING_DAYS,
+    DEMAND_FILE,
+    MAX_CHANGEOVERS_PER_DAY,
+    MIN_CAMPAIGN_MINS,
+    BUILD_LEAD_SHIFTS,
+    CONSUMPTION_OUTPUT,
+    BUILDING_OUTPUT,
+    CURING_OUTPUT,
+    ANALYSIS_OUTPUT,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -97,25 +88,19 @@ class BCConfig:
     DEMAND_FILE:   str      = DEMAND_FILE
 
     # Plan horizon
-    PLAN_START:    datetime = field(default_factory=lambda: PLAN_START_DT)
+    PLAN_START:    datetime = field(default_factory=lambda: PLAN_START)
     PLANNING_DAYS: int      = PLANNING_DAYS
 
-    # Scheduling params (imported by building_b2c & curing_consumption_dynamic)
+    # Scheduling params — all sourced from bc_config.py
     MAX_CHANGEOVERS_PER_DAY: int = MAX_CHANGEOVERS_PER_DAY
     MIN_CAMPAIGN_MINS:       int = MIN_CAMPAIGN_MINS
     BUILD_LEAD_SHIFTS:       int = BUILD_LEAD_SHIFTS
 
-    # Phase 0 output
-    CONSUMPTION_OUTPUT: str = os.path.join(OUT, "curing_consumption_table.xlsx")
-
-    # Phase 1 output
-    BUILDING_OUTPUT: str = os.path.join(MAIN_OUT, "bc_building_schedule.xlsx")
-
-    # Phase 2 output
-    CURING_OUTPUT: str = os.path.join(MAIN_OUT, "bc_curing_schedule.xlsx")
-
-    # Phase 3 output
-    ANALYSIS_OUTPUT: str = os.path.join(MAIN_OUT, "bc_analysis.xlsx")
+    # Output paths — all sourced from bc_config.py
+    CONSUMPTION_OUTPUT: str = CONSUMPTION_OUTPUT
+    BUILDING_OUTPUT:    str = BUILDING_OUTPUT
+    CURING_OUTPUT:      str = CURING_OUTPUT
+    ANALYSIS_OUTPUT:    str = ANALYSIS_OUTPUT
 
     # Pipeline control
     RUN_BUILDING:  bool = True
