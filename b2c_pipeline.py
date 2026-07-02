@@ -381,6 +381,7 @@ def _write_rolling_building_excel(
     opening_gt: dict,              # opening GT inventory
     demand_dict: dict,             # {sku: demand_qty} from demand file
     planning_days: int,
+    n_curing_cos: int = 0,         # curing press CO count (from co_events)
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -605,7 +606,139 @@ def _write_rolling_building_excel(
     ws_dem.cell(row=footer+9, column=1, value="Total Building COs")
     ws_dem.cell(row=footer+9, column=2, value=n_co_bld)
     ws_dem.cell(row=footer+10, column=1, value=f"Curing COs scheduled (≤{MAX_CHANGEOVERS_PER_DAY}/day)")
-    ws_dem.cell(row=footer+10, column=2, value=len(bld_co_events))
+    ws_dem.cell(row=footer+10, column=2, value=n_curing_cos)
+
+    # ── Sheet 7: Machine Utilization ──────────────────────────────────────────
+    ws_util = wb.create_sheet("Machine Utilization")
+
+    _GREEN_U = "E2EFDA"; _AMBER_U = "FFF2CC"; _RED_U = "FFE0E0"
+
+    def _mgroup(m: str) -> str:
+        if m in {"6001","6002","6003","6004","7001","7002","7003","7004"}: return "VMI"
+        if m in {"7101","7102","7103","7104","7105","7106","7201"}:        return "BJ"
+        if m in {"7501","7502","7503"}:                                    return "UNI_NARROW"
+        if m in {"8201","8301","8302","8501","8502","7301"}:               return "Stage-2"
+        return "Stage-1"
+
+    avail_per_mach = planning_days * 3 * SHIFT_MINS  # 44,640 min
+
+    # Production time per machine
+    mach_prod_mins: dict[str, float] = defaultdict(float)
+    mach_carcass:   dict[str, int]   = defaultdict(int)
+    mach_gt:        dict[str, int]   = defaultdict(int)
+    mach_skus:      dict[str, set]   = defaultdict(set)
+    for row in prod_rows:
+        m   = str(row.get("Machine", ""))
+        qty = int(row.get("Qty", 0) or 0)
+        sku = str(row.get("SKUCode", ""))
+        ct_sec = _BLD_CT_SEC.get(m, 120.0)
+        mach_prod_mins[m] += qty * ct_sec / 60.0
+        if m in _S1_MACHINES:
+            mach_carcass[m] += qty
+        else:
+            mach_gt[m] += qty
+        mach_skus[m].add(sku)
+
+    # CO time per machine from bld_co_events
+    mach_co_mins: dict[str, float] = defaultdict(float)
+    mach_co_count: dict[str, int]  = defaultdict(int)
+    for ev in bld_co_events:
+        m    = str(ev.get("Machine", ""))
+        cost = float(ev.get("CO_Cost_Mins", 0) or 0)
+        mach_co_mins[m]  += cost
+        mach_co_count[m] += 1
+
+    # All 39 building machines — explicit set so zero-production machines (e.g. 8101)
+    # are always included regardless of whether they appear in production or CO dicts.
+    _ALL_39_MACHINES = frozenset({
+        "6801","6802","6803","6909","6911","7601","7701",
+        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (15)
+        "8201","8301","8302","8501","8502","7301",                # Stage-2 (6)
+        "7001","7002","7003","7004","6001","6002","6003","6004",  # VMI (8)
+        "7101","7102","7103","7104","7105","7106","7201",         # BJ (7)
+        "7501","7502","7503",                                     # UNI_NARROW (3)
+    })
+    all_machines = sorted(
+        _ALL_39_MACHINES,
+        key=lambda m: (
+            {"VMI":0,"BJ":1,"UNI_NARROW":2,"Stage-2":3,"Stage-1":4}.get(_mgroup(m), 5),
+            m
+        )
+    )
+
+    # Summary header
+    def _u_avg(machines):
+        vals = [mach_prod_mins[m] / avail_per_mach for m in machines]
+        return sum(vals) / len(vals) if vals else 0
+    avg_gt_mach = [m for m in all_machines if _mgroup(m) != "Stage-1"]
+    avg_util = _u_avg(avg_gt_mach) if avg_gt_mach else 0
+    high = sum(1 for m in avg_gt_mach if mach_prod_mins[m]/avail_per_mach >= 0.80)
+    low  = sum(1 for m in avg_gt_mach if mach_prod_mins[m]/avail_per_mach < 0.40)
+    ws_util.cell(row=1, column=1, value=(
+        f"Avg GT-machine util (prod only): {avg_util:.1%}  |  "
+        f"High(≥80%): {high}  |  Low(<40%): {low}  |  "
+        f"Note: Stage-1 always <77% by design (15 machines for 11.5-equiv S2 demand)"
+    )).font = Font(bold=True, size=10)
+
+    util_cols = [
+        "Machine", "Machine_Group", "Available_Mins",
+        "GT_Built", "Carcass_Built",
+        "Prod_Mins", "CO_Mins", "Idle_Mins",
+        "Util_Pct", "CO_Pct", "Idle_Pct",
+        "SKUs_Served", "COs_Done",
+    ]
+    _xl_header(ws_util, 2, util_cols)
+
+    for ri, m in enumerate(all_machines, 3):
+        prod  = mach_prod_mins[m]
+        co    = mach_co_mins[m]
+        idle  = max(0.0, avail_per_mach - prod - co)
+        util_pct = prod / avail_per_mach
+        co_pct   = co   / avail_per_mach
+        idle_pct = idle / avail_per_mach
+        grp = _mgroup(m)
+        # Color: red <40%, amber 40-80%, green ≥80% (Stage-1 always amber by design)
+        if grp == "Stage-1":
+            color = _AMBER_U
+        elif util_pct >= 0.80:
+            color = _GREEN_U
+        elif util_pct >= 0.40:
+            color = _AMBER_U
+        else:
+            color = _RED_U
+        vals = [
+            m, grp, avail_per_mach,
+            mach_gt.get(m, 0), mach_carcass.get(m, 0),
+            round(prod), round(co), round(idle),
+            util_pct, co_pct, idle_pct,
+            len(mach_skus[m]), mach_co_count[m],
+        ]
+        for ci, val in enumerate(vals, 1):
+            cell = ws_util.cell(row=ri, column=ci, value=val)
+            cell.fill = _fill(_GREEN_U if grp != "Stage-1" and util_pct >= 0.80 else
+                              _AMBER_U if util_pct >= 0.40 or grp == "Stage-1" else _RED_U)
+            cell.alignment = _ctr()
+            if ci in (9, 10, 11):  # percent columns
+                cell.number_format = "0.0%"
+
+    # Totals row
+    tot_row = len(all_machines) + 3
+    ws_util.cell(row=tot_row, column=1, value="TOTAL / AVERAGE").font = Font(bold=True)
+    ws_util.cell(row=tot_row, column=3, value=avail_per_mach * len(all_machines)).font = Font(bold=True)
+    ws_util.cell(row=tot_row, column=4, value=sum(mach_gt.values())).font = Font(bold=True)
+    ws_util.cell(row=tot_row, column=5, value=sum(mach_carcass.values())).font = Font(bold=True)
+    ws_util.cell(row=tot_row, column=6, value=round(sum(mach_prod_mins.values()))).font = Font(bold=True)
+    ws_util.cell(row=tot_row, column=7, value=round(sum(mach_co_mins.values()))).font = Font(bold=True)
+    tot_idle = max(0, avail_per_mach * len(all_machines)
+                   - sum(mach_prod_mins.values()) - sum(mach_co_mins.values()))
+    ws_util.cell(row=tot_row, column=8, value=round(tot_idle)).font = Font(bold=True)
+    avg_pct = sum(mach_prod_mins.values()) / (avail_per_mach * len(all_machines))
+    cell = ws_util.cell(row=tot_row, column=9, value=avg_pct)
+    cell.font = Font(bold=True); cell.number_format = "0.0%"
+
+    for ltr_idx, w in enumerate([14,16,16,12,14,12,10,10,10,10,10,12,10], 1):
+        ws_util.column_dimensions[get_column_letter(ltr_idx)].width = w
+    ws_util.freeze_panes = "A3"
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
@@ -722,27 +855,34 @@ def _write_rolling_curing_excel(
     ws = wb.create_sheet("Machine Utilization")
     all_presses = sorted(press_stats)
     if all_presses:
-        avg_u = sum(press_stats[p]["running_mins"] / avail_mins for p in all_presses) / len(all_presses)
-        high  = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins >= 0.90)
-        low   = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins < 0.05)
+        avg_u    = sum(press_stats[p]["running_mins"] / avail_mins for p in all_presses) / len(all_presses)
+        total_co = sum(press_stats[p]["co_mins"] for p in all_presses)
+        high     = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins >= 0.90)
+        low      = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins < 0.05)
         ws.cell(row=1, column=1,
-                value=f"Avg util: {avg_u:.1%}  |  High(≥90%): {high}  |  Idle(<5%): {low}  |  Presses: {len(all_presses)}"
+                value=(f"Avg util: {avg_u:.1%}  |  High(≥90%): {high}  |  Idle(<5%): {low}  |  "
+                       f"Presses: {len(all_presses)}  |  Total CO_Mins: {int(total_co):,}")
                 ).font = _bold(10)
-    u_cols = ["Machine", "Available_Mins", "Used_Mins", "Idle_Mins",
-              "Utilization_Pct", "SKUs_Count", "Total_Cycles", "Total_Units"]
+    u_cols = ["Machine", "Available_Mins", "Used_Mins", "CO_Mins", "Idle_Mins",
+              "Utilization_Pct", "CO_Pct", "Idle_Pct",
+              "SKUs_Count", "Total_Cycles", "Total_Units"]
     _hdr(ws, 2, u_cols)
     for ri, press in enumerate(all_presses, 3):
         s    = press_stats[press]
         used = s["running_mins"]
-        idle = max(0, avail_mins - used - s["co_mins"] - s["clean_mins"])
-        pct  = used / avail_mins if avail_mins else 0.0
+        co   = s["co_mins"]
+        idle = max(0, avail_mins - used - co - s["clean_mins"])
+        pct      = used / avail_mins if avail_mins else 0.0
+        co_pct   = co   / avail_mins if avail_mins else 0.0
+        idle_pct = idle / avail_mins if avail_mins else 0.0
         color = _GREEN if pct >= 0.90 else (_AMBER if pct >= 0.60 else _RED)
-        vals  = [press, avail_mins, round(used), round(idle), pct,
+        vals  = [press, avail_mins, round(used), round(co), round(idle),
+                 pct, co_pct, idle_pct,
                  len(s["skus"]), s["cycles"], s["units"]]
         for ci, v in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=v)
             cell.fill = _fill(color); cell.alignment = _ctr()
-            if ci == 5: cell.number_format = "0.0%"
+            if ci in (6, 7, 8): cell.number_format = "0.0%"
     for ltr in "ABCDEFGH": ws.column_dimensions[ltr].width = 17
     ws.freeze_panes = "A3"
 
@@ -1253,13 +1393,14 @@ def run_rolling_pipeline(
                     sku_cured[sku]        += cured
                     daily_cured[date_str] += cured
                     demand_remaining[sku]  = max(0.0, demand_remaining.get(sku, 0.0) - cured)
-                    press_stats[press]["running_mins"] += SHIFT_MINS
+                    prod_mins = cured * ct / CURING_CAVITIES
+                    press_stats[press]["running_mins"] += prod_mins
                     press_stats[press]["skus"].add(sku)
                     press_stats[press]["cycles"] += cured // CURING_CAVITIES
                     press_stats[press]["units"]  += cured
                     press_sku_stats[(press, sku)]["cycles"]    += cured // CURING_CAVITIES
                     press_sku_stats[(press, sku)]["units"]     += cured
-                    press_sku_stats[(press, sku)]["mins_used"] += SHIFT_MINS
+                    press_sku_stats[(press, sku)]["mins_used"] += prod_mins
 
                     # ── Instant CO when demand is met ─────────────────────────
                     # Demand just hit 0: CO starts immediately (remaining shift
@@ -1376,6 +1517,7 @@ def run_rolling_pipeline(
         opening_gt     = opening_gt,
         demand_dict    = demand_dict,
         planning_days  = planning_days,
+        n_curing_cos   = len(co_events),
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,

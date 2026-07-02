@@ -569,31 +569,35 @@ def _write_machine_utilization(ws, press_stats, planning_days, total_press_count
         sim_count = len(all_presses)
         plant_note = f"  |  Plant total: {total_press_count}" if total_press_count else ""
         ws.cell(row=1, column=1,
-                value=(f"Avg util: {avg_u:.1%}  |  High(≥90%): {high}  |  "
-                       f"Idle(<5%): {low}  |  In simulation: {sim_count}{plant_note}")
+                value=(f"Avg production util (CO excluded): {avg_u:.1%}  |  High(≥90%): {high}  |  "
+                       f"Idle/GT-starved(<5%): {low}  |  In simulation: {sim_count}{plant_note}  |  "
+                       f"Note: Used_Mins = actual production time only; CO shifts reduce Idle_Mins, not Used_Mins")
                 ).font = _bold(10)
 
-    cols = ["Machine", "Available_Mins", "Used_Mins", "Idle_Mins",
+    cols = ["Machine", "Available_Mins", "Prod_Mins", "CO_Mins", "Idle_Mins",
             "Utilization_Pct", "SKUs_Count", "Total_Cycles", "Total_Units"]
     _header(ws, 2, cols)
 
     for ri, press in enumerate(all_presses, 3):
         s    = press_stats[press]
-        used = s["running_mins"]
-        idle = avail - used - s["co_mins"] - s["clean_mins"]
-        pct  = used / avail if avail else 0.0
+        prod = s["running_mins"]
+        co   = s["co_mins"] + s["clean_mins"]
+        idle = max(0.0, avail - prod - co)
+        pct  = prod / avail if avail else 0.0
         color = _GREEN if pct >= 0.90 else (_AMBER if pct >= 0.60 else _RED)
         fill  = _fill(color)
-        vals  = [press, avail, round(used), round(max(0, idle)), pct,
+        # cols: Machine, Available_Mins, Prod_Mins, CO_Mins, Idle_Mins,
+        #        Utilization_Pct, SKUs_Count, Total_Cycles, Total_Units
+        vals  = [press, avail, round(prod), round(co), round(idle), pct,
                  len(s["skus"]), s["cycles"], s["units"]]
         for ci, v in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=v)
             cell.fill = fill
             cell.alignment = _center()
-            if ci == 5:  # Utilization_Pct
+            if ci == 6:  # Utilization_Pct
                 cell.number_format = "0.0%"
 
-    for ltr in "ABCDEFGH":
+    for ltr in "ABCDEFGHI":
         ws.column_dimensions[ltr].width = 17
     ws.freeze_panes = "A3"
 

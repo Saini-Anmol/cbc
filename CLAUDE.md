@@ -117,21 +117,25 @@ both rows into a single press record keyed by the numeric press label (e.g.
 > target SKU must ALSO start producing GT in **Shift A of Day D** — not Shift B,
 > not Shift C.
 
-Rationale: the curing press is idle for 2 full shifts (Shift A = CO, Shift B =
-Mould Clean). If building waits until Shift B or Shift C to start, those shifts
-of GT production are lost. Starting building at Shift A means 2 full shifts of
-GT are pre-built and sitting in inventory by the time the curing press fires up
-in Shift C. This eliminates any Day-1 starvation risk for the new SKU.
+Rationale: the curing press is idle for 1 shift (Shift A = CO only; mould clean
+removed from scheduler model). Building starts in Shift A so at least 1 shift of
+GT is in inventory by the time curing fires in Shift B. This eliminates any
+starvation risk on Day-1 of the new SKU.
 
 ```
-Day D  Shift A:  Curing press  → CHANGEOVER (300 min, OCCUPIED)
+Day D  Shift A:  Curing press  → CHANGEOVER (490 min, OCCUPIED — full shift)
                  Building mach → START producing GT for new SKU   ← simultaneous
-Day D  Shift B:  Curing press  → MOULD_CLEAN (120 min, OCCUPIED)
+Day D  Shift B:  Curing press  → PRODUCTION begins (new SKU)      ← no mould-clean idle
                  Building mach → CONTINUE producing GT
-Day D  Shift C:  Curing press  → PRODUCTION begins (new SKU)
+                 GT inventory  → 1 full shift pre-built = immediate feed
+Day D  Shift C:  Curing press  → PRODUCTION continues
                  Building mach → CONTINUE producing GT
-                 GT inventory  → 2 full shifts pre-built = immediate feed
 ```
+
+**Mould-clean is NOT modelled as a scheduling event.** The physical mould-clean
+(triggered after 3,000 cycles) is absorbed into the CO window at the plant level.
+The scheduler treats every shift after CHANGEOVER as productive.
+`bc_config.py`: `CURING_CO_DURATION_SHIFTS = 1`, `CURING_CO_CHANGEOVER_MINS = 490`.
 
 This applies to ALL changeover types:
 - Runner-Out press switching to a demand SKU (Phase 2a)
@@ -366,7 +370,7 @@ Three starvation failure modes (baseline May run: 1,241 events, 65.3% avg util):
 |------|-----------|------------|
 | **Mode A — Machine idle** | LP heuristic doesn't assign some machines to any SKU; they idle while curing runs at synthetic demand | **Implemented:** mould-constrained priority boost (`priority × (1 + current_days/31)`, capped 4×) forces LP to assign mould-limited SKUs first |
 | **Mode B — Physical constraint** | Not enough building machines assigned to a SKU; even at 100% util they can't match curing volume | **Structural:** fix = assign more building machines, or implement Phase 4 (structural gap becomes throughput, not starvation) |
-| **Mode C — NRI CO timing gap** | Building starts Shift A of CO day; curing Shift C → 2-shift buffer only. diff-size CO (180 min) eats Shift A → insufficient buffer | **Implemented:** NRI demand front-loading 70% pre-CO / 30% post-CO forces LP to pre-build buffer |
+| **Mode C — NRI CO timing gap** | Building starts Shift A of CO day; curing Shift B → 1-shift buffer only. diff-size CO (180 min) eats Shift A → insufficient buffer | **Implemented:** NRI demand front-loading 70% pre-CO / 30% post-CO forces LP to pre-build buffer |
 
 **Why small building CT doesn't fix Mode A or B:** Building CT ~2–3 min/tyre vs curing ~17 min —
 building is fast enough. The problem is the machine is either not assigned (Mode A) or too few
@@ -399,6 +403,7 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 | HURL0 zero production | Only machine 7102 eligible after `_HARD` filter (HURL0 is 14"; 7104 missing from DB allowable list). 7102 fully occupied by 15" primary SKU — diff_size_CO (90 min) exceeds 30% CO guard so 7102 can never reach HURL0 in Campaign 2. | **Data fix needed:** add machine 7104 to `Master_Building_Allowable_Machines_source` for SKU `1325218614088HURL0`. 7104 has `_HARD={"14","15"}` — would pass the filter once inserted. Both 7102 and 7104 are "the 2 BJ-exclusive 14" RI SKU machines" per CLAUDE.md; HURL0 is missing 7104 in DB. |
 | TVECE partial production (3,945 remaining of 4,097 demand) | Only 7102 + 7104 eligible. BJ structural oversubscription (249k demand / 184k capacity = 136%) leaves little spare time for TVECE (14") after 15" primary SKU campaigns. | Structural — cannot close without more BJ capacity or VMI certification. Currently gets limited Shift B/C spillover. |
 | Rolling pipeline starvation events (~4,800) | Pre-existing consequence of BJ oversubscription — building physically cannot supply all BJ presses at full rate. Not caused by any scheduling change. | Pre-existing baseline. Reduced as overall coverage improves. |
+| Curing output lower than expected (old: ~587k) | MOULD_CLEAN held Shift B idle per CO event. 80 COs × ~56 tyres/shift = ~4,480 tyres lost per run. | **Fixed:** MOULD_CLEAN removed from scheduler. Shift B of CO day is now RUNNING. New cured total: **616,514** (May 2026). `bc_config.py`: `CURING_CO_DURATION_SHIFTS=1`. `curing_b2c.py` co_trans and press simulation updated. |
 
 ---
 
@@ -414,6 +419,8 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. Was incorrectly set to 1 (cost 7–10k GT); fixed. |
 | `MAX_CHANGEOVERS_PER_DAY` | **10** | Curing CO cap per calendar day. **Single source of truth in `bc_config.py`** — propagates automatically to all pipeline files. Lower values (8) reduce NRI SKU activation rate; higher values (10) activate more NRI SKUs but increase building CO overhead. |
 | `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: how many curing shifts of GT to pre-build as a buffer. 2 = build today's + 1 extra shift so sibling machines (e.g. 6004 + 7001 on 16") both see non-zero deficit and share the demand. VMI uses 2; BJ/UNI/STAGE use 1. |
+| `CURING_CO_DURATION_SHIFTS` | **1** | Shifts a curing press is idle during CO: Shift A only (CHANGEOVER). Mould-clean removed from scheduler model — Shift B is productive. |
+| `CURING_CO_CHANGEOVER_MINS` | **490** | Shift A duration for curing CO (full shift, press occupied). |
 | `CO_CLASS_FILTER` | **Class A only** | COScheduler fires only Class A (critical: `current_days > horizon_left`) COs. Class B (helpful) skipped to avoid CO explosion from premature NRI activation. |
 | `PRE_START_SHIFTS` | **2** | Building pre-starts N shifts before plan_start. 2 = Apr 30 Shift B (15:00). Pre-start GT credited to curing simulation's opening balance by `curing_b2c.py`. |
 | `BUILD_LEAD_SHIFTS` | **3** (= 1 full day) | Legacy pipeline: building targets curing demand this many shifts ahead. Rolling pipeline: not applicable (simultaneous build + cure per shift). |
@@ -493,13 +500,13 @@ for Day D in 1..31:
 
     Step 1 — Per-shift curing demand
       shift_cure_demand[sku] = sum over presses in RUNNING state for shift S
-        (CO presses: Shift A=CHANGEOVER, B=MOULD_CLEAN → contribute 0;
-                     Shift C only: new_sku gets 1 shift of demand)
-      Pre-build signal (Shifts A and B only):
+        (CO presses: Shift A=CHANGEOVER → contribute 0;
+                     Shifts B and C: new_sku already RUNNING → contributes 1 shift demand)
+      Pre-build signal (Shift A ONLY):
         for each new_sku in co_target_skus:
           shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
-        → Building sees a positive deficit for CO target SKUs in A/B and starts
-          pre-building GT before the curing press fires up in Shift C
+        → Building sees a positive deficit in Shift A and starts producing GT
+          so inventory is ready before Shift B curing fires
 
     Step 2 — Greedy building assignment (_assign_building_shift)
       allow_new_co = (Shift == "A")
@@ -519,8 +526,8 @@ for Day D in 1..31:
 
     Step 4 — Curing simulation
       for each press:
-        RUNNING:     cured = min(capacity, gt_available); gt_inventory -= cured
-        CHANGEOVER/MOULD_CLEAN: press idle
+        RUNNING:    cured = min(capacity, gt_available); gt_inventory -= cured
+        CHANGEOVER: press idle (Shift A of CO day only)
 
   End of day: apply CO transitions (press_state updated after all 3 shifts)
 ```
@@ -536,7 +543,7 @@ for Day D in 1..31:
 | Building CO (Shift A) | LP penalty discourage | Free to pick any eligible SKU; same-inch + dominant inch preferred |
 | Building CO (Shifts B/C) | Unrestricted | Restricted: only when cur demand=0 or curing CO forces it |
 | Primary SKU per day | No concept | Machine locks to Shift A choice in Shifts B/C |
-| CO target pre-build | Separate pre-start mechanism | Injected into shift_cure_demand in Shifts A/B |
+| CO target pre-build | Separate pre-start mechanism | Injected into shift_cure_demand in Shift A ONLY |
 | machine_current_sku | Updated end of day | Updated end of EACH SHIFT |
 | Starvation | Possible (synthetic plan mismatch) | Near-zero by construction |
 | Plant match | N/A | Confirmed matches 09.04.2026 plant schedule pattern |
@@ -692,7 +699,7 @@ Exclusive demand assignment: each SKU counted once in highest-priority eligible 
 | UNI\_NARROW | 3 | 7 | 56,717 | 44,193 | 12,524 | 77.9% | 58.4% |
 | STAGE2 | 6 | 14 | 89,549 | 85,684 | 3,865 | 95.7% | 81.2% |
 | No machine data | — | 7 | 59,918 | 8,417 | 51,501 | 14.0% | — |
-| **TOTAL** | **39** | **89** | **653,138** | **581,664** | **71,474** | **89.3%** | |
+| **TOTAL** | **39** | **89** | **653,138** | **615,438** | **37,700** | **94.4%** | |
 
 **Structural ceilings:**
 - BJ: demand/capacity ratio = 249,633 / ~184k = 136% — **physically oversubscribed**. Cannot close the 20k gap via scheduling. Fix = more BJ presses or VMI certification.
@@ -701,9 +708,10 @@ Exclusive demand assignment: each SKU counted once in highest-priority eligible 
 - STAGE2: 95.7% coverage, near ceiling with Stage-1 feed constraints.
 - No machine data: 51,501 permanently unbuilt until master data certifications added.
 
-**Rolling pipeline actual (May 2026, current code): 581,664 GT built / 587,000 cured / 89.3% coverage**
-**Scheduler ceiling (without master data changes): ~600–610k / 653,138 ≈ 92–93%** (after data fixes for HURL0 + TVECE)
-**True ceiling (if all no-master-data SKUs certified): ~630k+ / 653,138 ≈ 96%+**
+**Rolling pipeline actual (May 2026, current code): 615,438 GT built / 616,514 cured / 94.4% coverage**
+**Note:** Curing exceeds building because opening GT inventory (6,199) from pre-start shifts is also consumed.
+**Scheduler ceiling (without master data changes): ~620–625k / 653,138 ≈ 95–96%** (after data fix for HURL0 + TVECE)
+**True ceiling (if all no-master-data SKUs certified): ~635k+ / 653,138 ≈ 97%+**
 
 ### BJ oversubscription — SKU-level breakdown (May 2026)
 
