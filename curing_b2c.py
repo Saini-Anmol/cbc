@@ -11,7 +11,7 @@ Algorithm (GT-balance simulation):
   • CO events from the building schedule's "Changeover Plan" sheet drive
     press-state transitions:
         Shift A of CO day → CHANGEOVER (press occupied, no production)
-        Shift B of CO day → MOULD_CLEAN (press occupied, no production)
+        Shift B of CO day → RUNNING on new SKU (mould clean removed from model)
         Shift C of CO day → RUNNING on new SKU
   • Press state initialised from testing_Daily_Running_Moulds.
 
@@ -353,7 +353,7 @@ def simulate(
     demand_skus = set(demand_df["SKUCode"].astype(str).str.strip()) if not demand_df.empty else set()
 
     # ── Init press state ──────────────────────────────────────────────────────
-    #   status: RUNNING | IDLE | CHANGEOVER | MOULD_CLEAN
+    #   status: RUNNING | IDLE | CHANGEOVER
     press_state: dict[str, dict] = {}
     for _, r in press_df.iterrows():
         press = str(r["press"]).strip()
@@ -389,9 +389,9 @@ def simulate(
     co_trans: dict[tuple, list] = defaultdict(list)
     for press, day_idx, old_sku, new_sku in co_events:
         co_date = (plan_start + timedelta(days=day_idx)).strftime("%Y-%m-%d")
-        co_trans[(co_date, "A")].append((press, "CHANGEOVER",  new_sku))
-        co_trans[(co_date, "B")].append((press, "MOULD_CLEAN", new_sku))
-        co_trans[(co_date, "C")].append((press, "RUNNING",     new_sku))
+        co_trans[(co_date, "A")].append((press, "CHANGEOVER", new_sku))
+        co_trans[(co_date, "B")].append((press, "RUNNING",    new_sku))
+        co_trans[(co_date, "C")].append((press, "RUNNING",    new_sku))
 
     # ── Accumulators ─────────────────────────────────────────────────────────
     shift_rows: list[dict] = []
@@ -446,9 +446,6 @@ def simulate(
             elif status == "CHANGEOVER":
                 press_stats[press]["co_mins"] += SHIFT_MINS
                 remark = f"C/O → {sku}"
-            elif status == "MOULD_CLEAN":
-                press_stats[press]["clean_mins"] += SHIFT_MINS
-                remark = "MOULD_CLEAN"
             else:  # IDLE
                 press_stats[press]["idle_mins"] += SHIFT_MINS
                 remark = "IDLE"
@@ -612,8 +609,6 @@ def _write_shift_schedule(ws, shift_rows):
         st = r.get("_status", "")
         if st == "CHANGEOVER":
             fill = _fill(_ORANGE)
-        elif st == "MOULD_CLEAN":
-            fill = _fill(_AMBER)
         elif st == "IDLE":
             fill = _fill(_LGREY)
         else:
@@ -623,7 +618,7 @@ def _write_shift_schedule(ws, shift_rows):
             cell = ws.cell(row=ri, column=ci, value=r.get(h, ""))
             cell.fill = fill
             cell.alignment = _center()
-            if st in ("CHANGEOVER", "MOULD_CLEAN"):
+            if st == "CHANGEOVER":
                 cell.font = Font(bold=True)
 
     ws.column_dimensions["A"].width = 14

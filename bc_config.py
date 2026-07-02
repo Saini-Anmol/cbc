@@ -121,11 +121,16 @@ STAGE2_CO_TIME_MULTIPLIER = 2.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-MIN_CAMPAIGN_MINS   = 120
+MIN_CAMPAIGN_MINS   = 60
 # Minimum production run (minutes) per (SKU, machine) before the heuristic
 # is allowed to switch to a different SKU.
 # Default in building.py = 45 → machine 7001-7004 reach 173 COs/month.
-# 120 = quarter-shift minimum, limits daily SKU count and CO overhead.
+# Was 120 (for LP pipeline to prevent CO explosion). Rolling pipeline uses
+# MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT=2 to cap COs, so 60 is safe.
+# 120 blocked any SKU with ≤2 presses (112 units/shift < 120 min threshold)
+# on fast VMI machines (1 unit/min CT), causing permanent zero production.
+# 60 allows 1–2 press SKUs (64–128 min/shift demand) while still preventing
+# micro-campaigns that generate unnecessary CO overhead.
 
 MIN_CAMPAIGN_UNITS  = 40
 # Secondary guard: minimum units per campaign (after MIN_CAMPAIGN_MINS passes).
@@ -151,12 +156,17 @@ GT_SHELF_LIFE_DAYS      = 3
 # GT cannot sit more than 3 days before curing (plant rule).
 # TopUp will not pre-build GT beyond this window.
 
-GT_BUFFER_SHIFTS        = 1
+GT_BUFFER_SHIFTS        = 2
 # NEW ARCHITECTURE: how many curing shifts of GT to pre-build as a buffer.
-# 1 = build exactly what today's presses consume today (default).
-# 2 = build today's + 1 shift extra (next-shift safety buffer).
+# 1 = build exactly what today's presses consume today.
+# 2 = build today's + 1 shift extra (next-shift safety buffer).  ← current
 # With GT_BUFFER_SHIFTS = 1–2 (~0.33–0.67 day buffer), the 3-day shelf life is
 # never hit under normal operation. Must be <= GT_SHELF_LIFE_DAYS × SHIFTS_PER_DAY.
+# Reason for 2: with GT_BUFFER_SHIFTS=1, same-inch sibling machines (6004/7001
+# on 16", 6001/7002/7004 on 14") fight for the same deficit. The first machine
+# fills the single-shift target; siblings see deficit=0 and idle. With 2 shifts
+# of target, all siblings share the demand (6004 fills shift 1, 7001 fills shift 2)
+# → both machines utilized, no wasted capacity.
 
 CARCASS_SHELF_LIFE_DAYS = 1
 # Stage-1 carcass shelf life: 1 day (must enter Stage-2 same or next shift).
@@ -176,11 +186,10 @@ DEFAULT_CURING_CT = 17.0
 #   Shift C (CO day)  → PRODUCTION begins on new SKU
 # Building for the new SKU must start simultaneously with Shift A (see CLAUDE.md).
 
-CURING_CO_DURATION_SHIFTS  = 2     # total shifts a press is idle during CO (Shift A + Shift B)
+CURING_CO_DURATION_SHIFTS  = 1     # shifts idle during CO: Shift A only (CHANGEOVER).
+#                                    Mould clean removed from scheduler model.
 CURING_CO_CHANGEOVER_MINS  = 490   # Shift A: press occupied for changeover (full shift)
-CURING_MOULD_CLEAN_MINS    = 120   # Shift B: mould clean window within the idle shift
-# Note: press is idle the entire Shift B (480 min); 120 min is the physical
-# mould-clean time. The remaining ~360 min of Shift B are not schedulable.
+# Shift B: PRODUCTION begins for new SKU immediately (no mould-clean idle shift).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════

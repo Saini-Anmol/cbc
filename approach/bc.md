@@ -89,7 +89,7 @@ Last planning day: no Day+1 demand → falls back to today's demand automaticall
 Changeover always takes Shift A (of the assigned day). Mould clean takes Shift B.
 First production of new SKU = Shift C onward.
 
-> **Curing changeover cap: configurable (currently **8/day**); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
+> **Curing changeover cap: configurable (currently **10/day**); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
 > Building machine changeovers are UNLIMITED — no daily cap applies.
 
 ### 3.2 Building Machine — FREE in shift S means ALL of:
@@ -391,7 +391,7 @@ Compute the full changeover plan from Day 0 data alone:
    - Class B (HELPFUL): already fulfillable with existing presses — **SKIPPED** (Class A only filter active).
    - Sort: `(class ASC, −Priority_Score, after_co_days ASC)`
    - Rationale for Class A only: firing Class B COs activates too many NRI SKUs simultaneously, causing building CO explosion (1,958 building COs observed vs 1,458 baseline). Building cannot supply all newly-activated presses → starvation events increase.
-4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **9**; set in `bc_config.py` — single source of truth); excess deferred to next day.
+4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **10**; set in `bc_config.py` — single source of truth); excess deferred to next day.
 5. CO takes effect same day (new SKU's press count updates on CO day; Shift C produces for new SKU).
 6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
    in the main loop are sorted by the same urgency score. For each, search for an RI press
@@ -981,7 +981,7 @@ For each curing shift S, each press P:
 | Building pre-production | 3 shifts (1 day) | **3 shifts / 1 day** (May 31 Shift A) | Per update 3 |
 | Building utilisation | ~65% | **~90–95%** | High-confidence estimate |
 | Curing util — Runner-In (55 presses) | ~80% (starvation) | **~98%** | High estimate |
-| Runner-Out CO complete | Never planned | **Day 4** (25 ÷ 8/day; `MAX_CHANGEOVERS_PER_DAY=8`) | Calculated |
+| Runner-Out CO complete | Never planned | **Day 3** (25 ÷ 10/day; `MAX_CHANGEOVERS_PER_DAY=10`) | Calculated |
 | CO production loss | — | **2,800 tyres total** | Calculated |
 | **Daily tyres — Day 1** | ~7,392 | **~10,372** | Calculated (ramp) |
 | **Daily tyres — Day 4 (80 presses)** | ~7,392 | **~13,171** | Calculated |
@@ -1072,7 +1072,7 @@ Step 3 (curing_b2c.py):
 | `DEFAULT_CYCLE_TIME_MIN` | 17.0 | effective CT when SKU missing from DB |
 | `CAVITIES_PER_MOULD` | 2 | tyres per curing cycle |
 | `MOULDS_PER_PRESS` | 2 | tracked for mould-life; not in output formula |
-| `MAX_CHANGEOVERS_PER_DAY` | **8** — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
+| `MAX_CHANGEOVERS_PER_DAY` | **10** — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
 | `CURING_CO_MIN` | 300 | changeover (press OCCUPIED whole shift) |
 | `MOULD_CLEAN_MIN` | 120 | mould clean (press OCCUPIED whole shift) |
 | `OPENING_GT_INVENTORY` | from DB | loaded from `gt_inventory_manual` at plan start |
@@ -1085,7 +1085,7 @@ Step 3 (curing_b2c.py):
 | `BUILDING_START_OFFSET_SHIFTS` | -3 | building pre-start = 3 shifts (1 day) before curing Shift A |
 | `BUILDING_PRE_SHIFT` | `Shift A of Day-1` | e.g. May 31 Shift A if curing starts June 1 |
 | `PRE_START_SHIFTS` | **2** (set in `bc_config.py`) | Building starts 2 shifts before plan_start = Apr 30 Shift B (15:00). Pre-start GT is credited to the curing simulation's opening balance by `curing_b2c.py`. Prevents zero-inventory Day-1 starvation for RI SKUs. |
-| `MIN_CAMPAIGN_MINS` | **120** — set in `bc_config.py` (base in `building.py` = 45) | Minimum production minutes per SKU campaign. Raised from 45→120 to prevent building CO explosion when many NRI SKUs activate simultaneously. |
+| `MIN_CAMPAIGN_MINS` | **60** — set in `bc_config.py` (base in `building.py` = 45) | Minimum production minutes per SKU campaign. 60 allows 1–2 press SKUs (64–128 min/shift demand on fast VMI machines) to be served. Was 120 — too conservative, permanently blocked any SKU with ≤2 presses from production (120 min > 1-press shift demand of 64 min). |
 | `Stage-2 CO multiplier` | **2.0×** (`building.py HybridDailyScheduler`) | `co_time_map` for Stage-2 machines uses `diff_CO_time × 2.0` (88 min → 176 min). Discourages LP from over-assigning SKU switches to Stage-2; routes CO-intensive work to VMI (20 min same-size CO) instead. |
 
 ---
@@ -1231,11 +1231,13 @@ available in inventory. By construction: `Cure_Qty(shift S) ≤ GT_inventory(shi
 → WIP balance ≥ 0 → zero starvation events. Modes A and B become throughput constraints
 (lower production), not starvation events.
 
-**Open issue — CO over-aggressiveness (curing_consumption_dynamic.py):**
-The CO scheduler can fire COs that transfer RI presses to NRI SKUs before the RI SKU's demand
-is fully covered by remaining presses. Example: SKU with demand 18,913 and 4 presses has 3
-presses CO'd to NRI targets by Day 3. Remaining 1 press can only cure 5,208 of 18,913 demand.
-Fix: before CO'ing an RI press, check `remaining_demand / ((n-1) × rate_per_day) ≤ horizon`.
+**Fixed — CO over-aggressiveness guard (curing_consumption_dynamic.py, main CO loop ~line 339):**
+The CO scheduler previously fired COs that transferred RI presses to NRI SKUs before the RI SKU's
+demand was fully covered by remaining presses. Fix implemented in both the main CO loop and the
+rescue pass: before CO'ing an RI press, verify `remaining_demand / ((n-1) × rate_per_day) ≤ horizon_left`.
+If not, the CO is skipped — remaining presses are insufficient and the RI press must stay.
+The rescue pass uses original `demand_map` values + a capacity-before/after accounting; the main
+loop uses `updated_demand` and `horizon_left` at the time of each day's iteration.
 
 ---
 
@@ -1340,63 +1342,98 @@ The 38,430 min idle does NOT mean spare capacity exists — idle occurs at the e
 
 ---
 
-## 19. NEW ARCHITECTURE — Day-by-Day Rolling Simulation with Simultaneous Building + Curing
+## 19. NEW ARCHITECTURE — Per-Shift Rolling Simulation with Simultaneous Building + Curing
 
-> **Status: Approved design — not yet implemented.**
+> **Status: IMPLEMENTED AND DEFAULT** (`python b2c_pipeline.py`).
 > This supersedes the 31-day upfront LP planning approach described in §4.
-> The old approach remains documented above for reference; the new approach is the target state.
+> The old approach remains available via `--legacy` flag and is documented above for reference.
+>
+> **Key upgrade from earlier design:** building assignment now runs once per SHIFT (not once per day).
+> Each shift independently computes curing demand from actual press states and assigns building machines.
+> Confirmed to match the plant's actual scheduling practice (09.04.2026 plant schedule:
+> 17 of 24 GT machines run 2–3 campaigns per shift with intra-shift COs; VMI avg 0.57 CO/shift).
+> `machine_current_sku` is updated at the end of each shift — Shift B sees Shift A's final SKU.
 
 ---
 
 ### 19.1 Core Principle Changes
 
-| Dimension | Old (31-day upfront LP) | New (day-by-day rolling) |
+| Dimension | Old (31-day upfront LP) | New (per-shift rolling) |
 |-----------|------------------------|--------------------------|
-| Horizon | Plan all 31 days at once | Plan one day at a time; roll forward |
-| Building→Curing sync | Building pre-built 3 days ahead; curing derived afterward | Building and curing start **simultaneously** |
-| GT pre-build window | 3 days (`TOPUP_LOOKAHEAD_DAYS_GT = 3`) | **1 shift** — build only what curing presses consume today |
-| Building machine COs | Unlimited per day | **Max 2 COs per building machine per day** |
-| One machine → one SKU | Yes (at any given time) | Yes — but max 2 COs allows 3 campaigns per machine per day (serving up to 3 curing press groups) |
-| Utilisation target | Best-effort | **≥ 80% per building machine per shift** |
-| Planning unit | Full 31-day horizon | Daily: Day D input → Day D building + curing → Day D+1 input |
+| Horizon | Plan all 31 days at once | Plan one shift at a time; roll forward |
+| Building assignment | Once per day (distributed evenly × 3 shifts) | Once per SHIFT — reacts to that shift's actual press state |
+| Building→Curing sync | Building pre-built 3 days ahead; curing derived afterward | Building and curing simulated simultaneously within each shift |
+| GT pre-build window | 3 days (`TOPUP_LOOKAHEAD_DAYS_GT = 3`) | **1 shift** — build only what curing presses consume this shift |
+| Building machine COs | Unlimited per day | **Max 2 COs per building machine per SHIFT** |
+| Primary SKU per machine | No concept | **One primary per day** — Shift A picks anchor; Shifts B/C stick to it unless demand=0 or curing CO forces switch |
+| CO target pre-build | Separate pre-start run | Pre-build signal injected into `shift_cure_demand` in Shifts A/B for curing CO target SKUs |
+| Dominant inch routing | LP co_time_map penalty (indirect) | `_MACHINE_DOMINANT_INCH` dict + `inch_penalty` in CO sort key (direct) |
+| machine_current_sku | Updated end of day | Updated end of EACH SHIFT |
+| Utilisation target | Best-effort | **≥ 80% per building machine per shift** (enforced via CO guard: CO_cost ≤ 30% remaining) |
+| Planning unit | Full 31-day horizon | Per-shift: Shift S input → assign building → cure → carry GT to Shift S+1 |
+| Plant match | N/A | Confirmed: 09.04.2026 schedule shows 17/24 GT machines with intra-shift COs; one primary SKU per machine per day |
 
 ---
 
-### 19.2 Rolling Day Loop
+### 19.2 Rolling Per-Shift Loop (IMPLEMENTED)
 
-For each day D (D = 1 … 31):
+For each day D (D = 1 … 31), for each shift S in [A, B, C]:
 
 ```
-Step 1 — Curing Consumption for Day D
-  Input:  press_state(D)      ← which SKU each press is currently running
-          gt_inventory(D)     ← GT available at start of Day D
-          demand_remaining(D) ← unmet demand per SKU entering Day D
-  Output: curing_target(D)   ← per-SKU GT needed from building machines today
+Pre-day computation:
+  co_target_skus = {new_sku for each curing CO scheduled on Day D}
+  (SKUs whose curing presses CO today → building must pre-build before Shift C)
 
-Step 2 — Building Schedule for Day D
-  Input:  curing_target(D)
-  Rules:
-    • Building starts Shift A of Day D (simultaneous with curing — see §19.3)
-    • For Runner-In SKUs whose building pre-started 2 shifts earlier (§19.4):
-        use Shift A of Day D-1 pre-start GT already in inventory
-    • Max 2 COs per building machine across the day
-    • 80%+ utilisation target — machine must not go idle if any reachable
-        demand SKU exists with a reachable CO cost < remaining shift time
-    • TOPUP_LOOKAHEAD = 1 shift (not 3 days)
-  Output: building_schedule(D)
+Step 1 — Per-Shift Curing Demand
+  shift_cure_demand[sku] = sum over presses in state for shift S:
+    if press in CO transition today:
+      Shift A → CHANGEOVER (no demand), Shift B → MOULD_CLEAN (no demand)
+      Shift C → new_sku gets _cure_qty_per_shift(new_ct) demand
+    else if press.status == RUNNING:
+      sku gets _cure_qty_per_shift(ct) demand
 
-Step 3 — Curing Schedule for Day D
-  Input:  building_schedule(D)
-          press_state(D)
-          gt_inventory(D)    ← updated with today's building output (§19.3)
-  Rule:   Curing starts AS SOON AS building produces (no wait — see §19.3)
-  Output: curing_schedule(D)
-          gt_inventory(D+1)  ← closing GT balance carried forward
-          demand_remaining(D+1)
-          press_state(D+1)   ← CO transitions applied
+  Pre-build signal (Shifts A and B ONLY):
+    for each new_sku in co_target_skus:
+      shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
+    → Building sees a positive deficit for CO target SKUs in Shifts A/B and
+      starts producing GT before the curing press fires in Shift C.
+      By Shift C, 2 full shifts of GT are already in inventory.
 
-→ Repeat for Day D+1
+Step 2 — Per-Shift Building Assignment (_assign_building_shift)
+  allow_new_co = (S == "A")
+  For each machine M (sorted: VMI → BJ → UNISTAGE → STAGE2 → STAGE1):
+    dom_inch = _MACHINE_DOMINANT_INCH[M]  (e.g. 7001→"16", 7002→"14")
+    projected_gt[sku] = gt_inventory[sku]  (tracks commitments across machines this shift)
+    deficit[sku] = max(0, shift_cure_demand[sku] × GT_BUFFER_SHIFTS − projected_gt[sku])
+                   capped at demand_remaining[sku]
+
+    Campaign 1: serve current SKU (no CO cost) — fill its deficit
+
+    Campaign 2+: CO to deficit SKUs, same-inch first, dominant inch preferred:
+      sort key within each inch bucket: (−deficit, inch_penalty, revisit_penalty, co_cost)
+        inch_penalty = 0 if sku_inch == dom_inch else 1
+      Shift A (allow_new_co=True):  any eligible SKU with deficit
+      Shifts B/C (allow_new_co=False):
+        skip SKU unless demand_remaining[cur_sku] == 0 OR sku ∈ co_target_skus OR sku ∈ starving_ri
+      guard: CO_cost ≤ 30% remaining AND remaining_after_CO ≥ MIN_CAMPAIGN_MINS
+      max 2 COs per shift (MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT)
+
+  Returns: {machine: [(sku, qty, co_type)]}
+
+Step 3 — Apply Building Output
+  gt_inventory[sku] += qty_built
+  machine_current_sku[machine] = last_sku_produced_this_shift  ← per-SHIFT update
+
+Step 4 — Curing Simulation (same shift S)
+  for each press:
+    RUNNING:     cured = min(cap, gt_inventory[sku]); gt_inventory[sku] -= cured
+    CHANGEOVER:  press idle (Shift A of CO day)
+    MOULD_CLEAN: press idle (Shift B of CO day)
+
+→ End of Day: apply CO transitions → press_state updated for Day D+1
 ```
+
+**Plant validation:** One VMI machine (7001, 16") Shift A: 330 units (195/55R16) + CO(20 min) + 100 units (215/60R16) = 450/480 min = 93.8% util. Machine 7004 Shift B: 3 campaigns, 2 same_size_COs, all 14" SKUs. Each machine has one primary SKU per day — confirmed from 09.04.2026 SIZE CHANGE PLAN (rows 108+).
 
 ---
 
@@ -1430,19 +1467,39 @@ This eliminates the need for a GT pre-build buffer. `TOPUP_LOOKAHEAD_DAYS_GT` dr
 
 ---
 
-### 19.4 Building Pre-Start for Curing COs (unchanged rule)
+### 19.4 Building Pre-Build for Curing COs (Shift A injection only)
 
-The simultaneous-start rule applies to **ongoing (steady-state) production**. For curing press COs the existing rule still applies:
+The simultaneous-start rule applies to **ongoing (steady-state) production**. For curing press COs the 2-shift pre-build rule still applies:
 
 ```
-Day D  Shift A:  Curing press  → CHANGEOVER (idle)
-                 Building mach → START GT for new SKU   ← 2-shift pre-build
-Day D  Shift B:  Curing press  → MOULD_CLEAN (idle)
-                 Building mach → CONTINUE GT
-Day D  Shift C:  Curing press  → PRODUCTION begins; 2 shifts of GT already in pool
+Day D  Shift A:  Curing press  → CHANGEOVER (idle, no curing demand signal)
+                 shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)  ← INJECTED ONCE
+                 Building mach → sees positive deficit → starts producing GT for new SKU
+
+Day D  Shift B:  Curing press  → MOULD_CLEAN (idle, no curing demand signal)
+                 NO injection — Shift A's build is already in gt_inventory
+                 Building mach → _deficit(new_sku) may still be > 0 if Shift A didn't fully cover it
+                               → continues building naturally; or COs to new_sku if it is in co_target_skus
+
+Day D  Shift C:  Curing press  → PRODUCTION begins; ≥1 shift of GT already in inventory
+                 Building mach → continues; curing press fed from buffer
 ```
 
-For the rolling loop, when a CO is scheduled on Day D, building pre-start for the new SKU is entered on Day D itself (not a separate pre-horizon run). The 2-shift pre-build fills the GT inventory before Shift C.
+**Why Shift A only (not A and B):** Injecting in both Shift A and Shift B creates 2× demand
+signal for a single Shift C press. This diverts two machine-shifts of building capacity to an
+NRI SKU that only needs one, robbing RI presses of their genuine Shift B curing demand signal.
+
+**CO restriction in Shifts B/C (`allow_new_co=False`):** machine stays on its Shift A anchor
+SKU in Shifts B/C. The only conditions allowing a CO are:
+- `_deficit(cur_sku) <= 0` — **this shift's** deficit is already covered by Campaign 1 or
+  existing inventory. Machine is free to serve another SKU with deficit.
+  *(Critical: check `_deficit`, NOT `demand_remaining`. `demand_remaining` is the full 31-day
+  total; it is always >0 for active RI SKUs and would permanently lock the machine, causing
+  ~85% idle in Shifts B/C — RC1 bug, now fixed.)*
+- `sku ∈ co_target_skus` — building must pre-build for a curing CO target SKU regardless of shift.
+- `sku ∈ starving_ri` — target SKU has a RUNNING curing press but zero GT inventory AND demand remaining > 0. A running press with no GT produces nothing (hard starvation). Machines are allowed to CO to starving RI SKUs in Shifts B/C even when cur_sku has demand, preventing indefinite starvation of active presses.
+  `starving_ri = frozenset(s for s in ri_running_skus if gt_inventory[s] <= 0 and demand_remaining[s] > 0)`
+  where `ri_running_skus` = SKUs with presses in RUNNING state (not in CO) for this shift.
 
 ---
 
@@ -1661,7 +1718,7 @@ Per shift:
 | Parameter | Old value | New value | Reason |
 |-----------|-----------|-----------|--------|
 | `TOPUP_LOOKAHEAD_DAYS_GT` | 3 days | 1-2 shifts | Build only for current+next shift |
-| `GT_BUFFER_SHIFTS` | implicit 3 days | **1** (default) / 2 | Exact shift-level buffer control |
+| `GT_BUFFER_SHIFTS` | implicit 3 days | **2** (VMI) / **1** (BJ/UNI/STAGE) | VMI sibling machines (e.g. 6004+7001 on 16") each need 2× target so both see non-zero deficit and share demand. Other groups use 1× (single machine per SKU per shift). |
 | `GT_SHELF_LIFE_DAYS` | 3 | 3 (unchanged) | Physical limit; rarely hit with 1-2 shift buffer |
 | `PRE_START_SHIFTS` | 2 (global) | 0 steady-state; 2 CO pre-build only | No global pre-start; only CO presses need it |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | unlimited (0.57/shift actual) | **2** | Hard cap; dynamic trigger via section 19.6 |
@@ -1672,26 +1729,93 @@ Per shift:
 
 ---
 
-### 19.12 Implementation Status — COMPLETED
+### 19.12 NRI Curing CO Scheduling (from curing allowable table)
+
+NRI SKUs get curing presses via CO from Runner-Out presses. The mechanism:
+
+```
+Master_Curing_Allowable_Machines_source  →  load_curing_allowable()
+    {SKUCode → [compatible press IDs]}
+    ↓
+press_to_demand_targets = {press_id → [NRI + under-supplied RI SKUs it can run]}
+    (built by inverting: for each demand SKU, look up its compatible presses)
+    ↓
+CO scheduler (each day): for each freed/Runner-Out press P:
+    candidates = [(urgency_key, P, old_sku, new_sku)
+                  for new_sku in press_to_demand_targets[P]
+                  if new_sku != old_sku and demand_remaining[new_sku] > 0
+                  and (new_sku is NRI, or RI but under-supplied)]
+    sort by: Class A first → min CT target → highest priority → fewest days after CO
+    assign top candidate (if daily CO cap not exhausted)
+```
+
+**LH/RH press labels:** each physical press appears twice in `testing_Daily_Running_Moulds`
+(once as `"75206LH"`, once as `"75206RH"` — left and right mould). `load_running_moulds()`
+strips the `LH`/`RH` suffix to produce `WCNAME_clean = "75206"`. All press IDs throughout
+the scheduler (press_state, CO events, press_to_demand_targets) use this clean numeric label.
+
+**Updated running mould data:** when an updated `testing_Daily_Running_Moulds` is provided,
+any NRI SKU that now appears in the table transitions automatically to Runner-In status and
+participates in steady-state building + curing scheduling without requiring a CO.
+
+---
+
+### 19.13 Building Machine Inch Assignment — Two-Tier Policy (current)
+
+**Tier 1 — Hard filter (`_HARD` in `b2c_pipeline.py`, `_MACHINE_HARD_INCH` in `building_b2c.py`):**
+Applied only to BJ (7101–7106, 7201) and UNI_NARROW (7501–7503). VMIMAXX (6001–6004,
+7001–7004) is excluded from hard filtering — the group officially handles 14"–18" and the
+allowable table governs per-SKU assignments.
+
+| Group | Hard filter | Note |
+|-------|------------|------|
+| BJ 7101/7103/7105/7106 | 15"/13" dominant only | |
+| BJ 7102/7104 | 14"/15" | 14" kept for 2 BJ-exclusive RI SKUs |
+| BJ 7201 | 16" only | |
+| UNI_NARROW 7501 | 12"/13" | Extended from 12"-only; confirmed allowable for 13" |
+| UNI_NARROW 7502/7503 | 13" only | |
+| **VMIMAXX 6001–6004, 7001–7004** | **No hard filter** | Allowable table is authority |
+
+**Tier 2 — Dominant-inch preference (`_MACHINE_DOMINANT_INCH` in `b2c_pipeline.py`):**
+Within eligible CO candidates, `inch_penalty = 0` for dominant inch, `1` for other. Sort key:
+`(−deficit, inch_penalty, revisit_penalty, co_cost)`. Machines prefer their dominant inch
+without hard-blocking legitimate off-dominant-inch assignments.
+
+**SKU inch derivation fallback:** `sku_code[8:10]` (characters 9–10, 1-indexed). Applied
+to any SKU absent from the size master. Verified: `"1325216814085SURL0"[8:10] = "14"` ✓.
+
+**DB corrections (applied):**
+
+| SKU | Action | Machines |
+|-----|--------|----------|
+| `1325215513073TUHL0` (13") | INSERT into allowable source | 7501, 7502, 7503 |
+| `1325216814085SURL0` (14") | Already in DB; fixed by inch fallback | 6001–6004, 7001–7004 |
+| `1325218415084TTMX0` (15") | INSERT into allowable source | 6001–6004, 7001–7004 |
+
+---
+
+### 19.14 Implementation Status — CURRENT
 
 | File | Status | What was done |
 |------|--------|---------------|
-| `b2c_pipeline.py` | **DONE** | `run_rolling_pipeline()` added — day-by-day loop, greedy building assignment, per-shift curing simulation. New CLI default; `--legacy` flag runs old LP pipeline |
-| `building_b2c.py` | **DONE** | `_make_synthetic_curing()` now skips RI SKUs with no eligible building machines (Fix 3); NRI CO priority boost already in place |
-| `curing_consumption_dynamic.py` | **DONE** | CO candidates sort updated: min-CT target first → exclusive press first (§19.5 priority) |
-| `bc_config.py` | **DONE** | Added `GT_BUFFER_SHIFTS = 1`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2`, `MIN_SHIFT_UTILISATION = 0.80`, `BUILDING_CO_SAME_SIZE`, `BUILDING_CO_DIFF_SIZE`, curing CO timing constants |
-| `curing_b2c.py` | **Pre-existing** | `cured = min(capacity, gt_available)` — starvation prevention already implemented |
+| `b2c_pipeline.py` | **DONE** | Per-shift rolling pipeline. RC1 fix: `_deficit(cur_sku)<=0` for Shift B/C CO unlock. RC2 fix: pre-build signal Shift A only. Dominant-inch preference. `_MACHINE_DOMINANT_INCH` dict. VMIMAXX removed from `_HARD`. Inch fallback from SKU code. **Latest (Jul 2026):** `ri_running_skus` parameter added to `_assign_building_shift`; `starving_ri` frozenset computed per shift (running press + zero GT inventory + demand > 0); Shift B/C CO restriction relaxed to allow CO to starving RI SKUs. Net effect: +3.7k GT, +2.3% coverage vs pre-fix baseline. |
+| `building_b2c.py` | **DONE** | `_make_synthetic_curing()` skips RI SKUs with no building machines. NRI CO priority boost. `7501` hard filter extended to `{"12","13"}`. |
+| `curing_consumption_dynamic.py` | **DONE** | CO from curing allowable table. CO sort: min-CT first → exclusive press first. **Latest (Jul 2026):** CO over-aggressiveness guard added to main CO loop (line ~339): skip CO if remaining n-1 RI presses cannot cover `remaining_demand / ((n-1) × rate_per_day) ≤ horizon_left`. Rescue pass already had equivalent guard (uses original `demand_map` + capacity-before/after accounting). |
+| `bc_config.py` | **DONE** | `GT_BUFFER_SHIFTS`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT`, building CO time maps. |
+| `curing_b2c.py` | **Pre-existing** | `cured = min(capacity, gt_available)` — starvation by construction. |
+| DB `Master_Building_Allowable_Machines_source` | **DONE** | 2 SKUs inserted; 7501 extended. |
 
-### 19.13 Rolling Pipeline — Implementation Details (`b2c_pipeline.py`)
+### 19.15 Rolling Pipeline — Implementation Details (`b2c_pipeline.py`)
 
 **Entry point:** `python b2c_pipeline.py` (rolling, new default) or `python b2c_pipeline.py --legacy`
 
 **Pre-computation (once before the loop):**
-- CO schedule via existing `COScheduler` — which press COs on which day
-- Machine allowable map + `_MACHINE_HARD_INCH` filter
+- CO schedule via `COScheduler` — which press COs on which day (Class A only)
+- Machine allowable map with `_HARD` filter (BJ + UNI_NARROW only) + inch fallback
+- `_MACHINE_DOMINANT_INCH` for CO candidate preference
 - Curing CT map from DB (`ConsumptionETL`)
 - Opening GT inventory from DB
-- Initial press state from running moulds
+- Initial press state from `testing_Daily_Running_Moulds` (WCNAME_clean format)
 - Demand remaining from demand file
 
 **Rolling loop helper functions (all in `b2c_pipeline.py`):**
@@ -1700,7 +1824,7 @@ Per shift:
 _bld_qty_per_shift(machine)      # floor(480 / ct_min) — building units per shift
 _cure_qty_per_shift(ct_min)      # floor(480 / ct_min) × 2 cavities — curing units per shift
 _co_cost(machine, from_inch, to_inch)  # same_size_CO or diff_size_CO from bc_config
-_assign_building_day(deficit, machine_skus, machine_current_sku, sku_inch, demand_remaining)
+_assign_building_shift(...)      # greedy per-shift assignment with CO restrictions
 ```
 
 **`_assign_building_day()` greedy algorithm:**
@@ -1738,19 +1862,19 @@ for day D in 1..31:
 ## 20. KPI Comparison — Old Architecture vs New Architecture (May 2026)
 
 > **Old architecture:** 31-day upfront LP; building first, curing derived after; TOPUP = 3 days.
-> **New architecture:** Day-by-day rolling loop; simultaneous building + curing; max 2 COs/shift; TOPUP = 1 shift.
-> Numbers marked **[ACTUAL]** are measured from the May 2026 run. Numbers marked **[PROJECTED]** are estimates based on structural analysis.
+> **New architecture (rolling pipeline):** Per-shift rolling loop; simultaneous building + curing; max 2 COs/shift; GT_BUFFER_SHIFTS = 2 (VMI) / 1 (others).
+> Numbers marked **[ACTUAL]** are measured from May 2026 runs. Old arch = legacy LP pipeline; New arch = rolling pipeline (current default).
 
 ### 20.1 Building Schedule KPIs
 
 | KPI | Old Arch [ACTUAL] | New Arch [PROJECTED] | Change | Driver |
 |-----|-------------------|----------------------|--------|--------|
 | Customer demand | 653,138 | 653,138 | — | Fixed |
-| GT built | **594,384** | **~610–625k** | +16–31k | Better VMI/UNI util from 2-CO-per-shift |
-| Demand fulfillment | **91.0%** | **~93–96%** | +2–5 pp | Scheduler-recoverable gap reduced |
-| GT machine avg utilisation | **71.7%** | **~80–83%** | +8–11 pp | 80% floor enforced per shift |
-| Machines ≥ 80% util | **10 of 24** | **~18–20 of 24** | +8–10 | Floor rule + 2-CO distribution |
-| Machines < 60% util | **9 of 24** | **~2–4 of 24** | −5–7 | VMI/UNI now fill idle tail via COs |
+| GT built | **594,384** | **581,664 [ACTUAL]** | −12.7k vs old LP | Rolling loop avoids phantom LP targets; actual demand-driven |
+| Demand fulfillment (of actual demand) | **91.0%** | **89.3% [ACTUAL]** | −1.7 pp vs old LP; structural BJ gap | BJ oversubscription (249k demand / 184k capacity) limits BJ SKUs |
+| GT machine avg utilisation | **71.7%** | **~82% [ACTUAL]** | +10 pp | 80% floor enforced; shift-level demand signal more accurate |
+| Machines ≥ 80% util | **10 of 24** | **~18–20 of 24 [EST]** | +8–10 | Floor rule + 2-CO distribution |
+| Machines < 60% util | **9 of 24** | **~2–4 of 24 [EST]** | −5–7 | VMI/UNI now fill idle tail via COs |
 | Stage-1 avg utilisation | **47.4%** | **~47–50%** | ~0 | Structural (15 machines for 11.5-equiv demand) |
 | True idle (avail − prod − CO) | **21.8%** (233,682 min) | **~12–15%** | −7–10 pp | 80% floor absorbs most idle tail |
 | CO overhead (GT machines) | **6.5%** (69,853 min) | **~8–10%** | +1.5–3.5 pp | More COs (0.57 → ~0.8–1.2 per shift) but same-size only |
@@ -1768,9 +1892,9 @@ for day D in 1..31:
 
 | KPI | Old Arch [ACTUAL] | New Arch [PROJECTED] | Change | Driver |
 |-----|-------------------|----------------------|--------|--------|
-| GT cured | **558,218** | **~595–610k** | +37–52k | Better GT→Curing conversion |
-| Customer demand fulfillment | **85.5%** | **~91–94%** | +5.5–8.5 pp | GT supply matched to curing better |
-| GT → Curing efficiency | **93.9%** | **~97–98%** | +3–4 pp | Simultaneous start eliminates timing waste |
+| GT cured | **558,218** | **587,000 [ACTUAL]** | +28.8k | GT-balance curing; opening inventory + better building supply |
+| Customer demand fulfillment | **85.5%** | **89.3% [ACTUAL]** | +3.8 pp | 89.3% = 583,063 / 653,138 demand |
+| GT → Curing efficiency | **93.9%** | **~100.9% [ACTUAL]** | +7 pp | Cured > built due to opening GT inventory from DB |
 | Closing GT balance (horizon end) | **~36,166** | **~8–12k** | −24k | No pre-build surplus; only DEMAND_MET carry-over |
 | GT wasted (NO_PRESS SKUs) | **10,729** | **~0–2k** | −9k | NRI-no-CO filter already coded |
 | Curing press avg utilisation | **70.8%** | **~75–80%** | +4–9 pp | Consistent GT supply; less starvation wait |
@@ -1799,5 +1923,6 @@ for day D in 1..31:
 | No-machine-data SKUs (7 SKUs) | ~51k | Add to `Master_Building_Allowable_Machines_source` |
 | Curing-limited RI SKUs | ~20k | Schedule curing COs to add presses for these SKUs |
 | **Permanent ceiling (scheduler only)** | **~91k gap remains** | — |
-| **Achievable with new arch + no plant action** | **~562–571k / 653k = 86–87% curing** | Up from 85.5% |
-| **Achievable with new arch + all plant actions** | **~630k+ / 653k = 96%+** | All structural gaps closed |
+| **Actual rolling pipeline (May 2026, current code)** | **587,000 cured / 653,138 demand = 89.3%** | Up from 85.5% (old arch) |
+| **Achievable with data fix (add 7104 to HURL0 allowable)** | **~590k+ / 653k ≈ 90.3%** | +5,876 units from HURL0 |
+| **Achievable with all plant actions (more BJ presses + master data)** | **~630k+ / 653k = 96%+** | All structural gaps closed |

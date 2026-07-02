@@ -800,8 +800,8 @@ def run_from_database_b2c(
         "7105": {"13"},               # dominant=13"
         "7106": {"13"},               # dominant=13"
         "7201": {"16"},               # dominant=16"
-        # UNISTAGE — 12" and 13" split cleanly; 7501 takes all 12" demand
-        "7501": {"12"},               # dominant=12" HARD (EXISTING)
+        # UNISTAGE — 7501 dominant=12" but also runs 13" (confirmed allowable)
+        "7501": {"12","13"},          # dominant=12"; 13" allowed per plant data
         "7502": {"13"},               # dominant=13"
         "7503": {"13"},               # dominant=13"
     }

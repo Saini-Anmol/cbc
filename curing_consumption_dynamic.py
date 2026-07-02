@@ -318,6 +318,34 @@ class COScheduler:
                 if urgency_class != 0:
                     continue  # Class B — skip; existing presses can meet demand
 
+                # Re-check with CURRENT press_count — earlier COs this day may have
+                # already satisfied this target's demand. Without this guard, the same
+                # low-demand NRI SKU can absorb the entire daily CO budget (10 presses
+                # all see n_t=0 in the pre-built candidates list, all appear Class A).
+                cur_n = press_count.get(new_sku, 0)
+                cur_rem = updated_demand.get(new_sku, 0)
+                if cur_rem <= 0:
+                    continue   # demand fulfilled by earlier CO today
+                if cur_n > 0:
+                    rate_recheck = _qty_per_press_per_day(
+                        ct_map.get(new_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
+                    )
+                    if rate_recheck > 0 and cur_rem / (cur_n * rate_recheck) <= horizon_left:
+                        continue  # downgraded to Class B — existing presses now sufficient
+
+                # Guard: don't CO an RI press if remaining presses can't cover its demand.
+                # This prevents early CO'ing of RI presses whose SKU demand hasn't been met
+                # when the theoretical drain races ahead of actual building output.
+                if old_sku in ri_skus:
+                    n_old_remaining = press_count.get(old_sku, 0) - 1
+                    rem_old = updated_demand.get(old_sku, 0)
+                    if rem_old > 0 and n_old_remaining > 0:
+                        rate_old = _qty_per_press_per_day(
+                            ct_map.get(old_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
+                        )
+                        if rate_old > 0 and rem_old / (n_old_remaining * rate_old) > horizon_left:
+                            continue  # remaining n-1 presses cannot cover old_sku demand
+
                 co_events.append(
                     {"day": day, "press": p, "old_sku": old_sku, "new_sku": new_sku}
                 )

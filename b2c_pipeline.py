@@ -102,6 +102,18 @@ _BLD_CT_SEC: dict[str, float] = {
 DEFAULT_CURING_CT = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
 CURING_CAVITIES   = 2
 
+# ── Dominant inch per building machine ────────────────────────────────────────
+# Used to prioritise same-dominant-inch SKUs when choosing campaigns/COs.
+# When a machine's dominant-inch SKUs have no deficit, it can build other inches
+# per its allowable list — but dominant inch is always tried first.
+_MACHINE_DOMINANT_INCH: dict[str, str] = {
+    "6001": "14", "6002": "15", "6003": "17", "6004": "16",
+    "7001": "16", "7002": "14", "7003": "15", "7004": "14",
+    "7101": "15", "7102": "15", "7103": "13", "7104": "15",
+    "7105": "13", "7106": "13", "7201": "16",
+    "7501": "12", "7502": "13", "7503": "13",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROLLING PIPELINE HELPERS
@@ -123,37 +135,86 @@ def _co_cost(machine: str, from_inch: str, to_inch: str) -> int:
     return BUILDING_CO_DIFF_SIZE.get(mg, 120)
 
 
-def _assign_building_day(
-    curing_demand:       dict,
+def _select_dynamic_co_target(
+    old_sku: str,
+    demand_remaining: dict,
+    press_count: dict,
+    cure_ct_map: dict,
+    priority_score_map: dict,
+    gt_inventory: dict,
+    horizon_left: int,
+    already_targeted: set,
+) -> "str | None":
+    """Select the best curing CO target when a press finishes its SKU demand mid-plan.
+
+    Only fires Class A COs: demand_remaining / (n × rate) > horizon_left, meaning
+    the SKU CANNOT meet its demand without this additional press.
+
+    Sort key: (fewest after-CO days, highest priority score, most GT in inventory).
+    `already_targeted` prevents multiple dynamic COs going to the same new SKU in
+    the same shift.
+    """
+    candidates = []
+    for sku, rem in demand_remaining.items():
+        if rem <= 0 or sku == old_sku or sku in already_targeted:
+            continue
+        n    = press_count.get(sku, 0)
+        ct   = cure_ct_map.get(sku, DEFAULT_CURING_CT)
+        rate = _cure_qty_per_shift(ct) * 3          # per-day curing rate
+        if rate <= 0:
+            continue
+        current_days = rem / (n * rate) if n > 0 else float("inf")
+        if current_days <= horizon_left:
+            continue                                 # Class B — skip
+        after_days = rem / ((n + 1) * rate)
+        prio       = priority_score_map.get(sku, 0.0)
+        gt_signal  = min(gt_inventory.get(sku, 0.0), rate)  # cap at 1 day's rate
+        candidates.append((after_days, -prio, -gt_signal, sku))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][3]
+
+
+def _assign_building_shift(
+    shift_cure_demand:   dict,
     machine_skus:        dict,
     machine_current_sku: dict,
     sku_inch:            dict,
     demand_remaining:    dict,
     gt_inventory:        dict,
+    co_target_skus:      frozenset = frozenset(),
+    allow_new_co:        bool = True,
+    ri_running_skus:     frozenset = frozenset(),
 ) -> dict:
     """
-    Greedy per-day building assignment.
+    Greedy per-SHIFT building assignment.
 
-    Option B — projected GT:
-      projected_gt accumulates as each machine commits. Later machines skip
-      SKUs where projected supply already covers curing demand.
-
-    Same-inch preference:
-      same_size_CO candidates always tried before diff_size_CO.
+    Plant-accurate behaviour:
+    - allow_new_co=True  (Shift A): machine may CO to any eligible SKU with deficit.
+    - allow_new_co=False (Shifts B/C): machine stays on its Campaign-1 primary SKU
+      UNLESS (a) current demand is fully met, or (b) target is in co_target_skus
+      (curing press is switching to that SKU today → building must pre-build GT),
+      or (c) target is a starving RI (running press + zero GT inventory).
+    - Dominant-inch priority: when selecting CO candidates, SKUs matching the
+      machine's dominant inch sort before other eligible inches.
+    - Starving RI priority: RI SKUs with a running curing press but zero GT
+      inventory get Campaign-1 priority over normal deficit ordering. A curing
+      press cannot run without GT — starvation is a hard failure, not a trade-off.
 
     Returns: {machine: [(sku, qty_int, co_type_str)]}
       co_type: "start" | "same_size_CO" | "diff_size_CO"
     """
-    MAX_COS = MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT * 3
-    DAY_MINS = SHIFT_MINS * 3
-
+    MAX_COS = MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
     projected_gt: dict[str, float] = dict(gt_inventory)
 
-    def _deficit(sku: str) -> float:
-        need = curing_demand.get(sku, 0.0) * GT_BUFFER_SHIFTS
-        gap  = need - projected_gt.get(sku, 0.0)
-        cap  = max(0.0, demand_remaining.get(sku, 0.0))
-        return min(max(0.0, gap), cap)
+    # Starving RI: SKUs with a running curing press but zero GT in inventory.
+    # These must be served before normal priority ordering — a running press
+    # with no GT produces nothing (hard starvation), so they override volume.
+    starving_ri: frozenset = frozenset(
+        s for s in ri_running_skus
+        if gt_inventory.get(s, 0.0) <= 0 and demand_remaining.get(s, 0.0) > 0
+    )
 
     _pri = {"VMI": 0, "BJ": 1, "UNISTAGE": 2, "STAGE2": 3, "STAGE1": 9}
     sorted_machines = sorted(
@@ -164,18 +225,51 @@ def _assign_building_day(
     plan: dict[str, list] = {}
 
     for machine in sorted_machines:
+        group = _MACHINE_GROUP.get(machine, "")
+        # VMI sibling machines (e.g. 6004 + 7001 both on 16") each see only half the
+        # demand because the first machine fills the single-shift target and the sibling
+        # finds deficit=0.  GT_BUFFER_SHIFTS=2 doubles the target so both machines get
+        # non-zero deficit and each fills roughly 1 shift worth.
+        # BJ/UNI_NARROW/STAGE machines already serve many SKUs via Campaign 2; using 1×
+        # leaves room for Campaign 2 CO targets (NRI, CO-day pre-builds) and avoids
+        # crowding lower-demand SKUs (SUHL0, TUNE0) out of the shift.
+        _buf = GT_BUFFER_SHIFTS if group == "VMI" else 1
+
+        def _deficit(sku: str, _b: float = _buf) -> float:
+            need = shift_cure_demand.get(sku, 0.0) * _b
+            gap  = need - projected_gt.get(sku, 0.0)
+            cap  = max(0.0, demand_remaining.get(sku, 0.0))
+            return min(max(0.0, gap), cap)
+
         eligible = machine_skus.get(machine, set())
         if not any(_deficit(s) > 0 for s in eligible):
             continue
 
-        remaining = DAY_MINS
+        remaining = SHIFT_MINS
         co_count  = 0
         cur_sku   = machine_current_sku.get(machine, "")
         cur_inch  = sku_inch.get(cur_sku, "")
+        dom_inch  = _MACHINE_DOMINANT_INCH.get(str(machine), cur_inch)
         rate      = _bld_qty_per_shift(machine) / SHIFT_MINS
         campaigns: list[tuple] = []
 
-        # Pass 1: serve current SKU (no CO)
+
+        # ── Campaign 1: continue current SKU (no CO cost) ──────────────────
+        # If machine has no current SKU (machine_current_sku not set / first shift ever),
+        # pick the highest-deficit eligible SKU as a free "start" with zero CO cost.
+        # Without this, machines with unknown inch pay diff_size_CO (180 min for UNI/Stage-1)
+        # on first assignment, which exceeds the 30% budget and permanently blocks them.
+        if not cur_sku:
+            # Free start: pick dominant-inch high-deficit SKU, treat as "start" (no CO cost).
+            # min() on (inch_penalty, -deficit): 0=dominant inch first, most-negative=-highest deficit.
+            best_start = min(
+                (s for s in eligible if _deficit(s) > 0),
+                key=lambda s: (0 if sku_inch.get(s, "") == dom_inch else 1, -_deficit(s)),
+                default=None,
+            )
+            if best_start is not None:
+                cur_sku  = best_start
+                cur_inch = sku_inch.get(cur_sku, "")
         if cur_sku in eligible and _deficit(cur_sku) > 0:
             mins = min(remaining, _deficit(cur_sku) / rate if rate > 0 else remaining)
             qty  = int(mins * rate)
@@ -184,27 +278,46 @@ def _assign_building_day(
                 projected_gt[cur_sku] = projected_gt.get(cur_sku, 0.0) + qty
                 remaining -= mins
 
-        # Pass 2: CO to other deficit SKUs, same-inch preferred
+        # Campaign 2+: CO to deficit SKUs while time allows.
+        # Same-inch (cheaper CO) tried before diff-inch; dominant inch preferred within each bucket.
+        # In Shifts B/C (allow_new_co=False): only CO when THIS SHIFT's deficit for cur_sku
+        # is already covered (Campaign 1 satisfied it) OR target is a curing CO SKU today.
+        # NOTE: cur_demand_done uses _deficit (this shift's gap), NOT demand_remaining
+        # (31-day total). demand_remaining is always >0 for active RI SKUs, which would
+        # permanently lock the machine and cause ~85% idle in Shifts B/C.
         while remaining >= MIN_CAMPAIGN_MINS and co_count < MAX_COS:
             same_cands: list = []
             diff_cands: list = []
+            seen_in_plan = {sku for sku, _, _ in campaigns}
+            cur_demand_done = _deficit(cur_sku) <= 0   # this shift's deficit satisfied?
+
             for sku in eligible:
-                if sku == cur_sku or _deficit(sku) <= 0:
+                d = _deficit(sku)
+                if sku == cur_sku or d <= 0:
+                    continue
+                # Shift B/C CO restriction: skip unless current SKU is done, curing CO forces it,
+                # or target is a starving RI (running press with zero GT — urgent regardless of shift)
+                if not allow_new_co and not cur_demand_done and sku not in co_target_skus and sku not in starving_ri:
                     continue
                 to_inch = sku_inch.get(sku, "")
                 cost    = _co_cost(machine, cur_inch, to_inch)
-                if cost > 0.20 * remaining or remaining - cost < MIN_CAMPAIGN_MINS:
+                if remaining - cost < MIN_CAMPAIGN_MINS:
                     continue
+                if cost > 0.30 * remaining:
+                    continue
+                revisit_penalty = 1 if sku in seen_in_plan else 0
+                # 0 = dominant inch (preferred), 1 = non-dominant
+                inch_penalty = 0 if to_inch == dom_inch else 1
                 bucket = same_cands if to_inch == cur_inch else diff_cands
-                bucket.append((-_deficit(sku), cost, sku))
+                bucket.append((-d, inch_penalty, revisit_penalty, cost, sku))
 
             if same_cands:
                 same_cands.sort()
-                _, best_cost, best_sku = same_cands[0]
+                _, _, _, best_cost, best_sku = same_cands[0]
                 co_type = "same_size_CO"
             elif diff_cands:
                 diff_cands.sort()
-                _, best_cost, best_sku = diff_cands[0]
+                _, _, _, best_cost, best_sku = diff_cands[0]
                 co_type = "diff_size_CO"
             else:
                 break
@@ -409,7 +522,7 @@ def _write_rolling_building_excel(
 
     dem_cols = ["SKUCode", "Category", "Priority", "Demand", "GT_Inventory",
                 "Planned_Units", "Gap", "Fulfillment_Pct", "Status",
-                "Eligible_Machines", "Skip_Reason"]
+                "CycleTime_min", "Eligible_Machines", "Presses_Needed", "Skip_Reason"]
     _xl_header(ws_dem, 1, dem_cols)
 
     cat_map_d0: dict[str, str]   = {}
@@ -420,6 +533,13 @@ def _write_rolling_building_excel(
             cat_map_d0[s] = str(r.get("Category",""))
             pri_map_d0[s] = float(r.get("Priority_Score", 0) or 0)
 
+    # Average building CT per SKU (seconds → minutes), across eligible machines
+    _PRESS_NORM = 86_400.0  # 60 days × 24h × 60min (presses_needed normalisation)
+    def _avg_bld_ct(sku: str):
+        machs = sku_machine_map.get(sku, set())
+        cts   = [_BLD_CT_SEC.get(str(m), 120.0) / 60.0 for m in machs]
+        return round(sum(cts) / len(cts), 1) if cts else None
+
     dem_rows_out = []
     for sku, dem in sorted(demand_dict.items(), key=lambda x: -x[1]):
         planned  = float(prod_by_sku.get(sku, 0))
@@ -427,6 +547,8 @@ def _write_rolling_building_excel(
         fill_pct = round(100 * planned / dem, 1) if dem > 0 else 0.0
         status   = ("FULLY MET" if planned >= dem * 0.95
                     else "PARTIAL" if planned > 0 else "UNMET")
+        avg_ct   = _avg_bld_ct(sku)
+        p_needed = (round(dem * avg_ct / _PRESS_NORM, 2) if avg_ct else "NA")
         dem_rows_out.append({
             "SKUCode": sku, "Category": cat_map_d0.get(sku, ""),
             "Priority": round(pri_map_d0.get(sku, 0), 7),
@@ -434,20 +556,56 @@ def _write_rolling_building_excel(
             "GT_Inventory": int(opening_gt.get(sku, 0)),
             "Planned_Units": int(planned), "Gap": gap,
             "Fulfillment_Pct": f"{fill_pct}%", "Status": status,
-            "Eligible_Machines": len(sku_machine_map.get(sku, set())),
+            "CycleTime_min": avg_ct if avg_ct is not None else "NA",
+            "Eligible_Machines": len(sku_machine_map.get(sku, set())) or "NA",
+            "Presses_Needed": p_needed,
             "Skip_Reason": "" if planned > 0 else (
                 "No eligible building machine" if not sku_machine_map.get(sku) else ""),
         })
     status_colors = {"FULLY MET": _GREEN, "PARTIAL": _AMBER, "UNMET": _RED}
+    pu_col_idx = dem_cols.index("Planned_Units") + 1
     for ri, row in enumerate(dem_rows_out, 2):
         color = status_colors.get(row["Status"], _GREY)
         for ci, col in enumerate(dem_cols, 1):
             cell = ws_dem.cell(row=ri, column=ci, value=row.get(col, ""))
             cell.fill = _fill(color)
             cell.alignment = _ctr()
+            if ci == pu_col_idx:
+                cell.font = Font(bold=True)
     ws_dem.column_dimensions["A"].width = 34
-    for ltr in "BCDEFGHIJK":
+    for ltr in "BCDEFGHIJKLM":
         ws_dem.column_dimensions[ltr].width = 15
+
+    # KPI footer (matches building_b2c.py _append_b2c_sheets format)
+    n_full  = sum(1 for r in dem_rows_out if r["Status"] == "FULLY MET")
+    n_part  = sum(1 for r in dem_rows_out if r["Status"] == "PARTIAL")
+    n_unmet = sum(1 for r in dem_rows_out if r["Status"] == "UNMET")
+    tot_bld = sum(r["Planned_Units"] for r in dem_rows_out)
+    tot_dem = sum(r["Demand"]        for r in dem_rows_out)
+    kpi_pct = round(100 * tot_bld / tot_dem, 1) if tot_dem else 0.0
+    n_co_bld = sum(1 for r in bld_shift_rows if str(r.get("SKUCode","")).upper() in _SENTINEL)
+    footer = len(dem_rows_out) + 3
+    ws_dem.cell(row=footer,   column=1, value="KPI SUMMARY").font = Font(bold=True)
+    ws_dem.cell(row=footer+1, column=1, value="Total Customer Demand (units)")
+    ws_dem.cell(row=footer+1, column=2, value=tot_dem)
+    ws_dem.cell(row=footer+2, column=1, value="Total GT Built (units)")
+    ws_dem.cell(row=footer+2, column=2, value=tot_bld)
+    _kv = ws_dem.cell(row=footer+3, column=1, value="KPI — GT Built / Customer Demand")
+    _kv.font = Font(bold=True)
+    _kv2 = ws_dem.cell(row=footer+3, column=2, value=f"{kpi_pct}%")
+    _kv2.font = Font(bold=True)
+    ws_dem.cell(row=footer+5, column=1, value="Total SKUs in demand file")
+    ws_dem.cell(row=footer+5, column=2, value=len(dem_rows_out))
+    ws_dem.cell(row=footer+6, column=1, value="Fully Met (≥95% of demand built)")
+    ws_dem.cell(row=footer+6, column=2, value=n_full)
+    ws_dem.cell(row=footer+7, column=1, value="Partial (0 < built < 95%)")
+    ws_dem.cell(row=footer+7, column=2, value=n_part)
+    ws_dem.cell(row=footer+8, column=1, value="Unmet (0 built)")
+    ws_dem.cell(row=footer+8, column=2, value=n_unmet)
+    ws_dem.cell(row=footer+9, column=1, value="Total Building COs")
+    ws_dem.cell(row=footer+9, column=2, value=n_co_bld)
+    ws_dem.cell(row=footer+10, column=1, value=f"Curing COs scheduled (≤{MAX_CHANGEOVERS_PER_DAY}/day)")
+    ws_dem.cell(row=footer+10, column=2, value=len(bld_co_events))
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
@@ -469,6 +627,7 @@ def _write_rolling_curing_excel(
     curing_allowable: dict,        # {sku: [press_ids]}
     planning_days: int,
     plan_start: datetime,
+    df_day0: "pd.DataFrame | None" = None,  # Day 0 consumption (has Priority_Score, Category)
 ) -> None:
     """
     Write curing Excel matching the legacy bc_curing_b2c output.
@@ -499,6 +658,15 @@ def _write_rolling_curing_excel(
             c = ws.cell(row=row, column=ci, value=h)
             c.fill = _fill(bg); c.font = _bold(10, fg); c.alignment = _ctr()
 
+    # ── Build priority + category lookup from df_day0 ─────────────────────────
+    pri_map: dict[str, float] = {}
+    cat_map: dict[str, str]   = {}
+    if df_day0 is not None and not df_day0.empty:
+        for _, r in df_day0.iterrows():
+            s = str(r.get("SKUCode", "")).strip()
+            pri_map[s] = float(r.get("Priority_Score", 0) or 0)
+            cat_map[s] = str(r.get("Category", ""))
+
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     avail_mins = planning_days * 3 * SHIFT_MINS
@@ -522,7 +690,8 @@ def _write_rolling_curing_excel(
                    else "PARTIAL" if planned > 0
                    else ("NO DATA" if dem <= 0 else "UNMET"))
         rows_out.append({
-            "SKUCode": sku, "Priority": 1.0, "Demand": int(dem),
+            "SKUCode": sku, "Priority": round(pri_map.get(sku, 0.0), 4),
+            "Demand": int(dem),
             "GT_Inventory": int(opening_gt.get(sku, 0)),
             "Planned_Units": int(planned), "Gap": int(gap),
             "Fulfillment_Pct": pct, "Status": status,
@@ -614,10 +783,11 @@ def _write_rolling_curing_excel(
     for (press, sku), s in sorted(press_sku_stats.items()):
         if s["units"] == 0:
             continue
-        ct       = cure_ct_map.get(sku, DEFAULT_CURING_CT)
+        ct        = cure_ct_map.get(sku, DEFAULT_CURING_CT)
         days_used = s["mins_used"] / (3 * SHIFT_MINS) if s["mins_used"] else 0
         ms_rows.append({
             "Machine": press, "SKUCode": sku,
+            "Priority": round(pri_map.get(sku, 0.0), 4),
             "CycleTime_min": round(ct, 2),
             "Cycles": s["cycles"], "Units_Planned": s["units"],
             "Mins_Used": round(s["mins_used"]), "Days_Used": round(days_used, 2),
@@ -628,14 +798,14 @@ def _write_rolling_curing_excel(
     ws.cell(row=1, column=1,
             value=f"Press-SKU pairs: {len(ms_rows)}  |  Total Units: {tot_u:,}  |  Total Cycles: {tot_c:,}"
             ).font = _bold(10)
-    ms_cols = ["Machine", "SKUCode", "CycleTime_min", "Cycles",
-               "Units_Planned", "Mins_Used", "Days_Used"]
+    ms_cols = ["Machine", "SKUCode", "Priority", "CycleTime_min",
+               "Cycles", "Units_Planned", "Mins_Used", "Days_Used"]
     _hdr(ws, 2, ms_cols)
     for ri, r in enumerate(ms_rows, 3):
         for ci, h in enumerate(ms_cols, 1):
             ws.cell(row=ri, column=ci, value=r.get(h, "")).alignment = _ctr()
     ws.column_dimensions["A"].width = 12; ws.column_dimensions["B"].width = 34
-    for ltr in "CDEFG": ws.column_dimensions[ltr].width = 14
+    for ltr in "CDEFGH": ws.column_dimensions[ltr].width = 14
     ws.freeze_panes = "A3"
 
     # ── Sheet 6: Daily Cured tyres ────────────────────────────────────────────
@@ -684,6 +854,20 @@ def _write_rolling_curing_excel(
             if ci == 4: c.fill = fill
             c.alignment = _ctr()
         ri += 1
+    # Summary + note (matches curing_b2c.py format)
+    ws.cell(row=ri + 1, column=1, value="TOTAL").font = _bold(11)
+    total_built_diag  = sum(round(built_per_sku.get(s, 0)) for s in closing_gt_bal if closing_gt_bal[s] >= 0.5)
+    total_cured_diag  = sum(round(float(sku_cured.get(s, 0))) for s in closing_gt_bal if closing_gt_bal[s] >= 0.5)
+    total_bal_diag    = sum(round(closing_gt_bal[s]) for s in closing_gt_bal if closing_gt_bal[s] >= 0.5)
+    ws.cell(row=ri + 1, column=2, value=total_built_diag).font = _bold(11)
+    ws.cell(row=ri + 1, column=3, value=total_cured_diag).font = _bold(11)
+    tc = ws.cell(row=ri + 1, column=4, value=total_bal_diag)
+    tc.font = _bold(11); tc.fill = _fill(_RED)
+    note = ws.cell(row=ri + 3, column=1,
+        value=("NO_PRESS = built but no curing press (main gap cause)  |  "
+               "DEMAND_MET = carry-over to next month  |  "
+               "RESIDUAL = last-shift lag (next month opening inventory)"))
+    note.font = _bold(9)
     ws.column_dimensions["A"].width = 34
     for ltr in "BCDE": ws.column_dimensions[ltr].width = 16
 
@@ -759,12 +943,35 @@ def run_rolling_pipeline(
         sku_to_size = _etl.load_sku_sizes()
         sku_inch = {str(k): str(v).strip().replace('"', "") for k, v in sku_to_size.items()}
 
+        # Fallback: derive inch from characters 9–10 of SKU code (1-indexed) for
+        # any SKU missing from the size master.  E.g. "1325216814085SURL0"[8:10] = "14".
+        for _, row in df_allow.iterrows():
+            sku = str(row["SKUCode"])
+            if sku not in sku_inch or not sku_inch[sku]:
+                if len(sku) >= 10:
+                    sku_inch[sku] = sku[8:10]
+
+        # Hard-inch filter: restricts each machine to its dominant inch(es).
+        # Prevents carry-over locking: without this, a machine that does a diff_size_CO
+        # in Shift A gets locked onto the non-dominant inch for the rest of the month
+        # via machine_current_sku carry-over, starving dominant-inch SKUs.
+        # VMIMAXX inches confirmed from May 2026 plant inch-run study (CLAUDE.md §inch-run).
         _HARD = {
-            "7001":{"16"},       "6001":{"14"},        "7002":{"14"},   "7004":{"14"},
-            "6002":{"15"},       "7003":{"15"},        "6003":{"17","18"}, "6004":{"16"},
-            "7101":{"15"},       "7102":{"14","15"},   "7103":{"13"},   "7104":{"14","15"},
-            "7105":{"13"},       "7106":{"13"},        "7201":{"16"},
-            "7501":{"12"},       "7502":{"13"},        "7503":{"13"},
+            # VMIMAXX — dominant-inch locks (each machine serves its primary inch group)
+            "6001": {"14"},             # dom=14" — 3 machines share 14" (6001/7002/7004)
+            "6002": {"15"},             # dom=15" — 2 machines share 15" (6002/7003)
+            "6003": {"17", "18"},       # dom=17" — sole 17"/18" machine; serves HURL1/HRHT0
+            "6004": {"16"},             # dom=16" — 2 machines share 16" (6004/7001)
+            "7001": {"16"},             # dom=16"
+            "7002": {"14"},             # dom=14"
+            "7003": {"15"},             # dom=15"
+            "7004": {"14"},             # dom=14"
+            # BJ — no hard filter; dominant-inch preference via _MACHINE_DOMINANT_INCH + inch_penalty.
+            # Removing hard locks allows BJ machines to serve off-dominant SKUs in their
+            # allowable table (e.g. 7103 can produce HURL0 at 14" when 13" demand is met).
+            # UNI_NARROW — physically cannot run 14"+ (genuine hard constraint)
+            # 7501 dominant=12" but can also run 13" (confirmed allowable)
+            "7501":{"12","13"},  "7502":{"13"},        "7503":{"13"},
         }
         for idx, row in df_allow.iterrows():
             sku = str(row["SKUCode"]); si = sku_inch.get(sku, "")
@@ -820,6 +1027,17 @@ def run_rolling_pipeline(
     total_demand = sum(demand_dict.values())
     print(f"  [Rolling] Demand: {len(demand_dict)} SKUs, {total_demand:,.0f} units")
 
+    # Priority score for dynamic CO target selection (higher = serve first)
+    _prio_col = next(
+        (c for c in demand_df.columns if "Priority" in str(c) or "Score" in str(c)), None
+    )
+    priority_score_map: dict[str, float] = {}
+    if _prio_col:
+        priority_score_map = {
+            str(r[sku_col]): float(r[_prio_col] or 0)
+            for _, r in demand_df.iterrows() if pd.notna(r.get(_prio_col))
+        }
+
     # ── F: Machine current SKU ────────────────────────────────────────────────
     machine_current_sku: dict[str, str] = {}
     try:
@@ -847,6 +1065,19 @@ def run_rolling_pipeline(
     writeoff_total   = 0.0
     SHIFTS           = ["A", "B", "C"]
 
+    # ── Dynamic CO infrastructure ─────────────────────────────────────────────
+    # Tracks instant COs triggered when a press finishes its SKU demand mid-plan.
+    # CO starts in the SAME SHIFT demand is met (remaining time = CHANGEOVER).
+    # Next shift: PRODUCTION for new SKU (no MOULD_CLEAN).
+    # Key = press, value = (global_shift_idx_of_co_start, new_sku)
+    # global_shift_idx = (day − 1) × 3 + shift_idx  (A=0, B=1, C=2)
+    dynamic_co_tracker: dict[str, tuple[int, str]] = {}
+
+    # Track daily CO counts (pre-planned + dynamic combined) to enforce the cap.
+    daily_co_count: dict[int, int] = defaultdict(int)
+    for _dco_day, _dco_evs in co_by_day.items():
+        daily_co_count[_dco_day] += len(_dco_evs)
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
@@ -856,121 +1087,213 @@ def run_rolling_pipeline(
         date_str = date.strftime("%Y-%m-%d")
         today_cos = co_by_day.get(day, [])
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
+        # SKUs that curing presses are switching TO today — building must pre-build for these
+        co_target_skus_today: frozenset = frozenset(co_press_map.values())
 
-        # ── 1. Curing demand ─────────────────────────────────────────────
-        curing_demand: dict[str, float] = defaultdict(float)
-        for press, st in press_state.items():
-            if st["status"] != "RUNNING":
-                continue
-            sku = st["sku"]
-            ct  = cure_ct_map.get(sku, DEFAULT_CURING_CT)
-            if press in co_press_map:
-                new_sku = co_press_map[press]
-                new_ct  = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
-                curing_demand[new_sku] += _cure_qty_per_shift(new_ct) * 1  # Shift C only
-            else:
-                curing_demand[sku] += _cure_qty_per_shift(ct) * 3
-
-        # ── 2. Building assignment (Option B: projected GT) ───────────────
-        daily_plan = _assign_building_day(
-            curing_demand=dict(curing_demand),
-            machine_skus=machine_skus,
-            machine_current_sku=machine_current_sku,
-            sku_inch=sku_inch,
-            demand_remaining=demand_remaining,
-            gt_inventory=gt_inventory,
-        )
-
-        # ── 3. Distribute build across shifts + record CO events ──────────
-        bld_plan_by_shift: dict[tuple, list] = {(date_str, s): [] for s in SHIFTS}
-        for machine, campaigns in daily_plan.items():
-            prev_sku = machine_current_sku.get(machine, "")
-            prev_inch = sku_inch.get(prev_sku, "")
-            for sku, qty, co_type in campaigns:
-                # Insert building CO sentinel row (once, in Shift A)
-                if co_type != "start":
-                    co_mins = _co_cost(machine, prev_inch, sku_inch.get(sku, ""))
-                    bld_shift_rows.append({
-                        "Machine": machine, "Date": date_str, "Shift": "A",
-                        "SKUCode": "CHANGEOVER", "Qty": co_mins,
-                        "Machine_Group": _MACHINE_GROUP.get(machine, ""),
-                        "CO_Type": co_type,
-                    })
-                    bld_co_events.append({
-                        "Machine": machine, "Date": date_str,
-                        "Day": day, "CO_Day_Index": day,
-                        "From_SKU": prev_sku, "Target_SKU": sku,
-                        "CO_Type": co_type, "CO_Cost_Mins": co_mins,
-                        "Status": f"Rolling CO ({co_type})",
-                    })
-                # Distribute production across 3 shifts
-                qps = qty // 3; rem = qty - qps * 3
-                for s_idx, shift in enumerate(SHIFTS):
-                    q = qps + (1 if s_idx < rem else 0)
-                    if q > 0:
-                        bld_plan_by_shift[(date_str, shift)].append((machine, sku, q, co_type))
-                        bld_shift_rows.append({
-                            "Machine": machine, "Date": date_str, "Shift": shift,
-                            "SKUCode": sku, "Qty": q,
-                            "Machine_Group": _MACHINE_GROUP.get(machine, ""),
-                            "CO_Type": "production",
-                        })
-                prev_sku = sku; prev_inch = sku_inch.get(sku, "")
-            if campaigns:
-                machine_current_sku[machine] = campaigns[-1][0]
-                for sku, qty, _ in campaigns:
-                    if qty > 0:
-                        last_build_day[sku] = day
-
-        # ── 4. Per-shift simulation ───────────────────────────────────────
-        day_built: dict[str, float] = defaultdict(float)
-        day_cured_d: dict[str, float] = defaultdict(float)
+        # Per-shift simulation: build → cure for each shift independently.
+        # Building assignment runs once per shift (not once per day) so each
+        # shift's build plan reacts to the actual GT inventory and curing demand
+        # for that specific shift — matching the plant's actual scheduling approach.
+        day_built:    dict[str, float] = defaultdict(float)  # all machines (GT + carcass)
+        day_gt_built: dict[str, float] = defaultdict(float)  # GT machines only (no Stage-1)
+        day_cured_d:  dict[str, float] = defaultdict(float)
 
         for shift in SHIFTS:
             key = (date_str, shift)
             shift_bld: dict[str, int] = defaultdict(int)
             build_by_shift_sku[key] = shift_bld
 
-            # 4a. Building: add to GT inventory FIRST
-            for machine, sku, qty, co_type in bld_plan_by_shift.get(key, []):
-                gt_inventory[sku] += qty
-                day_built[sku]    += qty
-                shift_bld[sku]    += qty
+            # Global shift index: unique monotonic ID used by dynamic_co_tracker.
+            # (day−1)×3 + {A=0, B=1, C=2}
+            cur_shift_global = (day - 1) * 3 + SHIFTS.index(shift)
 
-            # 4b. Curing simulation
+            # ── 0. Apply dynamic CO transitions ──────────────────────────────
+            # When demand was met in shift X (CO started immediately), the press
+            # starts RUNNING for the new SKU from shift X+1 onwards.
+            for _press, (_co_idx, _new_sku) in list(dynamic_co_tracker.items()):
+                if cur_shift_global == _co_idx + 1:
+                    # CO used remaining time of shift _co_idx; press now produces.
+                    press_count[_new_sku] = press_count.get(_new_sku, 0) + 1
+                    press_state[_press]   = {"sku": _new_sku, "status": "RUNNING"}
+                    curing_allowable[_new_sku].append(_press)
+                    del dynamic_co_tracker[_press]
+
+            # ── 1. Per-shift curing demand (which SKUs need GT this shift) ──
+            shift_cure_demand: dict[str, float] = defaultdict(float)
+            for press, st in press_state.items():
+                if press in co_press_map:
+                    # Shift A = CHANGEOVER (idle); Shift B + C = PRODUCTION (no mould clean)
+                    if shift in ("B", "C"):
+                        new_sku = co_press_map[press]
+                        new_ct  = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
+                        shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
+                elif press in dynamic_co_tracker:
+                    # Dynamic CO: press already in CHANGEOVER this shift or started RUNNING
+                    # (RUNNING case handled by press_state update at top of shift).
+                    # No explicit demand signal needed — if RUNNING, press_state reflects it.
+                    pass
+                elif st["status"] == "RUNNING":
+                    sku = st["sku"]
+                    ct  = cure_ct_map.get(sku, DEFAULT_CURING_CT)
+                    shift_cure_demand[sku] += _cure_qty_per_shift(ct)
+
+            # Pre-build signal: in Shift A only, inject anticipated Shift C demand
+            # for CO target SKUs so building starts pre-building GT before the press
+            # fires up in Shift C.  Shift A build + Shift B continuation = 2 full
+            # shifts of GT buffer in inventory by the time the press starts Shift C.
+            # Injecting in BOTH A and B doubled the signal (2× demand for 1 press),
+            # diverting machines away from RI presses with real demand.
+            if shift == "A":
+                for new_sku in co_target_skus_today:
+                    new_ct = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
+                    shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
+
+            # ── 2. Building assignment for this shift ──────────────────────
+            # RI SKUs with a currently RUNNING press (not in CO transition) —
+            # used to identify starving RI SKUs (running press + zero GT).
+            ri_running_this_shift: frozenset = frozenset(
+                st["sku"]
+                for press, st in press_state.items()
+                if st["status"] == "RUNNING" and press not in co_press_map
+            )
+            shift_plan = _assign_building_shift(
+                shift_cure_demand=dict(shift_cure_demand),
+                machine_skus=machine_skus,
+                machine_current_sku=machine_current_sku,
+                sku_inch=sku_inch,
+                demand_remaining=demand_remaining,
+                gt_inventory=gt_inventory,
+                co_target_skus=co_target_skus_today,
+                allow_new_co=(shift == "A"),
+                ri_running_skus=ri_running_this_shift,
+            )
+
+            # ── 3. Add GT to inventory; record building rows + CO events ───
+            for machine, campaigns in shift_plan.items():
+                prev_sku  = machine_current_sku.get(machine, "")
+                prev_inch = sku_inch.get(prev_sku, "")
+                for sku, qty, co_type in campaigns:
+                    if co_type != "start":
+                        co_mins = _co_cost(machine, prev_inch, sku_inch.get(sku, ""))
+                        bld_shift_rows.append({
+                            "Machine":       machine,
+                            "Date":          date_str,
+                            "Shift":         shift,
+                            "SKUCode":       "CHANGEOVER",
+                            "Qty":           co_mins,
+                            "Machine_Group": _MACHINE_GROUP.get(machine, ""),
+                            "CO_Type":       co_type,
+                        })
+                        bld_co_events.append({
+                            "Machine":      machine,
+                            "Date":         date_str,
+                            "Shift":        shift,
+                            "Day":          day,
+                            "CO_Day_Index": day,
+                            "From_SKU":     prev_sku,
+                            "Target_SKU":   sku,
+                            "CO_Type":      co_type,
+                            "CO_Cost_Mins": co_mins,
+                            "Status":       f"Rolling CO ({co_type})",
+                        })
+                    bld_shift_rows.append({
+                        "Machine":       machine,
+                        "Date":          date_str,
+                        "Shift":         shift,
+                        "SKUCode":       sku,
+                        "Qty":           qty,
+                        "Machine_Group": _MACHINE_GROUP.get(machine, ""),
+                        "CO_Type":       "production",
+                    })
+                    # Stage-1 produces carcass (not GT) → carcass feeds Stage-2,
+                    # NOT curing presses.  Do NOT add to gt_inventory for Stage-1
+                    # machines; curing must only draw real GT (Stage-2 / Unistage / VMI / BJ).
+                    if machine not in _S1_MACHINES:
+                        gt_inventory[sku]   = gt_inventory.get(sku, 0.0) + qty
+                        day_gt_built[sku]  += qty
+                    day_built[sku]    += qty
+                    shift_bld[sku]    += qty
+                    if qty > 0:
+                        last_build_day[sku] = day
+                    prev_sku = sku; prev_inch = sku_inch.get(sku, "")
+                if campaigns:
+                    # Update current SKU at end of THIS SHIFT (not end of day)
+                    machine_current_sku[machine] = campaigns[-1][0]
+
+            # ── 4. Curing simulation ───────────────────────────────────────
             for press in sorted(press_state):
                 st  = press_state[press]
                 sku = st["sku"]
 
                 if press in co_press_map:
                     if shift == "A":
-                        status = "CHANGEOVER"
-                    elif shift == "B":
-                        status = "MOULD_CLEAN"
-                    else:
+                        status = "CHANGEOVER"      # CO shift: full shift idle
+                    else:                           # Shift B + C: production begins (no mould clean)
                         sku    = co_press_map[press]
                         status = "RUNNING"
+                elif press in dynamic_co_tracker:
+                    co_idx, _ = dynamic_co_tracker[press]
+                    if cur_shift_global == co_idx:
+                        status = "CHANGEOVER"      # CO started this shift (demand just met)
+                    else:
+                        status = st["status"]      # shouldn't occur; fallback
                 else:
                     status = st["status"]
 
-                ct      = cure_ct_map.get(sku, DEFAULT_CURING_CT)
-                cap     = _cure_qty_per_shift(ct)
+                ct       = cure_ct_map.get(sku, DEFAULT_CURING_CT)
+                cap      = _cure_qty_per_shift(ct)
                 gt_avail = max(0.0, gt_inventory.get(sku, 0.0))
 
                 if status == "RUNNING":
-                    cured = min(cap, int(gt_avail))
-                    gt_inventory[sku] = gt_avail - cured
-                    day_cured_d[sku] += cured
-                    sku_cured[sku]   += cured
+                    # Cap curing at remaining demand — never over-produce.
+                    demand_left = max(0.0, demand_remaining.get(sku, 0.0))
+                    cured = min(cap, int(gt_avail), int(demand_left))
+                    gt_inventory[sku]      = gt_avail - cured
+                    day_cured_d[sku]      += cured
+                    sku_cured[sku]        += cured
                     daily_cured[date_str] += cured
                     demand_remaining[sku]  = max(0.0, demand_remaining.get(sku, 0.0) - cured)
                     press_stats[press]["running_mins"] += SHIFT_MINS
                     press_stats[press]["skus"].add(sku)
                     press_stats[press]["cycles"] += cured // CURING_CAVITIES
                     press_stats[press]["units"]  += cured
-                    press_sku_stats[(press, sku)]["cycles"]   += cured // CURING_CAVITIES
-                    press_sku_stats[(press, sku)]["units"]    += cured
+                    press_sku_stats[(press, sku)]["cycles"]    += cured // CURING_CAVITIES
+                    press_sku_stats[(press, sku)]["units"]     += cured
                     press_sku_stats[(press, sku)]["mins_used"] += SHIFT_MINS
+
+                    # ── Instant CO when demand is met ─────────────────────────
+                    # Demand just hit 0: CO starts immediately (remaining shift
+                    # time = CHANGEOVER).  Next shift = PRODUCTION for new SKU.
+                    # Conditions: no pre-planned CO today, not already in a
+                    # dynamic CO, and no pre-planned CO tomorrow (avoid conflict).
+                    if (demand_remaining.get(sku, 0.0) <= 0
+                            and press not in co_press_map
+                            and press not in dynamic_co_tracker):
+                        _next_day_cos = {p for p, _, _ in co_by_day.get(day + 1, [])}
+                        if press not in _next_day_cos:
+                            _slots_left = MAX_CHANGEOVERS_PER_DAY - daily_co_count[day]
+                            if _slots_left > 0:
+                                _horizon_left = planning_days - day + 1
+                                _already = set(dynamic_co_tracker[p][1]
+                                               for p in dynamic_co_tracker)
+                                _target = _select_dynamic_co_target(
+                                    sku, demand_remaining, press_count,
+                                    cure_ct_map, priority_score_map,
+                                    gt_inventory, _horizon_left, _already,
+                                )
+                                if _target is not None:
+                                    # CO starts now (cur_shift_global); next shift = RUNNING
+                                    press_count[sku] = max(
+                                        0, press_count.get(sku, 0) - 1
+                                    )
+                                    dynamic_co_tracker[press] = (cur_shift_global, _target)
+                                    daily_co_count[day] += 1
+                                    print(
+                                        f"    [DynCO] Day {day} Shift {shift}: "
+                                        f"press {press} {sku}→{_target} "
+                                        f"(slot {MAX_CHANGEOVERS_PER_DAY - _slots_left + 1}"
+                                        f"/{MAX_CHANGEOVERS_PER_DAY})"
+                                    )
                 else:
                     cured = 0
                     if status == "CHANGEOVER":
@@ -979,17 +1302,17 @@ def run_rolling_pipeline(
                         press_stats[press]["clean_mins"] += SHIFT_MINS
 
                 cure_shift_rows.append({
-                    "Date":         date_str,
-                    "Shift":        shift,
-                    "Machine":      press,
-                    "SKUCode":      sku,
-                    "StartTime":    SHIFT_STARTS.get(shift, ""),
-                    "EndTime":      SHIFT_ENDS.get(shift, ""),
-                    "Qty":          cured,
+                    "Date":          date_str,
+                    "Shift":         shift,
+                    "Machine":       press,
+                    "SKUCode":       sku,
+                    "StartTime":     SHIFT_STARTS.get(shift, ""),
+                    "EndTime":       SHIFT_ENDS.get(shift, ""),
+                    "Qty":           cured,
                     "CycleTime_min": round(ct, 1),
-                    "GT_Inventory": int(round(gt_avail)),
-                    "Remarks":      status if status != "RUNNING" else "",
-                    "_status":      status,
+                    "GT_Inventory":  int(round(gt_avail)),
+                    "Remarks":       status if status != "RUNNING" else "",
+                    "_status":       status,
                 })
 
         # ── 5. GT shelf-life writeoff ─────────────────────────────────────
@@ -1003,18 +1326,20 @@ def run_rolling_pipeline(
             press_state[press]   = {"sku": new_sku, "status": "RUNNING"}
             curing_allowable[new_sku].append(press)
 
-        # Daily summary
-        d_built = sum(day_built.values()); d_cured = sum(day_cured_d.values())
-        n_active = sum(1 for st in press_state.values() if st["status"] == "RUNNING")
-        dem_met  = total_demand - sum(max(0, v) for v in demand_remaining.values())
-        cov      = dem_met / total_demand * 100 if total_demand > 0 else 0
+        # Daily summary — report GT-only (not carcass) for "built" KPI
+        d_gt_built = sum(day_gt_built.values())  # real GT (excludes Stage-1 carcass)
+        d_built    = sum(day_built.values())      # all machines (for internal tracking)
+        d_cured    = sum(day_cured_d.values())
+        n_active   = sum(1 for st in press_state.values() if st["status"] == "RUNNING")
+        dem_met    = total_demand - sum(max(0, v) for v in demand_remaining.values())
+        cov        = dem_met / total_demand * 100 if total_demand > 0 else 0
         if day % 5 == 0 or day == 1 or day == planning_days:
-            print(f"  Day {day:2d} | built {d_built:6,.0f} | cured {d_cured:6,.0f} | "
+            print(f"  Day {day:2d} | built {d_gt_built:6,.0f} | cured {d_cured:6,.0f} | "
                   f"presses {n_active} | COs {len(today_cos)} | "
                   f"writeoff {day_writeoff:,.0f} | coverage {cov:.1f}%")
         daily_summary.append({
             "Day": day, "Date": date_str,
-            "GT_Built": int(round(d_built)), "GT_Cured": int(round(d_cured)),
+            "GT_Built": int(round(d_gt_built)), "GT_Cured": int(round(d_cured)),
             "GT_Writeoff": int(round(day_writeoff)),
             "Active_Presses": n_active, "COs_Today": len(today_cos),
             "Demand_Coverage": round(cov, 2),
@@ -1067,6 +1392,7 @@ def run_rolling_pipeline(
         curing_allowable  = dict(curing_allowable),
         planning_days     = planning_days,
         plan_start        = plan_start,
+        df_day0           = df_day0,
     )
 
     return {

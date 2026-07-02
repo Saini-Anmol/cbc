@@ -84,7 +84,7 @@ Maximum 4× boost for SKUs where `current_days ≥ 3 × planning_horizon`.
 1. **Demand cap is sacred.** Total GT built for any SKU ≤ `Demand_Qty`. Enforced
    in three layers: `_gt_remaining` tracker, daily `cur_mat` clip, LP ceiling
    constraint. Any proposed change must preserve these.
-2. **Curing press changeover cap** is configurable via `MAX_CHANGEOVERS_PER_DAY` in `bc.py` USER SETTINGS (currently **9/day**). Building machine changeovers have NO cap.
+2. **Curing press changeover cap** is configurable via `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` (currently **10/day**). Building machine changeovers have NO cap.
 3. **Stage-2 cannot run without Stage-1 carcass** (same shift or S-1 preferred).
    Unistage machines have no Stage-1 dependency.
 4. **No waste GT.** Building output ≤ curing consumption. In B2C, this is
@@ -102,6 +102,13 @@ Each curing press holds **2 moulds simultaneously**, each with **2 cavities** �
 event** — mould clean is absorbed into the CO window (Shift A = CO, Shift B =
 Mould Clean). The scheduler does not need to track cycle counts or trigger
 mould-clean events independently.
+
+**LH / RH press labelling:** Each physical curing press appears as two rows in
+`testing_Daily_Running_Moulds` — one with suffix `LH` (left-hand mould) and one
+with `RH` (right-hand mould). They are the same press. `load_running_moulds()`
+strips the suffix (`WCNAME_clean = WCNAME.replace(r"(LH|RH)$", "")`) and groups
+both rows into a single press record keyed by the numeric press label (e.g.
+`"75206"`). CO events and press_state always use this clean numeric key.
 
 ### Changeover timing — building MUST start simultaneously with curing CO
 
@@ -131,10 +138,12 @@ This applies to ALL changeover types:
 - Runner-In press freed after demand fulfilled, switching to NRI SKU (Phase 2b)
 - Any NRI SKU assigned a curing press (Phase 1b)
 
-**Implementation note:** Phase 2b currently sets building start to Shift B of
-Day D. This should be corrected to Shift A of Day D. The `active_press_count`
-update for the new SKU (`+= 1` from Shift C) is unchanged — only the building
-machine start time moves earlier.
+**Implementation (rolling pipeline):** `co_target_skus_today = frozenset(co_press_map.values())`.
+In **Shift A only**, `shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)` is injected
+for every CO target SKU. This creates a positive deficit that `_assign_building_shift` responds
+to, starting GT production immediately. Shift B continues naturally (inventory now exists).
+**Do not inject in Shift B** — double injection creates 2× demand signal for a single press,
+diverting machines away from RI presses that have genuine Shift B curing demand.
 
 ---
 
@@ -199,35 +208,46 @@ UNISTAGE     | 7501, 7502, 7503     | 12", 13" ONLY    | HARD — never assign 1
 **Root cause of 7001–7004 low utilisation (25–28%):** each machine runs 5–7 different
 inches → 30–32 COs/month → 45% time in CO. Fix: restrict each to its dominant inch.
 
-## Hard Per-Machine Inch Locking (`_MACHINE_HARD_INCH`) — IMPLEMENTED
+## Inch Locking Policy — Two-tier approach
 
-Each machine is hard-locked to its dominant inch(es) in `building_b2c.py`.
-Applied AFTER `_UNISTAGE_INCH_POLICY` group filter, BEFORE heuristic assigner.
+### Tier 1: Hard filter (`_MACHINE_HARD_INCH` in `building_b2c.py`, `_HARD` in `b2c_pipeline.py`)
 
-| Machine | Hard-locked inches | Reason |
-|---------|-------------------|--------|
-| 7001 | 16" only | Strict {16} — same elig_count as 6004/7201 so TIER-3 does not deprioritise it |
-| 7002 | 14" only | Dominant; prevents 15" overflow eating 14" capacity |
-| 7004 | 14" only | Dominant |
-| 6001 | 14" only | Dominant; was getting 3% util when wrong-inch SKUs assigned |
-| 6002 | 15" only | Dominant |
-| 7003 | 15" only | Dominant |
-| 6003 | 17"/18" only | Dominant |
-| 6004 | 16" only | Dominant |
+Applied ONLY to BJ and UNI_NARROW groups where genuine physical constraints exist.
+**VMIMAXX (6001–6004, 7001–7004) is NOT hard-filtered** — the group officially handles
+14"–18" per plant policy, and the allowable table (`Master_Building_Allowable_Machines_source`)
+is the authority for individual SKU assignments within that range. Using a hard filter for
+VMIMAXX wrongly blocked legitimate assignments (e.g. all 8 VMIMAXX machines allowable for
+certain 15" SKUs but the filter was only passing 6002 and 7003).
+
+| Machine | Hard filter | Reason |
+|---------|------------|--------|
 | 7101 | 15" only | Dominant |
-| 7102 | 14"/15" | 14" kept — only BJ machine for 2 BJ-exclusive 14" RI SKUs |
+| 7102 | 14"/15" | 14" for 2 BJ-exclusive RI SKUs |
 | 7103 | 13" only | Dominant |
-| 7104 | 14"/15" | 14" kept — only BJ machine for 2 BJ-exclusive 14" RI SKUs |
+| 7104 | 14"/15" | 14" for 2 BJ-exclusive RI SKUs |
 | 7105 | 13" only | Dominant |
 | 7106 | 13" only | Dominant |
 | 7201 | 16" only | Dominant |
-| 7501 | 12" only | Hard (was already 97% dominant) |
-| 7502 | 13" only | Hard (was already 100% dominant) |
-| 7503 | 13" only | Hard (was already 100% dominant) |
+| 7501 | 12"/13" | Confirmed allowable for 13" SKUs (extended from 12"-only) |
+| 7502 | 13" only | Hard |
+| 7503 | 13" only | Hard |
 
-**BJ 14" note:** Two RI SKUs (1325218614088HURL0, 1325217514082TVECH) are exclusively
-eligible on BJ machines and are 14". BJ group policy expanded to include 14" to prevent
-zero-machine assignment for these SKUs. 7102 and 7104 carry the 14" load within BJ.
+### Tier 2: Dominant-inch preference (`_MACHINE_DOMINANT_INCH` in `b2c_pipeline.py`)
+
+For VMIMAXX (and all other machines), CO candidates are sorted with `inch_penalty`:
+- `inch_penalty = 0` if target SKU's inch == machine's dominant inch (preferred)
+- `inch_penalty = 1` if different inch (still allowed if in allowable table)
+
+This gives dominant-inch routing without hard-blocking legitimate assignments from the
+allowable table. Sort key within each CO bucket: `(−deficit, inch_penalty, revisit_penalty, co_cost)`.
+
+**SKU inch derivation:** if a SKU is missing from the size master, inch is derived from
+`sku_code[8:10]` (characters 9–10, 1-indexed). E.g. `"1325216814085SURL0"[8:10] = "14"`.
+
+**DB state (updated):**
+- `1325215513073TUHL0` (13"): inserted with machines 7501, 7502, 7503
+- `1325216814085SURL0` (14"): already in DB with VMIMAXX machines; was broken only because inch was unknown — now derived from SKU code
+- `1325218415084TTMX0` (15"): inserted with all 8 VMIMAXX machines
 
 ## CO target urgency score — two-level priority
 
@@ -366,13 +386,19 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 | Starvation events (Mode B) | Physical constraint — too few building machines for SKU's curing volume | **Structural:** true fix = Phase 4 (Curing Derivation; implemented in `curing_b2c.py`) |
 | Starvation events (Mode C) | NRI CO timing — 2-shift buffer sometimes insufficient | **Fixed:** NRI front-loading 70/30 in `_make_synthetic_curing()` |
 | 21 UNMET NRI SKUs | No CO scheduled in main loop (no free compatible press) | **Fixed:** CO Rescue pass (spare-press donation) in `curing_consumption_dynamic.py` |
-| 7001/7002 utilisation (was 25–28%) | Cross-inch SKU assignment + history bias | **Fixed:** `_MACHINE_HARD_INCH` dominant-inch lock + demand-minutes round-robin in heuristic. New util: 7001≈45%, 7002≈46% |
+| 7001/7002 utilisation (was 25–28%) | Cross-inch SKU assignment + history bias | **Fixed:** `_MACHINE_DOMINANT_INCH` preference in rolling pipeline + `_MACHINE_HARD_INCH` in legacy. New util: 7001≈45%, 7002≈46% |
 | Stage-1 util <33% | Structural (15 machines for 11.5-equiv demand) | By design; not a bug |
-| Demand skew: BJ oversubscribed | 249,633 BJ-bucket demand vs ~184–200k BJ capacity | Structural — needs more BJ presses or VMI certification of BJ SKUs. Gap of ~20k is permanent in scheduler. |
-| NRI SKUs with zero production | No allowable machine, or CO deferred past horizon | Logged per SKU; edge case table §18.4 in bc.md |
-| Day-2+ LP idle | Was LP cap collapse; fixed with OVERBUILD_BUFFER_FRAC=0.2 + TOPUP_LOOKAHEAD_DAYS_GT=3 | Fixed in current code |
-| Curing ~67k below building output | CO over-aggressiveness: RI presses CO'd to NRI before RI demand fulfilled (3 of 4 presses gone by Day 3) | **Open:** fix in `curing_consumption_dynamic.py` — before CO'ing an RI press, verify `remaining_demand / ((n-1) × rate_per_day) ≤ planning_horizon` |
-| Curing press IDs were 30 presses short | `_load_press_state` used `wcID` instead of `WCNAME_clean`; 30 presses had no WC Master match → dropped | **Fixed:** `curing_b2c.py` now uses `WCNAME_clean` (e.g. "75206") as press key; 167 presses loaded |
+| Demand skew: BJ oversubscribed | BJ demand vs ~184–200k BJ capacity | Structural — needs more BJ presses or VMI certification of BJ SKUs |
+| NRI SKUs with zero production | No allowable machine, or CO deferred past horizon | 3 SKUs fixed (DB insert + inch derivation). Remainder logged per SKU. |
+| Rolling pipeline KPI < 565k | RC1: `demand_remaining` check locked Shifts B/C → ~85% idle. RC2: double pre-build signal diverted machines from RI presses | **Fixed:** RC1 = `_deficit(cur_sku) <= 0` (this shift's gap, not horizon demand). RC2 = Shift A injection only. |
+| 3 SKUs missing allowable building machines | Not in DB / inch unknown → filtered out | **Fixed:** inserted `1325215513073TUHL0` (7501–7503) and `1325218415084TTMX0` (VMIMAXX). Inch fallback = `sku[8:10]`. |
+| VMIMAXX machines wrongly blocked for off-dominant-inch SKUs | Hard-inch filter removed 6001/6004/7001/7002/7004 from 15" SKU assignments | **Fixed:** VMIMAXX removed from `_HARD` filter. Allowable table governs; `inch_penalty` in CO sort provides dominant-inch preference. |
+| 7501 wrongly blocked for 13" SKUs | Hard filter had `7501:{"12"}` only | **Fixed:** expanded to `{"12","13"}` — confirmed allowable per plant data. |
+| Curing press IDs were 30 presses short | `_load_press_state` used `wcID` instead of `WCNAME_clean` | **Fixed:** `curing_b2c.py` uses `WCNAME_clean` (e.g. "75206"). LH/RH stripped in `load_running_moulds`. |
+| Curing ~67k below building output | CO over-aggressiveness: RI presses CO'd before demand fulfilled | **Fixed:** guard added in main CO loop of `curing_consumption_dynamic.py` (line ~339): skip CO if `remaining_demand / ((n-1) × rate) > horizon_left`. Rescue pass already had this guard; main loop now consistent. |
+| HURL0 zero production | Only machine 7102 eligible after `_HARD` filter (HURL0 is 14"; 7104 missing from DB allowable list). 7102 fully occupied by 15" primary SKU — diff_size_CO (90 min) exceeds 30% CO guard so 7102 can never reach HURL0 in Campaign 2. | **Data fix needed:** add machine 7104 to `Master_Building_Allowable_Machines_source` for SKU `1325218614088HURL0`. 7104 has `_HARD={"14","15"}` — would pass the filter once inserted. Both 7102 and 7104 are "the 2 BJ-exclusive 14" RI SKU machines" per CLAUDE.md; HURL0 is missing 7104 in DB. |
+| TVECE partial production (3,945 remaining of 4,097 demand) | Only 7102 + 7104 eligible. BJ structural oversubscription (249k demand / 184k capacity = 136%) leaves little spare time for TVECE (14") after 15" primary SKU campaigns. | Structural — cannot close without more BJ capacity or VMI certification. Currently gets limited Shift B/C spillover. |
+| Rolling pipeline starvation events (~4,800) | Pre-existing consequence of BJ oversubscription — building physically cannot supply all BJ presses at full rate. Not caused by any scheduling change. | Pre-existing baseline. Reduced as overall coverage improves. |
 
 ---
 
@@ -382,15 +408,16 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 
 | Parameter | Current value | What it controls |
 |-----------|--------------|-----------------|
-| `MIN_CAMPAIGN_MINS` | **120 min** | Shortest allowed production run. Base value in `building.py` is 45; raised to 120 to prevent CO explosion when many NRI SKUs activate simultaneously. |
+| `MIN_CAMPAIGN_MINS` | **60 min** | Shortest allowed production run. Base value in `building.py` is 45; raised to 60 to allow 1–2 press SKUs (64–128 min/shift demand on fast VMI machines). Was 120 — too conservative, blocked any SKU with ≤2 presses from being served. |
 | `MIN_CAMPAIGN_UNITS` | 40 | Minimum units per campaign. |
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. Was incorrectly set to 1 (cost 7–10k GT); fixed. |
-| `MAX_CHANGEOVERS_PER_DAY` | **8** | Curing CO cap per calendar day. 8 = baseline (effective at commit 75eec34). 10 activates more NRI SKUs simultaneously → more building CO overhead → net −7k GT. **Single source of truth in `bc_config.py`** — propagates automatically to all pipeline files. |
-| `CO_CLASS_FILTER` | **Class A only** | COScheduler fires only Class A (critical: `current_days > horizon_left`) COs. Class B (helpful) skipped. |
-| `PRE_START_SHIFTS` | **2** | Building pre-starts N shifts before plan_start. 2 = Apr 30 Shift B (15:00). Pre-start GT is credited to curing simulation's opening balance by `curing_b2c.py`. |
-| `BUILD_LEAD_SHIFTS` | **3** (= 1 full day) | Building targets curing demand this many shifts ahead. |
-| `GT_SHELF_LIFE_DAYS` | 3 | TopUp won't pre-build GT more than 3 days ahead. Must equal `TOPUP_LOOKAHEAD_DAYS_GT`. |
+| `MAX_CHANGEOVERS_PER_DAY` | **10** | Curing CO cap per calendar day. **Single source of truth in `bc_config.py`** — propagates automatically to all pipeline files. Lower values (8) reduce NRI SKU activation rate; higher values (10) activate more NRI SKUs but increase building CO overhead. |
+| `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: how many curing shifts of GT to pre-build as a buffer. 2 = build today's + 1 extra shift so sibling machines (e.g. 6004 + 7001 on 16") both see non-zero deficit and share the demand. VMI uses 2; BJ/UNI/STAGE use 1. |
+| `CO_CLASS_FILTER` | **Class A only** | COScheduler fires only Class A (critical: `current_days > horizon_left`) COs. Class B (helpful) skipped to avoid CO explosion from premature NRI activation. |
+| `PRE_START_SHIFTS` | **2** | Building pre-starts N shifts before plan_start. 2 = Apr 30 Shift B (15:00). Pre-start GT credited to curing simulation's opening balance by `curing_b2c.py`. |
+| `BUILD_LEAD_SHIFTS` | **3** (= 1 full day) | Legacy pipeline: building targets curing demand this many shifts ahead. Rolling pipeline: not applicable (simultaneous build + cure per shift). |
+| `GT_SHELF_LIFE_DAYS` | 3 | GT cannot sit >3 days before curing (plant rule). Must equal `TOPUP_LOOKAHEAD_DAYS_GT`. |
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | Stage-1 carcass shelf life: 1 day. |
 | `Stage-2 CO time multiplier` | **2.0×** (applied in `building.py`) | Stage-2 `co_time_map` uses `diff × 2.0` (88 min → 176 min) to discourage LP from overloading Stage-2 with SKU switches. |
 
@@ -398,8 +425,8 @@ starvation events. The curing output (520k May 2026) is now GT-limited, not pres
 
 ## Pipeline execution order
 
-> **NEW ARCHITECTURE (approved, not yet implemented):** Day-by-day rolling loop.
-> The current 3-step sequential pipeline is the LEGACY approach. Full spec in `approach/bc.md` §19.
+> **ROLLING PIPELINE IS THE DEFAULT** (`python b2c_pipeline.py`). The 3-step legacy pipeline is available via `--legacy` flag.
+> Full spec in `approach/bc.md` §19.
 
 ### Legacy pipeline (--legacy flag — run: `python b2c_pipeline.py --legacy`)
 
@@ -428,10 +455,27 @@ Step 3: curing_b2c.py  [ACTIVE — Phase 4 implemented]
   → Output: bc_curing_b2c.xlsx (6 sheets)
 ```
 
-### Rolling pipeline (NEW DEFAULT — run: `python b2c_pipeline.py`)
+### Rolling pipeline (DEFAULT — run: `python b2c_pipeline.py`)
 
-**Architecture:** Day-by-day loop — building and curing planned simultaneously from actual state.
-No synthetic 31-day curing plan. Gap between building and curing collapses to CO windows only.
+**Architecture:** Per-shift loop — building assignment runs once per shift (A, B, C), reacting to
+that shift's actual curing press state. Curing and building are simulated simultaneously shift-by-shift.
+No synthetic 31-day plan. Confirmed matches the plant's actual scheduling practice (plant schedule
+09.04.2026 shows 17 of 24 GT machines run 2–3 campaigns per shift with intra-shift COs).
+
+**Key function: `_assign_building_shift` in `b2c_pipeline.py`**
+- Time budget: SHIFT_MINS (480 min) — NOT 3 × SHIFT_MINS
+- Max COs: MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT (2 per shift)
+- Deficit signal: `shift_cure_demand[sku]` — presses running THIS SHIFT only, plus pre-build signal for CO target SKUs in Shifts A/B
+- machine_current_sku updated at END of EACH shift (carries over to next shift)
+- Same-inch CO tried before diff-inch CO; dominant inch preferred within each bucket
+- Shift B/C CO restriction: machine stays on its primary SKU unless demand is 0 or curing CO forces a switch
+
+**Parameters added to `_assign_building_shift`:**
+- `co_target_skus: frozenset` — SKUs that curing presses are switching to today (from `co_press_map`); building must pre-build these even in Shifts B/C
+- `allow_new_co: bool` — `True` for Shift A (machine free to pick any eligible SKU), `False` for Shifts B/C (restricted to CO only when current demand done, target is in `co_target_skus`, or target is a starving RI)
+- `ri_running_skus: frozenset` — SKUs with curing presses in RUNNING state this shift (not in CO). Used to compute `starving_ri` (running press + zero GT inventory + demand > 0). Starving RI SKUs bypass the Shift B/C CO restriction so machines can redirect to feed a starving press mid-shift.
+
+**`_MACHINE_DOMINANT_INCH` (module-level dict in `b2c_pipeline.py`):** per-machine preferred inch used to sort CO candidates — dominant-inch SKUs (`inch_penalty=0`) sort before non-dominant (`inch_penalty=1`) within same_cands and diff_cands buckets. This replaces the old history-based TIER 4 bias.
 
 ```
 Pre-computation (once):
@@ -443,62 +487,74 @@ Pre-computation (once):
   Demand         → demand file
 
 for Day D in 1..31:
+  co_target_skus = {new_sku for each curing CO on Day D}
 
-  Step 1 — Curing demand for Day D
-    curing_demand[sku] = press_count[sku] × qty_per_shift × shifts_active
-    (CO presses: Shift A=CHANGEOVER, Shift B=MOULD_CLEAN → Shift C only = 1 shift)
+  for Shift S in [A, B, C]:
 
-  Step 2 — GT deficit
-    deficit[sku] = max(0, curing_demand[sku] × GT_BUFFER_SHIFTS − gt_inventory[sku])
-    capped at demand_remaining[sku]
+    Step 1 — Per-shift curing demand
+      shift_cure_demand[sku] = sum over presses in RUNNING state for shift S
+        (CO presses: Shift A=CHANGEOVER, B=MOULD_CLEAN → contribute 0;
+                     Shift C only: new_sku gets 1 shift of demand)
+      Pre-build signal (Shifts A and B only):
+        for each new_sku in co_target_skus:
+          shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
+        → Building sees a positive deficit for CO target SKUs in A/B and starts
+          pre-building GT before the curing press fires up in Shift C
 
-  Step 3 — Greedy building assignment (_assign_building_day)
-    For each machine M:
-      1. Serve current SKU first (no CO cost)
-      2. CO to next-highest-deficit eligible SKU if:
-           CO_cost ≤ 20% remaining shift time
-           AND remaining_after_CO ≥ MIN_CAMPAIGN_MINS
-           prefer same_size_CO (20 min VMI, 45 min BJ)
-      3. Max 2 COs per shift × 3 shifts = 6 per day
+    Step 2 — Greedy building assignment (_assign_building_shift)
+      allow_new_co = (Shift == "A")
+      For each machine M (VMI first, then BJ, Unistage, Stage2, Stage1):
+        dom_inch = _MACHINE_DOMINANT_INCH[M]  (e.g. 7001→16", 7002→14")
+        Campaign 1: serve current SKU (no CO cost)
+        Campaign 2+: CO to deficit SKUs, same-inch first (dominant inch preferred):
+          Shift A: any eligible SKU with deficit
+          Shifts B/C: only if cur_sku demand == 0 OR target ∈ co_target_skus OR target ∈ starving_ri
+          guard: CO_cost ≤ 30% remaining AND remaining_after_CO ≥ MIN_CAMPAIGN_MINS
+          max 2 COs per shift (MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT)
+      Returns: {machine: [(sku, qty, co_type)]}
 
-  Step 4 — Distribute build across shifts (evenly: qty // 3 per shift)
+    Step 3 — Add building GT to inventory; record shift rows + CO events
+      gt_inventory[sku] += qty_built
+      machine_current_sku[machine] = last_sku_in_shift   ← updated per-shift
 
-  Step 5 — Per-shift simulation (A, B, C):
-    gt_inventory[sku] += build_this_shift[sku]     # GT added at start of shift
-    for each press:
-      RUNNING:       cured = min(capacity, gt_available); gt_inventory -= cured
-      CHANGEOVER/
-      MOULD_CLEAN:   press idle (CO day Shift A/B)
+    Step 4 — Curing simulation
+      for each press:
+        RUNNING:     cured = min(capacity, gt_available); gt_inventory -= cured
+        CHANGEOVER/MOULD_CLEAN: press idle
 
-  Step 6 — Update state:
-    press_count[old_sku] -= 1; press_count[new_sku] += 1
-    press_state[press] = {sku: new_sku, status: RUNNING}
-    machine_current_sku[machine] = last_sku_produced
+  End of day: apply CO transitions (press_state updated after all 3 shifts)
 ```
 
 **Key differences from legacy:**
 
 | Property | Legacy | Rolling |
 |----------|--------|---------|
-| Building plan | 31-day LP upfront | Greedy per-day from actual state |
-| Curing target | Synthetic 31-day plan | Actual press_count × qty_per_shift |
+| Building plan | 31-day LP upfront | Greedy per-SHIFT from actual press state |
+| Assignment granularity | Per-day (then distributed evenly × 3) | Per-shift (reacts to each shift's actual demand) |
+| Curing target | Synthetic 31-day plan | Actual press_count × qty_per_shift per shift |
 | GT buffer | TOPUP_LOOKAHEAD_DAYS_GT = 3 days | GT_BUFFER_SHIFTS = 1 shift |
-| Building CO | LP penalty discourage | Dynamic: only when deficit exists |
-| Starvation | Possible (synthetic plan mismatch) | Impossible by construction |
-| Building-curing gap | 60-70k (surplus inventory) | CO windows only (~2 shifts/CO event) |
+| Building CO (Shift A) | LP penalty discourage | Free to pick any eligible SKU; same-inch + dominant inch preferred |
+| Building CO (Shifts B/C) | Unrestricted | Restricted: only when cur demand=0 or curing CO forces it |
+| Primary SKU per day | No concept | Machine locks to Shift A choice in Shifts B/C |
+| CO target pre-build | Separate pre-start mechanism | Injected into shift_cure_demand in Shifts A/B |
+| machine_current_sku | Updated end of day | Updated end of EACH SHIFT |
+| Starvation | Possible (synthetic plan mismatch) | Near-zero by construction |
+| Plant match | N/A | Confirmed matches 09.04.2026 plant schedule pattern |
 
 ### In-shift building CO pattern (confirmed from plant data)
 
-One VMI building machine runs 2 same-inch SKUs per day with 1 same_size_CO:
+One primary SKU per machine per day. Shift A selects the anchor (dominant inch first). Shifts B/C continue on that anchor; COs in B/C only when the anchor's demand is 0 or a curing CO forces a switch:
 
 ```
-Machine 7001 (16"):
-  Campaign 1: 195/55 R16  ──[same_size_CO 20 min]──►  Campaign 2: 215/60 R16
-              ↓                                                     ↓
-  Feeds presses running 195/55 R16                  Feeds presses running 215/60 R16
+Machine 7001 (dominant 16"):
+  Shift A: picks 195/55 R16 (highest-deficit 16" SKU) as anchor
+           ──[same_size_CO 20 min]──►  215/60 R16 (if 2nd 16" press group has deficit)
+  Shift B: continues 195/55 R16 anchor (demand > 0, no CO target forcing switch)
+  Shift C: continues 195/55 R16 anchor
 
-Machine 7002 (14"):
-  Campaign 1: 165/80 R14 TOURING  ──[same_size_CO 20 min]──►  Campaign 2: 165/80 R14 TAXI MAX
+Machine 7002 (dominant 14"):
+  Shift A: 165/80 R14 TOURING ──[same_size_CO 20 min]──► 165/80 R14 TAXI MAX
+  Shift B: continues 165/80 R14 TOURING (same logic)
 ```
 
 CO math per shift for VMI same-inch (plant currently avg 0.57 CO/shift/machine):
@@ -589,13 +645,19 @@ Example: SKU with demand 18,913, 4 presses, 4×56×3 = 672/day capacity. CO'ing 
 by Day 3 leaves 1 press (56×3×31 = 5,208 capacity) — far below 18,913. Result: 12,919 GT
 sits uncured at month end.
 
-**Fix required in `curing_consumption_dynamic.py`:** Before CO'ing an RI press, check:
+**Fix implemented in `curing_consumption_dynamic.py` (main CO loop, line ~339):**
+```python
+if old_sku in ri_skus:
+    n_remaining = press_count.get(old_sku, 0) - 1
+    rem_old = updated_demand.get(old_sku, 0)
+    if rem_old > 0 and n_remaining > 0:
+        rate_old = _qty_per_press_per_day(ct_map.get(old_sku, DEFAULT_CT))
+        if rate_old > 0 and rem_old / (n_remaining * rate_old) > horizon_left:
+            continue  # remaining presses cannot cover old_sku demand
 ```
-if remaining_demand / ((current_press_count - 1) × rate_per_day) > planning_days:
-    do NOT CO this press
-```
-This ensures the remaining n-1 presses can still cover the RI SKU's demand before allocating
-the freed press to an NRI SKU.
+The rescue pass already had an equivalent guard using original `demand_map` values and
+capacity accounting; the main loop now applies the same protection. Both guards together
+ensure no RI press is CO'd unless remaining presses can still fulfill the RI SKU's demand.
 
 ---
 
@@ -630,7 +692,7 @@ Exclusive demand assignment: each SKU counted once in highest-priority eligible 
 | UNI\_NARROW | 3 | 7 | 56,717 | 44,193 | 12,524 | 77.9% | 58.4% |
 | STAGE2 | 6 | 14 | 89,549 | 85,684 | 3,865 | 95.7% | 81.2% |
 | No machine data | — | 7 | 59,918 | 8,417 | 51,501 | 14.0% | — |
-| **TOTAL** | **39** | **89** | **694,973** | **579,033** | **115,940** | **83.3%** | |
+| **TOTAL** | **39** | **89** | **653,138** | **581,664** | **71,474** | **89.3%** | |
 
 **Structural ceilings:**
 - BJ: demand/capacity ratio = 249,633 / ~184k = 136% — **physically oversubscribed**. Cannot close the 20k gap via scheduling. Fix = more BJ presses or VMI certification.
@@ -639,8 +701,9 @@ Exclusive demand assignment: each SKU counted once in highest-priority eligible 
 - STAGE2: 95.7% coverage, near ceiling with Stage-1 feed constraints.
 - No machine data: 51,501 permanently unbuilt until master data certifications added.
 
-**Scheduler ceiling (without master data changes): ~600–610k / 694,973 ≈ 86–88%**
-**True ceiling (if all 7 no-master-data SKUs certified): ~630k+ / 694,973 ≈ 91%+**
+**Rolling pipeline actual (May 2026, current code): 581,664 GT built / 587,000 cured / 89.3% coverage**
+**Scheduler ceiling (without master data changes): ~600–610k / 653,138 ≈ 92–93%** (after data fixes for HURL0 + TVECE)
+**True ceiling (if all no-master-data SKUs certified): ~630k+ / 653,138 ≈ 96%+**
 
 ### BJ oversubscription — SKU-level breakdown (May 2026)
 
