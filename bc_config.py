@@ -57,10 +57,21 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 10
+MAX_CHANGEOVERS_PER_DAY = 14
 # Hard cap on CURING PRESS COs scheduled per calendar day (unchanged in new arch).
 # 8  → ~594k GT (May 2026 baseline).
-# 10 → ~587k (more NRI simultaneously → more building CO overhead → net −7k).
+# 10 → ~615k (balanced NRI activation).
+# 14 → ~650k target: activates more NRI COs (TTMX0/MSXT0/TUHL0/HURL0 gain ~20k units).
+#      Also gives FXPC0 more presses via Runner-Out → FXPC0 CO conversion.
+
+CO_CLASS_B_THRESHOLD = 0.8
+# Class A threshold for curing CO urgency scoring.
+# A CO candidate is Class A (critical) when: current_days > horizon_left × threshold
+# 1.0 (default) = strict Class A: demand truly cannot be met without this CO.
+# 0.8 = allow COs where demand would take >80% of remaining horizon with current presses.
+# Lower = more COs scheduled = more NRI SKUs activated (higher output but more CO overhead).
+# Effect: activates high-demand NRI SKUs that sit just below the strict Class A cutoff.
+
 
 # ── NEW ARCHITECTURE: Building machine CO cap ────────────────────────────────
 MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2

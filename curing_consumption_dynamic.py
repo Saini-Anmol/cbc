@@ -81,6 +81,7 @@ from bc_config import (
     PLANNING_DAYS,
     MAX_CHANGEOVERS_PER_DAY as MAX_CO_PER_DAY,
     SHIFTS_PER_DAY,
+    CO_CLASS_B_THRESHOLD,
 )
 
 _NAVY  = "1F3864"
@@ -138,7 +139,7 @@ def _urgency_sort_key(
     else:
         after_days = float("inf")
 
-    cls = 0 if current_days > horizon_left else 1
+    cls = 0 if current_days > horizon_left * CO_CLASS_B_THRESHOLD else 1
     return (cls, -priority_score, after_days)
 
 
@@ -277,10 +278,10 @@ class COScheduler:
                     if is_nri:
                         pass   # always eligible
                     elif is_ri and n_t > 0:
-                        # Only eligible if under-supplied (can't meet demand in time)
+                        # Only eligible if under-supplied: needs more than horizon_left days
                         current_days = rem / (n_t * rate_t) if rate_t > 0 else float("inf")
                         if current_days <= horizon_left:
-                            continue           # RI is already on track — skip
+                            continue   # RI is already on track — skip
                     else:
                         continue
 
@@ -296,8 +297,8 @@ class COScheduler:
             _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
             candidates.sort(key=lambda x: (
                 x[0][0],                                           # Class A (0) before Class B (1)
-                ct_map.get(x[3], _dct),                            # min CT target first (max throughput)
-                x[0][1], x[0][2],                                  # −priority, after_days
+                x[0][1], x[0][2],                                  # −priority, after_days (urgency first)
+                ct_map.get(x[3], _dct),                            # CT as tiebreaker (throughput)
                 len(press_to_demand_targets.get(x[1], [])),         # exclusive press first (fewer targets)
             ))
 
@@ -331,7 +332,7 @@ class COScheduler:
                         ct_map.get(new_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
                     )
                     if rate_recheck > 0 and cur_rem / (cur_n * rate_recheck) <= horizon_left:
-                        continue  # downgraded to Class B — existing presses now sufficient
+                        continue  # downgraded — existing presses now sufficient
 
                 # Guard: don't CO an RI press if remaining presses can't cover its demand.
                 # This prevents early CO'ing of RI presses whose SKU demand hasn't been met

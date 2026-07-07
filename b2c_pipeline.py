@@ -1,3 +1,7 @@
+# Just confirm that new table in db- building allowable machines is got updated succesfully and now for more SKU will be eligible on the VMI machines in allowable matrix. 
+# Now, I have updated the building allowable machines data from the plant, Now, i think we should get the better KPIs in the building side so accordingly curing side KPIs should also get better automatically. But, now i am getting the output KPIs around- GT built= 609507 and curing 610955, from the same code we are able to generate GT of around 615535 and curing qty around- 616626. Why our KPIs got decreased now. So, where we are making mistake now. We only have to work on this- update in the inch size locking to machine group/machine? Anything else needed or some issues in the logic as well. Now, I have added 2 more SKU in the demand file- 1. "1D25212812074FXC10	28089	0.040417398	and 1325215813079TTMX0	12521	0.018016527	[sku, qty, prioirty_score]. And, after adding more than 40k qty we are getting the KPIs as building- 615,533 and 617,359. Now, why we laggin in KPIs now? Find the Root cause for the same. 
+
+
 """
 b2c_pipeline.py — End-to-end B2C scheduling pipeline.
 
@@ -230,9 +234,10 @@ def _assign_building_shift(
         # demand because the first machine fills the single-shift target and the sibling
         # finds deficit=0.  GT_BUFFER_SHIFTS=2 doubles the target so both machines get
         # non-zero deficit and each fills roughly 1 shift worth.
-        # BJ/UNI_NARROW/STAGE machines already serve many SKUs via Campaign 2; using 1×
-        # leaves room for Campaign 2 CO targets (NRI, CO-day pre-builds) and avoids
-        # crowding lower-demand SKUs (SUHL0, TUNE0) out of the shift.
+        # STAGE2 uses _buf=1: with more CO presses added via curing allowable, scd grows
+        # and the opening-inventory suppression (gt_inv > scd → deficit=0) self-corrects
+        # within 1-2 days as inventory drains. buf=2 over-commits Stage-2 machines and
+        # reduces throughput for competing SKUs (MSXT0 vs FXC10 on 8301/8302).
         _buf = GT_BUFFER_SHIFTS if group == "VMI" else 1
 
         def _deficit(sku: str, _b: float = _buf) -> float:
@@ -253,15 +258,12 @@ def _assign_building_shift(
         rate      = _bld_qty_per_shift(machine) / SHIFT_MINS
         campaigns: list[tuple] = []
 
-
         # ── Campaign 1: continue current SKU (no CO cost) ──────────────────
         # If machine has no current SKU (machine_current_sku not set / first shift ever),
         # pick the highest-deficit eligible SKU as a free "start" with zero CO cost.
         # Without this, machines with unknown inch pay diff_size_CO (180 min for UNI/Stage-1)
         # on first assignment, which exceeds the 30% budget and permanently blocks them.
         if not cur_sku:
-            # Free start: pick dominant-inch high-deficit SKU, treat as "start" (no CO cost).
-            # min() on (inch_penalty, -deficit): 0=dominant inch first, most-negative=-highest deficit.
             best_start = min(
                 (s for s in eligible if _deficit(s) > 0),
                 key=lambda s: (0 if sku_inch.get(s, "") == dom_inch else 1, -_deficit(s)),
@@ -270,6 +272,7 @@ def _assign_building_shift(
             if best_start is not None:
                 cur_sku  = best_start
                 cur_inch = sku_inch.get(cur_sku, "")
+
         if cur_sku in eligible and _deficit(cur_sku) > 0:
             mins = min(remaining, _deficit(cur_sku) / rate if rate > 0 else remaining)
             qty  = int(mins * rate)
@@ -697,10 +700,10 @@ def _write_rolling_building_excel(
         co_pct   = co   / avail_per_mach
         idle_pct = idle / avail_per_mach
         grp = _mgroup(m)
-        # Color: red <40%, amber 40-80%, green ≥80% (Stage-1 always amber by design)
+        # Color: red <40%, amber 40-85%, green ≥80% (Stage-1 always amber by design)
         if grp == "Stage-1":
             color = _AMBER_U
-        elif util_pct >= 0.80:
+        elif util_pct >= 0.85:
             color = _GREEN_U
         elif util_pct >= 0.40:
             color = _AMBER_U
@@ -1122,8 +1125,20 @@ def run_rolling_pipeline(
         for _, row in df_allow.iterrows():
             sku = str(row["SKUCode"])
             for m in (row.get("Machines") or []):
-                machine_skus[str(m)].add(sku)
-                sku_machine_map[sku].add(str(m))
+                m_str = str(m)
+                # Rolling pipeline tracks GT only (not carcass).
+                # Stage-1 machines produce carcass that feeds Stage-2 implicitly.
+                # Excluding them from machine_skus prevents:
+                #   (a) phantom projected_gt updates inside _assign_building_shift
+                #       that fool Stage-2 into seeing deficit=0 for Stage-2 SKUs
+                #   (b) Stage-1 machines "wasting" shifts on carcass campaigns whose
+                #       output (correctly) doesn't add to gt_inventory (line 1388)
+                # The planning assumption: Stage-1 always has capacity to supply
+                # whatever Stage-2 needs (validated: Stage-1 util ≈ 33% by design).
+                if _MACHINE_GROUP.get(m_str, "") == "STAGE1":
+                    continue
+                machine_skus[m_str].add(sku)
+                sku_machine_map[sku].add(m_str)
         print(f"  [Rolling] Allowable map: {len(machine_skus)} machines")
     except Exception as _e:
         print(f"  [Rolling] Allowable map: failed ({_e})")
@@ -1277,16 +1292,22 @@ def run_rolling_pipeline(
                     ct  = cure_ct_map.get(sku, DEFAULT_CURING_CT)
                     shift_cure_demand[sku] += _cure_qty_per_shift(ct)
 
-            # Pre-build signal: in Shift A only, inject anticipated Shift C demand
-            # for CO target SKUs so building starts pre-building GT before the press
-            # fires up in Shift C.  Shift A build + Shift B continuation = 2 full
-            # shifts of GT buffer in inventory by the time the press starts Shift C.
-            # Injecting in BOTH A and B doubled the signal (2× demand for 1 press),
-            # diverting machines away from RI presses with real demand.
+            # Pre-build signal: in Shift A only, inject anticipated demand for all CO target
+            # SKUs so building starts pre-building GT before their presses fire in Shift B.
+            # Bug fix: original code injected 1× qty_per_shift per UNIQUE target SKU,
+            # regardless of how many presses are CO'ing to it.  For SURL0 (3 CO presses),
+            # this produced d = 1×56×2 = 112 — far too low to compete with a 10-press RI
+            # SKU (d=1120).  Building never served SURL0 in Campaign 2.
+            # Fix: count actual CO presses per target SKU and inject n_presses × qty,
+            # matching how RUNNING presses accumulate their demand signal.
             if shift == "A":
+                _co_press_counts: dict[str, int] = defaultdict(int)
+                for _cp_sku in co_press_map.values():
+                    _co_press_counts[_cp_sku] += 1
                 for new_sku in co_target_skus_today:
-                    new_ct = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
-                    shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
+                    new_ct    = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
+                    n_co      = _co_press_counts.get(new_sku, 1)
+                    shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
 
             # ── 2. Building assignment for this shift ──────────────────────
             # RI SKUs with a currently RUNNING press (not in CO transition) —
