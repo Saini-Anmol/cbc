@@ -320,16 +320,14 @@ class ETL:
 
     def load_machine_allowable(self):
         df = self._sql(
-            f"SELECT * FROM {Config.DB_NAME}.Master_Building_Allowable_Machines_source"
+            f"SELECT * FROM {Config.DB_NAME}.Master_Building_Allowable_Machines"
         )
-        mcols = [c for c in df.columns if str(c).isdigit()]
-        df["Machines"] = df.apply(
-            lambda r: [str(int(c)) for c in mcols
-                       if str(r[c]).strip().upper() in
-                       {"Y","YES","1","ONLY ONE M/C RUN"}],
-            axis=1,
-        )
-        return df.rename(columns={"SKU Code":"SKUCode"})[["SKUCode","Machines"]]
+        def _parse(s):
+            if pd.isna(s) or not str(s).strip(): return []
+            return [str(int(p.strip())) for p in str(s).split(',') if p.strip().isdigit()]
+        df = df.rename(columns={"Machines": "_machines_raw"})
+        df["Machines"] = df["_machines_raw"].apply(_parse)
+        return df[["SKUCode", "Machines"]]
 
     def load_changeover_map(self):
         df = self._sql(f"SELECT * FROM {Config.DB_NAME}.Master_Building_ChangeoverTime")

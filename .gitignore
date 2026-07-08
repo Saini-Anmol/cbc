@@ -12,3 +12,4 @@ __pycache__/
 .DS_Store
 
 # We were using the mould data from the db, but that data is wrong, I will provide the latest mould data in terms of SKU and number of moulds for that SKU and in another sheet i will provide the SKUs that uses the common moulds. Will that info be enough of consider info & now we will not consider this db table- SELECT * FROM jkplanningV1.Master_Mapping_Mould_SKU; First confirm me this info and then i will provide the excel file in the input folder with the path. 
+

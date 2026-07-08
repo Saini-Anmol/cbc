@@ -240,8 +240,7 @@ class ConsumptionETL:
         """SKUs that appear in building allowable master with at least one machine."""
         try:
             df = self._sql(
-                f"SELECT `SKU Code` AS SKUCode "
-                f"FROM {self.db}.Master_Building_Allowable_Machines_source"
+                f"SELECT SKUCode FROM {self.db}.Master_Building_Allowable_Machines"
             )
             return set(df["SKUCode"].astype(str).str.strip())
         except Exception as exc:
@@ -478,8 +477,8 @@ class SKUEligibilityFilter:
         df_excluded columns:
           SKUCode, Demand_Qty, Priority_Score, Remark
         """
-        bld_pool = {s.upper() for s in (bld_master_skus | bld_history_skus)}
-        cur_pool = {s.upper() for s in (cur_master_skus | cur_history_skus)}
+        bld_pool = {s.upper() for s in bld_master_skus}
+        cur_pool = {s.upper() for s in cur_master_skus}
 
         eligible_rows: list[dict] = []
         excluded_rows: list[dict] = []
