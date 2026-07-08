@@ -89,7 +89,7 @@ Last planning day: no Day+1 demand → falls back to today's demand automaticall
 Changeover always takes Shift A (of the assigned day). Mould-clean is NOT modelled.
 First production of new SKU = Shift B onward (CURING_CO_DURATION_SHIFTS=1).
 
-> **Curing changeover cap: configurable (currently **10/day**); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
+> **Curing changeover cap: configurable (currently **14/day**); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
 > Building machine changeovers are UNLIMITED — no daily cap applies.
 
 ### 3.2 Building Machine — FREE in shift S means ALL of:
@@ -387,10 +387,11 @@ Compute the full changeover plan from Day 0 data alone:
 1. **Runner-Out presses** → eligible for CO from Day 1.
 2. **Runner-In presses** → eligible for CO on the day `Updated_Demand_Qty` hits 0.
 3. **NRI targets** ranked by two-level urgency score (§8 CO urgency):
-   - Class A (CRITICAL): `current_production_days > horizon_left` — demand cannot be met without this CO.
-   - Class B (HELPFUL): already fulfillable with existing presses — **SKIPPED** (Class A only filter active).
-   - Sort: `(class ASC, −Priority_Score, after_co_days ASC)`
-   - Rationale for Class A only: firing Class B COs activates too many NRI SKUs simultaneously, causing building CO explosion (1,958 building COs observed vs 1,458 baseline). Building cannot supply all newly-activated presses → starvation events increase.
+   - Class A (CRITICAL): `current_production_days > horizon_left` — demand cannot be met without this CO. Always fires.
+   - Class B (HELPFUL): already fulfillable with existing presses — normally **SKIPPED**.
+     **Exception (demand_done_free):** When a Runner-In press's demand hits 0 mid-horizon, it joins `demand_done_free`. These presses bypass the Class A gate and may CO to any target (Class A or B). Guard: Class B target requires `gt_inventory[target] ≥ _cure_qty_per_shift(ct)` to avoid starvation next shift.
+   - Sort: `(urgency_class ASC, after_co_days ASC, −Priority_Score, −gt_signal, sku)`
+   - Rationale for Class A only (general): firing Class B COs broadly activates too many NRI SKUs simultaneously → building CO explosion. demand_done_free exception is safe because those presses are already idle — any production is strictly better than idle.
 4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **10**; set in `bc_config.py` — single source of truth); excess deferred to next day.
 5. CO takes effect same day (new SKU's press count updates on CO day; Shift B produces for new SKU — mould-clean removed).
 6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
@@ -1763,19 +1764,31 @@ participates in steady-state building + curing scheduling without requiring a CO
 
 ### 19.13 Building Machine Inch Assignment — Two-Tier Policy (current)
 
-**Tier 1 — Hard filter (`_HARD` in `b2c_pipeline.py`, `_MACHINE_HARD_INCH` in `building_b2c.py`):**
-Applied only to BJ (7101–7106, 7201) and UNI_NARROW (7501–7503). VMIMAXX (6001–6004,
-7001–7004) is excluded from hard filtering — the group officially handles 14"–18" and the
-allowable table governs per-SKU assignments.
+**Tier 1 — Hard filter (`_HARD` in `b2c_pipeline.py`):**
+Applied to VMIMAXX, BJ, and UNI_NARROW. Each machine restricted to its dominant inch(es).
+Without BJ hard filters, high-demand 15" SKUs capture 13" BJ machines (e.g., 7106) because
+their deficit signal dominates — confirmed root cause of 1325217613082TUNE0 gap.
 
-| Group | Hard filter | Note |
-|-------|------------|------|
-| BJ 7101/7103/7105/7106 | 15"/13" dominant only | |
-| BJ 7102/7104 | 14"/15" | 14" kept for 2 BJ-exclusive RI SKUs |
-| BJ 7201 | 16" only | |
-| UNI_NARROW 7501 | 12"/13" | Extended from 12"-only; confirmed allowable for 13" |
-| UNI_NARROW 7502/7503 | 13" only | |
-| **VMIMAXX 6001–6004, 7001–7004** | **No hard filter** | Allowable table is authority |
+| Machine | Hard filter | Note |
+|---------|------------|------|
+| 6001 | 14" | VMIMAXX dom=14" |
+| 6002 | 15" | VMIMAXX dom=15" |
+| 6003 | 17"/18" | sole 17"/18" machine |
+| 6004 | 16" | VMIMAXX dom=16" |
+| 7001 | 16" | VMIMAXX dom=16" |
+| 7002 | 14" | VMIMAXX dom=14" |
+| 7003 | 15" | VMIMAXX dom=15" |
+| 7004 | 14" | VMIMAXX dom=14" |
+| 7101 | 15" | BJ primary 15" machine |
+| 7102 | 14"/15" | 14" for 2 BJ-exclusive RI SKUs |
+| 7103 | 13" | BJ dom=13" |
+| 7104 | 14"/15" | 14" for 2 BJ-exclusive RI SKUs |
+| 7105 | 13" | BJ dom=13" |
+| 7106 | 13" | BJ dom=13" |
+| 7201 | 16" | sole BJ 16" machine |
+| 7501 | 12"/13" | confirmed allowable for 13" SKUs |
+| 7502 | 13" | hard |
+| 7503 | 13" | hard |
 
 **Tier 2 — Dominant-inch preference (`_MACHINE_DOMINANT_INCH` in `b2c_pipeline.py`):**
 Within eligible CO candidates, `inch_penalty = 0` for dominant inch, `1` for other. Sort key:
@@ -1799,7 +1812,7 @@ to any SKU absent from the size master. Verified: `"1325216814085SURL0"[8:10] = 
 
 | File | Status | What was done |
 |------|--------|---------------|
-| `b2c_pipeline.py` | **DONE** | Per-shift rolling pipeline. RC1 fix: `_deficit(cur_sku)<=0` for Shift B/C CO unlock. RC2 fix: pre-build signal Shift A only. Dominant-inch preference. `_MACHINE_DOMINANT_INCH` dict. VMIMAXX removed from `_HARD`. Inch fallback from SKU code. `ri_running_skus` → `starving_ri` relaxation for Shift B/C CO. **Latest (Jul 2026):** Machine Utilization sheet added to `bc_building_schedule_*.xlsx` (Sheet 7: Machine, Group, Avail, GT_Built, Carcass_Built, Prod_Mins, CO_Mins, Idle_Mins, Util_Pct, CO_Pct, Idle_Pct, SKUs_Served, COs_Done). CO target pre-build signal narrowed to Shift A only (Shift B now gets natural demand from RUNNING state). |
+| `b2c_pipeline.py` | **DONE** | Per-shift rolling pipeline. RC1 fix: `_deficit(cur_sku)<=0` for Shift B/C CO unlock. RC2 fix: pre-build signal Shift A only. Dominant-inch preference. `_MACHINE_DOMINANT_INCH` dict. Inch fallback from SKU code. `ri_running_skus` → `starving_ri` relaxation for Shift B/C CO. Machine Utilization sheet in output. **Jul 2026 updates:** (1) BJ hard-inch filters added to `_HARD` dict — 7103/7105/7106→13" only, 7101→15", 7102/7104→14"/15", 7201→16"; prevents high-demand 15" SKUs from capturing 13" BJ machines. (2) VMIMAXX hard-inch filters added to `_HARD` dict — each machine restricted to its dominant inch (6001→14", 6002→15", 6003→17"/18", 6004→16", 7001→16", 7002→14", 7003→15", 7004→14"); prevents cross-inch CO explosion. (3) Stage-1 carcass tracking: `s1_sku_to_machines` dict built during allowable loading; Step 3b in shift loop assigns carcass production proportional to Stage-2 GT output; Stage-1 machines now show real utilization in Machine Utilization sheet (previously 0%). |
 | `building_b2c.py` | **DONE** | `_make_synthetic_curing()` skips RI SKUs with no building machines. NRI CO priority boost. `7501` hard filter extended to `{"12","13"}`. |
 | `curing_consumption_dynamic.py` | **DONE** | CO from curing allowable table. CO sort: min-CT first → exclusive press first. CO over-aggressiveness guard in main CO loop (line ~339): skip CO if `remaining_demand / ((n-1) × rate_per_day) > horizon_left`. Rescue pass has equivalent guard. |
 | `bc_config.py` | **DONE** | `GT_BUFFER_SHIFTS`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT`, building CO time maps. **Jul 2026:** `CURING_CO_DURATION_SHIFTS=1`, `CURING_CO_CHANGEOVER_MINS=490` (mould-clean removed from model). |
@@ -1870,9 +1883,9 @@ for day D in 1..31:
 
 | KPI | Old Arch [ACTUAL] | New Arch [ACTUAL Jul 2026] | Change | Driver |
 |-----|-------------------|---------------------------|--------|--------|
-| Customer demand | 653,138 | 653,138 | — | Fixed |
-| GT built | **594,384** | **615,438** | +21k vs old LP | MOULD_CLEAN removal + better NRI coverage |
-| Demand fulfillment (of actual demand) | **91.0%** | **94.4%** | +3.4 pp | Curing 616,514 / 653,138; includes 6,199 opening inventory |
+| Customer demand | 653,138 | 693,748 (updated demand file) | — | demand_may.xlsx updated |
+| GT built | **594,384** | **603,962** | +9.6k vs old LP | BJ hard filters + Stage-1 tracking |
+| Demand fulfillment (of actual demand) | **91.0%** | **87.3%** | −3.7 pp | 605,825 / 693,748; demand file has more SKUs |
 | GT machine avg utilisation | **71.7%** | **~82%** | +10 pp | 80% floor enforced; shift-level demand signal more accurate |
 | Machines ≥ 80% util | **10 of 24** | **~18–20 of 24 [EST]** | +8–10 | Floor rule + 2-CO distribution |
 | Machines < 60% util | **9 of 24** | **~2–4 of 24 [EST]** | −5–7 | VMI/UNI now fill idle tail via COs |
@@ -1893,9 +1906,9 @@ for day D in 1..31:
 
 | KPI | Old Arch [ACTUAL] | New Arch [ACTUAL Jul 2026] | Change | Driver |
 |-----|-------------------|---------------------------|--------|--------|
-| GT cured | **558,218** | **616,514** | +58.3k | MOULD_CLEAN removal (+4.5k) + GT-balance curing + opening inventory |
-| Customer demand fulfillment | **85.5%** | **94.4%** | +8.9 pp | 616,514 / 653,138 demand |
-| GT → Curing efficiency | **93.9%** | **99.2%** | +5.3 pp | 616,514 cured / (615,438 built + 6,199 opening) = 99.2% |
+| GT cured | **558,218** | **605,825** | +47.6k | MOULD_CLEAN removal + GT-balance curing + opening inventory |
+| Customer demand fulfillment | **85.5%** | **87.3%** | +1.8 pp | 605,825 / 693,748 demand |
+| GT → Curing efficiency | **93.9%** | **~100.3%** | +6.4 pp | Curing exceeds building by ~1,863 from opening inventory |
 | Closing GT balance (horizon end) | **~36,166** | **~5,123** | −31k | No pre-build surplus; only DEMAND_MET carry-over |
 | GT wasted (NO_PRESS SKUs) | **10,729** | **~0–2k** | −9k | NRI-no-CO filter already coded |
 | Curing press avg utilisation | **70.8%** | **~80–85%** | +10–15 pp | Consistent GT supply; MOULD_CLEAN removal adds 1 productive shift per CO |
@@ -1924,6 +1937,6 @@ for day D in 1..31:
 | No-machine-data SKUs (7 SKUs) | ~51k | Add to `Master_Building_Allowable_Machines_source` |
 | Curing-limited RI SKUs | ~20k | Schedule curing COs to add presses for these SKUs |
 | **Permanent ceiling (scheduler only)** | **~91k gap remains** | — |
-| **Actual rolling pipeline (May 2026, current code — Jul 2026 run)** | **616,514 cured / 653,138 demand = 94.4%** | Up from 85.5% (old arch); MOULD_CLEAN removal added +4.5k |
-| **Achievable with data fix (add 7104 to HURL0 allowable)** | **~622k+ / 653k ≈ 95.3%** | +5,876 units from HURL0 |
-| **Achievable with all plant actions (more BJ presses + master data)** | **~635k+ / 653k = 97%+** | All structural gaps closed |
+| **Actual rolling pipeline (May 2026, Jul 2026 run — after demand_done CO fix + CT fix)** | **617,939 cured / 693,748 demand = 89.1%** | demand_done_free presses CO immediately; real CTs loaded from DB (was always 17.0 due to wrong column key) |
+| **Achievable with data fix (add 7104 to HURL0 allowable + allowable master updates)** | **~620–625k / 693k ≈ 89–90%** | +5,876 from HURL0; remaining gap = structural |
+| **True ceiling (more BJ presses + all master data certified)** | **~640k+ / 693k ≈ 92%+** | All structural gaps closed |

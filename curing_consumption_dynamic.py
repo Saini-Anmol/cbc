@@ -247,11 +247,15 @@ class COScheduler:
             # Identify free presses this day:
             # 1. All pending RO presses (carried forward until they CO)
             # 2. Demand-running presses whose SKU demand just hit 0
+            #    → tracked in demand_done_free: these presses are producing NOTHING useful,
+            #      so any CO (Class A or B) is strictly better than sitting idle.
             newly_free: list[str] = list(pending_ro_presses)
+            demand_done_free: set[str] = set()
             for p in demand_running_presses:
                 current_sku = press_to_sku.get(p)
                 if current_sku and updated_demand.get(current_sku, 0) <= 0:
                     newly_free.append(p)
+                    demand_done_free.add(p)
 
             if not newly_free:
                 continue
@@ -309,15 +313,16 @@ class COScheduler:
                 if p in assigned:
                     continue
 
-                # Plant limit = 8 COs/day (hard).  Within that budget, only fire
+                # Plant limit = MAX_CO_PER_DAY (hard).  For normal presses, only fire
                 # Class A COs — those where demand CANNOT be met in the remaining
-                # horizon without this additional press.  Class B COs ("helpful"
-                # but not critical) are deferred: demand is already reachable with
-                # existing presses and using the CO slot for them just spreads
-                # building capacity thinner, causing timing gaps and starvation.
+                # horizon without this additional press.
+                # EXCEPTION: presses freed because their RI demand just hit 0
+                # (demand_done_free) — these produce NOTHING useful, so fire their CO
+                # immediately regardless of urgency class. Any production > 0 is better.
                 urgency_class = key[0]   # 0 = Class A (critical), 1 = Class B
-                if urgency_class != 0:
-                    continue  # Class B — skip; existing presses can meet demand
+                is_demand_done = p in demand_done_free
+                if urgency_class != 0 and not is_demand_done:
+                    continue  # Class B — skip (unless press is idle from demand done)
 
                 # Re-check with CURRENT press_count — earlier COs this day may have
                 # already satisfied this target's demand. Without this guard, the same

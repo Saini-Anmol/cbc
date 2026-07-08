@@ -59,13 +59,15 @@ from bc_config import (
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
     BUILD_LEAD_SHIFTS,
-    GT_BUFFER_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
+    GT_BUFFER_SHIFTS,
     BUILDING_CO_SAME_SIZE,
     BUILDING_CO_DIFF_SIZE,
     SHIFT_MINS,
     SHIFT_STARTS,
     SHIFT_ENDS,
+    POOL_SIZE,
+    STARVATION_BUFFER_MINS,
     DYNAMIC_CC_OUTPUT  as CC_OUTPUT,
     BUILDING_OUTPUT    as BUILD_OUTPUT,
     CURING_B2C_OUTPUT  as CURING_OUTPUT,
@@ -118,6 +120,10 @@ _MACHINE_DOMINANT_INCH: dict[str, str] = {
     "7501": "12", "7502": "13", "7503": "13",
 }
 
+# Machines removed from _HARD (soft-locked): serve non-dominant inch ONLY when primary demand done.
+# All other machines (BJ etc.) were never hard-locked; their Campaign 2+ inch freedom is unchanged.
+_SOFT_LOCK_MACHINES: frozenset[str] = frozenset({"7001", "7003"})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROLLING PIPELINE HELPERS
@@ -126,6 +132,72 @@ _MACHINE_DOMINANT_INCH: dict[str, str] = {
 def _bld_qty_per_shift(machine: str) -> int:
     ct_min = _BLD_CT_SEC.get(str(machine), 120.0) / 60.0
     return int(SHIFT_MINS / ct_min)
+
+
+def _urgency_score(
+    sku: str,
+    demand_remaining: dict,
+    press_count: dict,
+    cure_ct_map: dict,
+    days_left: int,
+    cavities: int = 2,
+) -> float:
+    """
+    Urgency = demand that CANNOT be covered by current curing presses in remaining horizon.
+    Higher → more urgent → becomes primary in pool ranking.
+
+    If days_left ≤ 0 or no presses: return full remaining demand (maximally urgent).
+    """
+    dem = demand_remaining.get(sku, 0.0)
+    if dem <= 0:
+        return 0.0
+    n  = press_count.get(sku, 0)
+    ct = float(cure_ct_map.get(sku, DEFAULT_CURING_CT))
+    if n <= 0 or ct <= 0 or days_left <= 0:
+        return dem
+    rate_per_shift = int(SHIFT_MINS / ct) * cavities   # units one press cures per shift
+    max_curable    = n * rate_per_shift * 3 * days_left  # 3 shifts/day
+    return max(0.0, dem - max_curable)
+
+
+def _build_machine_pools(
+    machine_skus:    dict,
+    sku_inch:        dict,
+    demand_dict:     dict,
+    press_count:     dict,
+    cure_ct_map:     dict,
+    planning_days:   int,
+    pool_size:       int = POOL_SIZE,
+) -> dict:
+    """
+    Build a fixed pool of up to `pool_size` same-dominant-inch SKUs per machine.
+    Pool ordering = urgency descending at Day 1.
+    Returns: {machine: [sku_primary, sku_sec1, sku_sec2, ...]}
+    """
+    pools: dict[str, list[str]] = {}
+    for machine, skus in machine_skus.items():
+        dom_inch = _MACHINE_DOMINANT_INCH.get(str(machine), "")
+
+        # Prefer same dominant inch + has demand + has active presses
+        same_inch = [
+            s for s in skus
+            if sku_inch.get(s, "") == dom_inch
+            and demand_dict.get(s, 0) > 0
+            and press_count.get(s, 0) > 0
+        ]
+        if not same_inch:
+            # Fallback: any eligible SKU with demand and presses
+            same_inch = [
+                s for s in skus
+                if demand_dict.get(s, 0) > 0 and press_count.get(s, 0) > 0
+            ]
+
+        same_inch.sort(
+            key=lambda s: -_urgency_score(s, demand_dict, press_count, cure_ct_map, planning_days)
+        )
+        pools[machine] = same_inch[:pool_size]
+
+    return pools
 
 
 def _cure_qty_per_shift(ct_min: float) -> int:
@@ -151,10 +223,11 @@ def _select_dynamic_co_target(
 ) -> "str | None":
     """Select the best curing CO target when a press finishes its SKU demand mid-plan.
 
-    Only fires Class A COs: demand_remaining / (n × rate) > horizon_left, meaning
-    the SKU CANNOT meet its demand without this additional press.
+    The calling press is already idle (old_sku demand = 0), so any production on a
+    new SKU is strictly better than idle. Both Class A and Class B targets are eligible.
 
-    Sort key: (fewest after-CO days, highest priority score, most GT in inventory).
+    Sort key: Class A first (critical, can't meet demand without this press), then Class B.
+    Within class: fewest after-CO days → highest priority score → most GT in inventory.
     `already_targeted` prevents multiple dynamic COs going to the same new SKU in
     the same shift.
     """
@@ -168,57 +241,58 @@ def _select_dynamic_co_target(
         if rate <= 0:
             continue
         current_days = rem / (n * rate) if n > 0 else float("inf")
-        if current_days <= horizon_left:
-            continue                                 # Class B — skip
+        # Class A = cannot meet demand without this press; Class B = helpful but not critical.
+        urgency_class = 0 if current_days > horizon_left else 1
+        # Class B allowed only if GT inventory already covers ≥ 1 shift of curing.
+        # Without this guard, a Class B press starts curing next shift but finds zero GT
+        # (building never pre-built for it) → starvation event instead of production.
+        gt_inv = gt_inventory.get(sku, 0.0)
+        if urgency_class == 1:
+            ct_sku    = cure_ct_map.get(sku, DEFAULT_CURING_CT)
+            shift_need = _cure_qty_per_shift(ct_sku)
+            if gt_inv < shift_need:
+                continue  # no GT ready → skip Class B to avoid starvation
         after_days = rem / ((n + 1) * rate)
         prio       = priority_score_map.get(sku, 0.0)
-        gt_signal  = min(gt_inventory.get(sku, 0.0), rate)  # cap at 1 day's rate
-        candidates.append((after_days, -prio, -gt_signal, sku))
+        gt_signal  = min(gt_inv, rate)  # cap at 1 day's rate
+        candidates.append((urgency_class, after_days, -prio, -gt_signal, sku))
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][3]
+    return candidates[0][4]
 
 
 def _assign_building_shift(
-    shift_cure_demand:   dict,
-    machine_skus:        dict,
-    machine_current_sku: dict,
-    sku_inch:            dict,
-    demand_remaining:    dict,
-    gt_inventory:        dict,
-    co_target_skus:      frozenset = frozenset(),
-    allow_new_co:        bool = True,
-    ri_running_skus:     frozenset = frozenset(),
+    shift_cure_demand:      dict,
+    machine_skus:           dict,
+    machine_current_sku:    dict,
+    sku_inch:               dict,
+    demand_remaining:       dict,
+    gt_inventory:           dict,
+    machine_pool:           dict,
+    machine_minutes_on_sku: dict,
+    cure_ct_map:            dict,
+    press_count:            dict,
+    co_target_skus:         frozenset = frozenset(),
+    days_left:              int = 31,
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
 
     Plant-accurate behaviour:
-    - allow_new_co=True  (Shift A): machine may CO to any eligible SKU with deficit.
-    - allow_new_co=False (Shifts B/C): machine stays on its Campaign-1 primary SKU
-      UNLESS (a) current demand is fully met, or (b) target is in co_target_skus
-      (curing press is switching to that SKU today → building must pre-build GT),
-      or (c) target is a starving RI (running press + zero GT inventory).
+    - CO can happen in any shift (A/B/C) whenever a deficit SKU exists and CO cost fits.
+    - co_target_skus: NRI SKUs with curing CO firing today — the 30% guard is bypassed
+      for urgent ones (0 GT inventory + active demand) in Campaign 2+.
     - Dominant-inch priority: when selecting CO candidates, SKUs matching the
       machine's dominant inch sort before other eligible inches.
-    - Starving RI priority: RI SKUs with a running curing press but zero GT
-      inventory get Campaign-1 priority over normal deficit ordering. A curing
-      press cannot run without GT — starvation is a hard failure, not a trade-off.
+    - All machines: MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT COs per shift.
 
     Returns: {machine: [(sku, qty_int, co_type_str)]}
       co_type: "start" | "same_size_CO" | "diff_size_CO"
     """
-    MAX_COS = MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
+    def _max_cos(mach: str) -> int:
+        return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
     projected_gt: dict[str, float] = dict(gt_inventory)
-
-    # Starving RI: SKUs with a running curing press but zero GT in inventory.
-    # These must be served before normal priority ordering — a running press
-    # with no GT produces nothing (hard starvation), so they override volume.
-    starving_ri: frozenset = frozenset(
-        s for s in ri_running_skus
-        if gt_inventory.get(s, 0.0) <= 0 and demand_remaining.get(s, 0.0) > 0
-    )
 
     _pri = {"VMI": 0, "BJ": 1, "UNISTAGE": 2, "STAGE2": 3, "STAGE1": 9}
     sorted_machines = sorted(
@@ -230,14 +304,6 @@ def _assign_building_shift(
 
     for machine in sorted_machines:
         group = _MACHINE_GROUP.get(machine, "")
-        # VMI sibling machines (e.g. 6004 + 7001 both on 16") each see only half the
-        # demand because the first machine fills the single-shift target and the sibling
-        # finds deficit=0.  GT_BUFFER_SHIFTS=2 doubles the target so both machines get
-        # non-zero deficit and each fills roughly 1 shift worth.
-        # STAGE2 uses _buf=1: with more CO presses added via curing allowable, scd grows
-        # and the opening-inventory suppression (gt_inv > scd → deficit=0) self-corrects
-        # within 1-2 days as inventory drains. buf=2 over-commits Stage-2 machines and
-        # reduces throughput for competing SKUs (MSXT0 vs FXC10 on 8301/8302).
         _buf = GT_BUFFER_SHIFTS if group == "VMI" else 1
 
         def _deficit(sku: str, _b: float = _buf) -> float:
@@ -252,6 +318,7 @@ def _assign_building_shift(
 
         remaining = SHIFT_MINS
         co_count  = 0
+        MAX_COS   = _max_cos(machine)
         cur_sku   = machine_current_sku.get(machine, "")
         cur_inch  = sku_inch.get(cur_sku, "")
         dom_inch  = _MACHINE_DOMINANT_INCH.get(str(machine), cur_inch)
@@ -259,10 +326,6 @@ def _assign_building_shift(
         campaigns: list[tuple] = []
 
         # ── Campaign 1: continue current SKU (no CO cost) ──────────────────
-        # If machine has no current SKU (machine_current_sku not set / first shift ever),
-        # pick the highest-deficit eligible SKU as a free "start" with zero CO cost.
-        # Without this, machines with unknown inch pay diff_size_CO (180 min for UNI/Stage-1)
-        # on first assignment, which exceeds the 30% budget and permanently blocks them.
         if not cur_sku:
             best_start = min(
                 (s for s in eligible if _deficit(s) > 0),
@@ -273,6 +336,18 @@ def _assign_building_shift(
                 cur_sku  = best_start
                 cur_inch = sku_inch.get(cur_sku, "")
 
+        # urgent_co_set: co_target SKUs eligible on this machine with zero GT inventory.
+        # These bypass allow_new_co=False guard in Campaign 2+ and the 30% cost guard.
+        urgent_co_set = frozenset(
+            s for s in co_target_skus
+            if s in eligible and s != cur_sku
+            and projected_gt.get(s, 0.0) == 0
+            and demand_remaining.get(s, 0.0) > 0
+        )
+
+        # Default: allow non-dominant inch in Campaign 2+ unless Campaign 1 had unfinished demand.
+        primary_demand_done = True
+
         if cur_sku in eligible and _deficit(cur_sku) > 0:
             mins = min(remaining, _deficit(cur_sku) / rate if rate > 0 else remaining)
             qty  = int(mins * rate)
@@ -281,36 +356,34 @@ def _assign_building_shift(
                 projected_gt[cur_sku] = projected_gt.get(cur_sku, 0.0) + qty
                 remaining -= mins
 
-        # Campaign 2+: CO to deficit SKUs while time allows.
-        # Same-inch (cheaper CO) tried before diff-inch; dominant inch preferred within each bucket.
-        # In Shifts B/C (allow_new_co=False): only CO when THIS SHIFT's deficit for cur_sku
-        # is already covered (Campaign 1 satisfied it) OR target is a curing CO SKU today.
-        # NOTE: cur_demand_done uses _deficit (this shift's gap), NOT demand_remaining
-        # (31-day total). demand_remaining is always >0 for active RI SKUs, which would
-        # permanently lock the machine and cause ~85% idle in Shifts B/C.
+            # Track whether Campaign 1 exhausted demand (vs cut by shift time).
+            # Soft-lock machines may serve non-dominant inch only when primary is done.
+            primary_demand_done = _deficit(cur_sku) <= 0
+
+        # ── Campaign 2+: CO to deficit SKUs ──────────────────────────────
         while remaining >= MIN_CAMPAIGN_MINS and co_count < MAX_COS:
             same_cands: list = []
             diff_cands: list = []
             seen_in_plan = {sku for sku, _, _ in campaigns}
-            cur_demand_done = _deficit(cur_sku) <= 0   # this shift's deficit satisfied?
 
             for sku in eligible:
                 d = _deficit(sku)
                 if sku == cur_sku or d <= 0:
                     continue
-                # Shift B/C CO restriction: skip unless current SKU is done, curing CO forces it,
-                # or target is a starving RI (running press with zero GT — urgent regardless of shift)
-                if not allow_new_co and not cur_demand_done and sku not in co_target_skus and sku not in starving_ri:
-                    continue
                 to_inch = sku_inch.get(sku, "")
-                cost    = _co_cost(machine, cur_inch, to_inch)
+                is_urgent = sku in urgent_co_set
+                # Soft-lock guard: only 7001/7003 serve non-dominant inch when primary demand done.
+                # BJ and other machines were never hard-locked — their inch freedom is unchanged.
+                if machine in _SOFT_LOCK_MACHINES and to_inch != dom_inch and not primary_demand_done:
+                    continue
+                cost = _co_cost(machine, cur_inch, to_inch)
                 if remaining - cost < MIN_CAMPAIGN_MINS:
                     continue
-                if cost > 0.30 * remaining:
+                # Bypass 30% cost guard for urgent co_target_skus (reservation already accounted for it).
+                if cost > 0.30 * remaining and not is_urgent:
                     continue
                 revisit_penalty = 1 if sku in seen_in_plan else 0
-                # 0 = dominant inch (preferred), 1 = non-dominant
-                inch_penalty = 0 if to_inch == dom_inch else 1
+                inch_penalty    = 0 if to_inch == dom_inch else 1
                 bucket = same_cands if to_inch == cur_inch else diff_cands
                 bucket.append((-d, inch_penalty, revisit_penalty, cost, sku))
 
@@ -1070,8 +1143,8 @@ def run_rolling_pipeline(
     cetl = ConsumptionETL(engine)
     df_ct_raw = cetl.load_cycle_times()
     cure_ct_map: dict[str, float] = {
-        str(r["SKUCode"]): float(r["CT_Min"])
-        for _, r in df_ct_raw.iterrows() if r.get("CT_Min")
+        str(r["SKUCode"]): float(r["CycleTime_min"])
+        for _, r in df_ct_raw.iterrows() if r.get("CycleTime_min")
     }
 
     # Building CTs are hardcoded in _BLD_CT_SEC above (sourced from plant data)
@@ -1101,13 +1174,13 @@ def run_rolling_pipeline(
         # VMIMAXX inches confirmed from May 2026 plant inch-run study (CLAUDE.md §inch-run).
         _HARD = {
             # VMIMAXX — dominant-inch locks (each machine serves its primary inch group)
+            # 7001 (dom=16") and 7003 (dom=15") are SOFT-locked: no hard filter here.
+            # They prefer dominant inch via inch_penalty sort key; serve others when primary done.
             "6001": {"14"},             # dom=14" — 3 machines share 14" (6001/7002/7004)
             "6002": {"15"},             # dom=15" — 2 machines share 15" (6002/7003)
             "6003": {"17", "18"},       # dom=17" — sole 17"/18" machine; serves HURL1/HRHT0
-            "6004": {"16"},             # dom=16" — 2 machines share 16" (6004/7001)
-            "7001": {"16"},             # dom=16"
+            "6004": {"16"},             # dom=16" — primary 16" machine; 7001 is secondary
             "7002": {"14"},             # dom=14"
-            "7003": {"15"},             # dom=15"
             "7004": {"14"},             # dom=14"
             # BJ — no hard filter; dominant-inch preference via _MACHINE_DOMINANT_INCH + inch_penalty.
             # Removing hard locks allows BJ machines to serve off-dominant SKUs in their
@@ -1200,6 +1273,25 @@ def run_rolling_pipeline(
         machine_current_sku = {str(r["Machine"]): str(r["SKUCode"]) for _, r in df_running_bld.iterrows()}
     except Exception:
         pass
+
+    # ── G: Machine pools + cross-shift minute tracker ─────────────────────────
+    # Pool: fixed 2–3 same-inch SKUs per machine, ordered by Day-1 urgency.
+    # Replaced only when a pool SKU's demand_remaining hits 0.
+    machine_pool: dict[str, list[str]] = _build_machine_pools(
+        machine_skus=machine_skus,
+        sku_inch=sku_inch,
+        demand_dict=demand_dict,
+        press_count=press_count,
+        cure_ct_map=cure_ct_map,
+        planning_days=planning_days,
+    )
+    print(f"  [Rolling] Pools: {sum(len(v) for v in machine_pool.values())} SKU slots "
+          f"across {len(machine_pool)} machines")
+
+    # machine_minutes_on_sku: cumulative minutes each machine has spent on its
+    # current SKU without a CO.  Reset to 0 on CO; incremented per campaign.
+    # Guards against micro-campaigns across shift boundaries (< MIN_CAMPAIGN_MINS).
+    machine_minutes_on_sku: dict[str, float] = {m: 0.0 for m in machine_skus}
 
     # ══════════════════════════════════════════════════════════════════════════
     # Data accumulators (matching output sheet formats)
@@ -1310,13 +1402,6 @@ def run_rolling_pipeline(
                     shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
 
             # ── 2. Building assignment for this shift ──────────────────────
-            # RI SKUs with a currently RUNNING press (not in CO transition) —
-            # used to identify starving RI SKUs (running press + zero GT).
-            ri_running_this_shift: frozenset = frozenset(
-                st["sku"]
-                for press, st in press_state.items()
-                if st["status"] == "RUNNING" and press not in co_press_map
-            )
             shift_plan = _assign_building_shift(
                 shift_cure_demand=dict(shift_cure_demand),
                 machine_skus=machine_skus,
@@ -1324,9 +1409,12 @@ def run_rolling_pipeline(
                 sku_inch=sku_inch,
                 demand_remaining=demand_remaining,
                 gt_inventory=gt_inventory,
+                machine_pool=machine_pool,
+                machine_minutes_on_sku=machine_minutes_on_sku,
+                cure_ct_map=cure_ct_map,
+                press_count=press_count,
                 co_target_skus=co_target_skus_today,
-                allow_new_co=(shift == "A"),
-                ri_running_skus=ri_running_this_shift,
+                days_left=planning_days - day + 1,
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
@@ -1380,6 +1468,26 @@ def run_rolling_pipeline(
                 if campaigns:
                     # Update current SKU at end of THIS SHIFT (not end of day)
                     machine_current_sku[machine] = campaigns[-1][0]
+
+                    # Update cross-shift minute tracker.
+                    # Accumulate production minutes after the LAST CO in this shift.
+                    # If no CO occurred: add all production minutes to existing total.
+                    _had_co = False
+                    _mins_after_last_co = 0.0
+                    for _, _q, _ct in campaigns:
+                        _ct_sec = _BLD_CT_SEC.get(machine, 150.0)
+                        _prod_m = _q * _ct_sec / 60.0
+                        if _ct != "start":           # CO event → reset counter
+                            _had_co = True
+                            _mins_after_last_co = _prod_m
+                        else:
+                            _mins_after_last_co += _prod_m
+                    if _had_co:
+                        machine_minutes_on_sku[machine] = _mins_after_last_co
+                    else:
+                        machine_minutes_on_sku[machine] = (
+                            machine_minutes_on_sku.get(machine, 0.0) + _mins_after_last_co
+                        )
 
             # ── 4. Curing simulation ───────────────────────────────────────
             for press in sorted(press_state):
@@ -1477,7 +1585,38 @@ def run_rolling_pipeline(
                     "_status":       status,
                 })
 
-        # ── 5. GT shelf-life writeoff ─────────────────────────────────────
+        # ── 5. Pool replacement: swap out any finished SKUs ─────────────────
+        # If a pool SKU's demand_remaining hit 0 this day, remove it and add
+        # the next best same-inch eligible SKU (highest urgency, not yet in pool).
+        days_left_now = planning_days - day
+        for machine in list(machine_pool.keys()):
+            pool = machine_pool[machine]
+            finished = [s for s in pool if demand_remaining.get(s, 0.0) <= 0]
+            if not finished:
+                continue
+            new_pool   = [s for s in pool if demand_remaining.get(s, 0.0) > 0]
+            pool_set   = set(new_pool)
+            dom_inch   = _MACHINE_DOMINANT_INCH.get(str(machine), "")
+            eligible_m = machine_skus.get(machine, set())
+            # Candidates: same dominant inch, has demand, has active presses, not already in pool
+            replacements = sorted(
+                [s for s in eligible_m
+                 if s not in pool_set
+                 and demand_remaining.get(s, 0.0) > 0
+                 and press_count.get(s, 0) > 0
+                 and sku_inch.get(s, "") == dom_inch],
+                key=lambda s: -_urgency_score(
+                    s, demand_remaining, press_count, cure_ct_map, days_left_now
+                ),
+            )
+            slots = POOL_SIZE - len(new_pool)
+            new_pool.extend(replacements[:slots])
+            machine_pool[machine] = new_pool
+            if finished:
+                print(f"    [Pool] Day {day}: machine {machine} dropped {finished}, "
+                      f"added {replacements[:slots]}")
+
+        # ── 6. GT shelf-life writeoff ─────────────────────────────────────
         day_writeoff = _writeoff_stale_gt(gt_inventory, last_build_day, day)
         writeoff_total += day_writeoff
 

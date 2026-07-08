@@ -168,16 +168,21 @@ GT_SHELF_LIFE_DAYS      = 3
 # TopUp will not pre-build GT beyond this window.
 
 GT_BUFFER_SHIFTS        = 2
-# NEW ARCHITECTURE: how many curing shifts of GT to pre-build as a buffer.
-# 1 = build exactly what today's presses consume today.
-# 2 = build today's + 1 shift extra (next-shift safety buffer).  ← current
-# With GT_BUFFER_SHIFTS = 1–2 (~0.33–0.67 day buffer), the 3-day shelf life is
-# never hit under normal operation. Must be <= GT_SHELF_LIFE_DAYS × SHIFTS_PER_DAY.
-# Reason for 2: with GT_BUFFER_SHIFTS=1, same-inch sibling machines (6004/7001
-# on 16", 6001/7002/7004 on 14") fight for the same deficit. The first machine
-# fills the single-shift target; siblings see deficit=0 and idle. With 2 shifts
-# of target, all siblings share the demand (6004 fills shift 1, 7001 fills shift 2)
-# → both machines utilized, no wasted capacity.
+# VMI sibling machines (e.g. 6004+7001, both on 16") both need non-zero deficit
+# to stay active. With _buf=2, target = 2× cure rate → each sibling fills ~1 shift
+# worth → total 2 shifts of buffer maintained.
+# BJ/UNISTAGE/STAGE use 1× (see _assign_building_shift _buf logic).
+
+POOL_SIZE = 3
+# Max SKUs per building machine pool.
+# Each machine oscillates among POOL_SIZE same-inch eligible SKUs.
+# Pool is fixed at Day 1; replaced only when a SKU's demand finishes.
+# Determines Campaign 2+ candidate list inside _assign_building_shift.
+
+STARVATION_BUFFER_MINS = 30
+# If a pool SKU's GT inventory covers < 30 min of curing press consumption,
+# it is treated as starving and gets Campaign-1 priority over normal urgency.
+# 30 min = ~3–4 curing cycles on a typical press (CT ~8–12 min).
 
 CARCASS_SHELF_LIFE_DAYS = 1
 # Stage-1 carcass shelf life: 1 day (must enter Stage-2 same or next shift).
