@@ -91,18 +91,18 @@ _S1_MACHINES = frozenset(m for m, g in _MACHINE_GROUP.items() if g == "STAGE1")
 
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
-    "7001":57.6,  "7002":57.6,  "7003":57.6,  "7004":57.6,
-    "6001":60.0,  "6002":60.0,  "6003":60.0,  "6004":60.0,
-    "7101":102.0, "7102":102.0, "7103":78.0,  "7104":108.0,
-    "7105":108.0, "7106":57.6,  "7201":66.0,
-    "7501":108.0, "7502":108.0, "7503":108.0,
-    "8201":72.0,  "8301":78.0,  "8302":78.0,
-    "8501":108.0, "8502":120.0, "7301":90.0,
-    "6801":150,   "6802":218,   "6803":262,
-    "6909":187,   "6911":150,   "7601":253,
-    "7701":267,   "7801":163,   "7802":182,
-    "7803":261,   "7804":257,   "8001":114,
-    "8002":169,   "8003":113,   "8101":300,
+    "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
+    "6001":53.0,  "6002":52.0,  "6003":63.0,  "6004":60.0,
+    "7101":83.0, "7102":86.0, "7103":60.0,  "7104":87.0,
+    "7105":60.0, "7106":60,  "7201":70.0,
+    "7501":90.0, "7502":90.0, "7503":90.0,
+    "8201":62.0,  "8301":60.0,  "8302":60.0,
+    "8501":70.0, "8502":70.0, "7301":70.0,
+    "6801":127,   "6802":146,   "6803":146,
+    "6909":157,   "6911":115,   "7601":186,
+    "7701":163,   "7801":135,   "7802":135,
+    "7803":135,   "7804":135,   "8001":113,
+    "8002":113,   "8003":113,   "8101":230,
 }
 
 DEFAULT_CURING_CT = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
@@ -1151,6 +1151,9 @@ def run_rolling_pipeline(
 
     machine_skus: dict[str, set]  = defaultdict(set)
     sku_machine_map: dict[str, set] = defaultdict(set)
+    s1_sku_to_machines: dict[str, set] = defaultdict(set)  # Stage-1 carcass eligibility (kept
+    # OUT of machine_skus/sku_machine_map so it never feeds the Stage-2 deficit signal — see
+    # the STAGE1 skip below. Used only for Step 3b carcass-utilization simulation.
     sku_inch: dict[str, str] = {}
     try:
         from building_b2c import B2C_ETL as _BETL
@@ -1209,6 +1212,7 @@ def run_rolling_pipeline(
                 # The planning assumption: Stage-1 always has capacity to supply
                 # whatever Stage-2 needs (validated: Stage-1 util ≈ 33% by design).
                 if _MACHINE_GROUP.get(m_str, "") == "STAGE1":
+                    s1_sku_to_machines[sku].add(m_str)
                     continue
                 machine_skus[m_str].add(sku)
                 sku_machine_map[sku].add(m_str)
@@ -1488,6 +1492,57 @@ def run_rolling_pipeline(
                         machine_minutes_on_sku[machine] = (
                             machine_minutes_on_sku.get(machine, 0.0) + _mins_after_last_co
                         )
+
+            # ── 3b. Stage-1 carcass scheduling (utilization tracking only) ──
+            # For every SKU that Stage-2 machines built this shift, allocate the
+            # matching carcass qty (1:1 with GT) across that SKU's eligible Stage-1
+            # machines, capped by each machine's per-shift capacity. Recorded in
+            # bld_shift_rows (CO_Type="carcass") so Machine Utilization / Daily GT
+            # & Carcass show real numbers instead of 0%. Deliberately does NOT
+            # touch gt_inventory, demand_remaining, or machine_skus — Stage-1 is
+            # assumed to always have spare capacity to supply Stage-2 (validated:
+            # Stage-1 util stays well under 100% even at full Stage-2 output), so
+            # this can never gate or double-count real GT output.
+            stage2_built_this_shift: dict[str, float] = defaultdict(float)
+            for machine, campaigns in shift_plan.items():
+                if _MACHINE_GROUP.get(machine, "") != "STAGE2":
+                    continue
+                for sku, qty, _co_type in campaigns:
+                    stage2_built_this_shift[sku] += qty
+            # One machine = one SKU per shift (same physical constraint as every
+            # other building machine — see CLAUDE.md "One building machine always
+            # produces for exactly one SKU at a time"). Once a Stage-1 machine is
+            # allocated to a SKU this shift it's removed from the pool even if it
+            # has leftover capacity, instead of splitting it across SKUs with no
+            # changeover between them.
+            s1_machines_used_this_shift: set = set()
+            for sku, need in sorted(stage2_built_this_shift.items(), key=lambda kv: -kv[1]):
+                if need <= 0:
+                    continue
+                eligible = sorted(
+                    (m for m in s1_sku_to_machines.get(sku, ())
+                     if m not in s1_machines_used_this_shift),
+                    key=lambda m: -_bld_qty_per_shift(m),
+                )
+                remaining_need = need
+                for m in eligible:
+                    if remaining_need <= 0:
+                        break
+                    cap = _bld_qty_per_shift(m)
+                    if cap <= 0:
+                        continue
+                    alloc = min(cap, remaining_need)
+                    s1_machines_used_this_shift.add(m)
+                    remaining_need -= alloc
+                    bld_shift_rows.append({
+                        "Machine":       m,
+                        "Date":          date_str,
+                        "Shift":         shift,
+                        "SKUCode":       sku,
+                        "Qty":           round(alloc),
+                        "Machine_Group": "STAGE1",
+                        "CO_Type":       "carcass",
+                    })
 
             # ── 4. Curing simulation ───────────────────────────────────────
             for press in sorted(press_state):
