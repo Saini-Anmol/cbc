@@ -677,10 +677,41 @@ def run_from_database_b2c(
     print("  [ETL] Loading history map (heuristic scoring) …")
     history_map = etl.load_history_map()
 
-    # Master_Building_Allowable_Machines is the single source of truth for
-    # machine-SKU allowable routing. Historical production union is disabled —
-    # the master table is maintained up-to-date and used directly.
-    print(f"  [Allow] Using Master_Building_Allowable_Machines directly ({len(df_allow)} SKUs)")
+    # ── Union: merge historical production machines into allow_map ────────────
+    # Master_Building_Allowable_Machines = current master data (hard allow_map).
+    # Building_Stage1/2_Best_Machines = 3-month historical runs (actual production).
+    # Union ensures SKUs that were historically built on a machine but are missing
+    # from master data still get scheduled on that machine. Confirmed by
+    # plant_vs_scheduler_report_may2026_v3.pdf §5: 43 machine-SKU combos (3,420
+    # May units) were actually run by the plant on machines absent from the DB
+    # allowable list — this union is a data-driven fix for that exact gap.
+    print("  [Allow] Merging historical machine-SKU pairs into allow_map …")
+    hist_by_sku: dict = {}
+    for (machine, sku), count in history_map.items():
+        if count > 0:
+            hist_by_sku.setdefault(sku, set()).add(machine)
+
+    allow_sku_idx = {str(r["SKUCode"]): i for i, r in df_allow.iterrows()}
+    extra_pairs = 0
+    new_hist_rows = []
+    for sku, hist_machs in hist_by_sku.items():
+        if sku in allow_sku_idx:
+            idx = allow_sku_idx[sku]
+            cur_set = set(df_allow.at[idx, "Machines"] or [])
+            added = hist_machs - cur_set
+            if added:
+                df_allow.at[idx, "Machines"] = list(cur_set | added)
+                extra_pairs += len(added)
+        else:
+            new_hist_rows.append({"SKUCode": sku, "Machines": list(hist_machs)})
+            extra_pairs += len(hist_machs)
+
+    if new_hist_rows:
+        df_allow = pd.concat(
+            [df_allow, pd.DataFrame(new_hist_rows)], ignore_index=True
+        )
+    print(f"  [Allow] +{extra_pairs} machine-SKU pairs from historical data "
+          f"({len(new_hist_rows)} new SKUs unlocked via production history)")
 
     # ── Inch-group restriction for UNISTAGE machines (Inch-Run Study) ───────
     # Source: CLAUDE.md §Inch-Run Study — Machine Group Inch Policies
@@ -1198,7 +1229,7 @@ def _skip_reason(
         if eligible_machines > 0:
             return ("NRI: machines available (historical) but no curing CO scheduled — "
                     "add curing mould/CO to activate this SKU")
-        return ("NRI: no building machine in master data — "
+        return ("NRI: no building machine in master data or historical production — "
                 "add to Master_Building_Allowable_Machines")
     return "NRI: partial — building capacity shared with higher-priority SKUs"
 

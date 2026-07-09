@@ -91,18 +91,18 @@ _S1_MACHINES = frozenset(m for m, g in _MACHINE_GROUP.items() if g == "STAGE1")
 
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
-    "7001":57.6,  "7002":57.6,  "7003":57.6,  "7004":57.6,
-    "6001":60.0,  "6002":60.0,  "6003":60.0,  "6004":60.0,
-    "7101":102.0, "7102":102.0, "7103":78.0,  "7104":108.0,
-    "7105":108.0, "7106":57.6,  "7201":66.0,
-    "7501":108.0, "7502":108.0, "7503":108.0,
-    "8201":72.0,  "8301":78.0,  "8302":78.0,
-    "8501":108.0, "8502":120.0, "7301":90.0,
-    "6801":150,   "6802":218,   "6803":262,
-    "6909":187,   "6911":150,   "7601":253,
-    "7701":267,   "7801":163,   "7802":182,
-    "7803":261,   "7804":257,   "8001":114,
-    "8002":169,   "8003":113,   "8101":300,
+    "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
+    "6001":53.0,  "6002":52.0,  "6003":63.0,  "6004":60.0,
+    "7101":83.0, "7102":86.0, "7103":60.0,  "7104":87.0,
+    "7105":60.0, "7106":60,  "7201":70.0,
+    "7501":81.0, "7502":74.0, "7503":70.0,
+    "8201":62.0,  "8301":78.0,  "8302":78.0,
+    "8501":108.0, "8502":120.0, "7301":70.0,
+    "6801":130,   "6802":152,   "6803":190,
+    "6909":157,   "6911":115,   "7601":186,
+    "7701":225,   "7801":140,   "7802":133,
+    "7803":165,   "7804":217,   "8001":90,
+    "8002":130,   "8003":90,   "8101":230,
 }
 
 DEFAULT_CURING_CT = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
@@ -1156,6 +1156,44 @@ def run_rolling_pipeline(
         from building_b2c import B2C_ETL as _BETL
         _etl = _BETL(engine)
         df_allow    = _etl.load_machine_allowable()
+
+        # ── Union: merge historical production machines into allow_map ─────────
+        # Master_Building_Allowable_Machines = current master data (hard allow_map).
+        # Building_Stage1/2_Best_Machines = 3-month historical runs (actual production).
+        # Union ensures SKUs the plant historically built on a machine but that are
+        # missing from master data still get scheduled on that machine. Confirmed by
+        # plant_vs_scheduler_report_may2026_v3.pdf §5: 43 machine-SKU combos (3,420
+        # May units) were actually run by the plant on machines absent from the DB
+        # allowable list — this is a data-driven fix for that exact gap (same logic
+        # previously used in building_b2c.py's legacy path, restored here for the
+        # rolling pipeline which is the default entry point).
+        history_map = _etl.load_history_map()
+        hist_by_sku: dict = {}
+        for (machine, sku), count in history_map.items():
+            if count > 0:
+                hist_by_sku.setdefault(sku, set()).add(machine)
+
+        allow_sku_idx = {str(r["SKUCode"]): i for i, r in df_allow.iterrows()}
+        extra_pairs = 0
+        new_hist_rows = []
+        for sku, hist_machs in hist_by_sku.items():
+            if sku in allow_sku_idx:
+                idx = allow_sku_idx[sku]
+                cur_set = set(df_allow.at[idx, "Machines"] or [])
+                added = hist_machs - cur_set
+                if added:
+                    df_allow.at[idx, "Machines"] = list(cur_set | added)
+                    extra_pairs += len(added)
+            else:
+                new_hist_rows.append({"SKUCode": sku, "Machines": list(hist_machs)})
+                extra_pairs += len(hist_machs)
+        if new_hist_rows:
+            df_allow = pd.concat(
+                [df_allow, pd.DataFrame(new_hist_rows)], ignore_index=True
+            )
+        print(f"  [Rolling] [Allow] +{extra_pairs} machine-SKU pairs from historical "
+              f"data ({len(new_hist_rows)} new SKUs unlocked via production history)")
+
         sku_to_size = _etl.load_sku_sizes()
         sku_inch = {str(k): str(v).strip().replace('"', "") for k, v in sku_to_size.items()}
 

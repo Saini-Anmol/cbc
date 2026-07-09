@@ -477,8 +477,8 @@ class SKUEligibilityFilter:
         df_excluded columns:
           SKUCode, Demand_Qty, Priority_Score, Remark
         """
-        bld_pool = {s.upper() for s in bld_master_skus}
-        cur_pool = {s.upper() for s in cur_master_skus}
+        bld_pool = {s.upper() for s in (bld_master_skus | bld_history_skus)}
+        cur_pool = {s.upper() for s in (cur_master_skus | cur_history_skus)}
 
         eligible_rows: list[dict] = []
         excluded_rows: list[dict] = []
