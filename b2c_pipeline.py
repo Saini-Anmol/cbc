@@ -89,6 +89,15 @@ for _m in ("6801","6802","6803","6909","6911","7601","7701",
 
 _S1_MACHINES = frozenset(m for m, g in _MACHINE_GROUP.items() if g == "STAGE1")
 
+# Round-trip buffer sizing: when a machine alternates between its current SKU
+# and another live, unfulfilled SKU, the buffer left behind for the current
+# SKU must survive CO(cur->partner) + partner's own dwell time + CO(partner->cur),
+# not just a flat GT_BUFFER_SHIFTS multiplier. Skipped entirely (falls back to
+# the flat buffer) when the machine has only one eligible SKU, when no other
+# eligible SKU has unmet demand, or when no other eligible SKU currently has a
+# real curing-driven deficit — see _assign_building_shift.
+_ROUND_TRIP_BUFFER_ENABLED = True
+
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
     "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
@@ -325,6 +334,38 @@ def _assign_building_shift(
         rate      = _bld_qty_per_shift(machine) / SHIFT_MINS
         campaigns: list[tuple] = []
 
+        # ── Round-trip buffer sizing for cur_sku ────────────────────────────
+        # Skip conditions (fall back to flat _buf): (1) machine has only one
+        # eligible SKU — len(eligible)<=1, nowhere to rotate to; (2) no other
+        # eligible SKU has unmet demand — demand_remaining<=0 filters it out;
+        # (3) no other eligible SKU currently has a real curing-driven deficit
+        # — _deficit(s)<=0 (flat-buf, no circularity) filters it out. When a
+        # genuine rotation partner exists, size cur_sku's buffer to survive
+        # CO(cur->partner) + partner's own deficit-driven dwell (floored at
+        # MIN_CAMPAIGN_MINS) + CO(partner->cur), so cur_sku's press doesn't
+        # starve while this machine is away serving the partner.
+        effective_buf = _buf
+        if _ROUND_TRIP_BUFFER_ENABLED and cur_sku and len(eligible) > 1:
+            partner_candidates = [
+                s for s in eligible
+                if s != cur_sku
+                and demand_remaining.get(s, 0.0) > 0
+                and _deficit(s) > 0
+            ]
+            if partner_candidates:
+                partner = max(partner_candidates, key=lambda s: _deficit(s))
+                partner_inch = sku_inch.get(partner, "")
+                partner_dwell = max(
+                    MIN_CAMPAIGN_MINS,
+                    _deficit(partner) / rate if rate > 0 else MIN_CAMPAIGN_MINS,
+                )
+                round_trip_mins = (
+                    _co_cost(machine, cur_inch, partner_inch)
+                    + partner_dwell
+                    + _co_cost(machine, partner_inch, cur_inch)
+                )
+                effective_buf = max(_buf, round_trip_mins / SHIFT_MINS)
+
         # ── Campaign 1: continue current SKU (no CO cost) ──────────────────
         if not cur_sku:
             best_start = min(
@@ -348,8 +389,8 @@ def _assign_building_shift(
         # Default: allow non-dominant inch in Campaign 2+ unless Campaign 1 had unfinished demand.
         primary_demand_done = True
 
-        if cur_sku in eligible and _deficit(cur_sku) > 0:
-            mins = min(remaining, _deficit(cur_sku) / rate if rate > 0 else remaining)
+        if cur_sku in eligible and _deficit(cur_sku, effective_buf) > 0:
+            mins = min(remaining, _deficit(cur_sku, effective_buf) / rate if rate > 0 else remaining)
             qty  = int(mins * rate)
             if mins >= MIN_CAMPAIGN_MINS and qty > 0:
                 campaigns.append((cur_sku, qty, "start"))
@@ -358,7 +399,7 @@ def _assign_building_shift(
 
             # Track whether Campaign 1 exhausted demand (vs cut by shift time).
             # Soft-lock machines may serve non-dominant inch only when primary is done.
-            primary_demand_done = _deficit(cur_sku) <= 0
+            primary_demand_done = _deficit(cur_sku, effective_buf) <= 0
 
         # ── Campaign 2+: CO to deficit SKUs ──────────────────────────────
         while remaining >= MIN_CAMPAIGN_MINS and co_count < MAX_COS:

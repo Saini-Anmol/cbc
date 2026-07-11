@@ -13,6 +13,30 @@ the curing schedule is **fully derived** from it. Direction is the reverse of C2
 
 ---
 
+> ## READ THIS FIRST — which architecture is actually running
+>
+> This document describes **two** building-scheduler architectures, in this order:
+> 1. **§1–§13 (and most of §14–§18):** the ORIGINAL 31-day-upfront LP + `DemandHeuristicAssigner`
+>    design (Phase 0 → 1a → 1b/2a → 2b → 3 → 4), implemented in `building_b2c.py` / `building.py`.
+>    This path only runs today via **`python b2c_pipeline.py --legacy`**. Some of it is still
+>    accurate for the legacy path; none of it describes the default run.
+> 2. **§19–§20: "NEW ARCHITECTURE — Per-Shift Rolling Simulation"** describes the **per-shift
+>    rolling pipeline** in `b2c_pipeline.py` (`run_rolling_pipeline` / `_assign_building_shift`),
+>    which is what **`python b2c_pipeline.py`** (no flags — the default) actually runs today.
+>    **If you only read one architecture section, read §19.**
+>
+> **One exception — §6 (Phase 0, including §6.6 the 31-day CO Scheduler) is NOT legacy-only.**
+> `curing_consumption_dynamic.py`'s `COScheduler`/`DaySimulator` (described in §6.6) is imported
+> and reused as-is by the rolling pipeline for CO pre-computation (`run_dynamic_consumption`,
+> called from `run_rolling_pipeline`). So §6's SKU classification, eligibility filter (§4.1,
+> corrected below), cycle-time formula, and CO-schedule logic are all still current — only
+> §7–§13's *building/curing scheduling* logic (LP + heuristic assigner) is superseded by §19.
+>
+> Also see `CLAUDE.md`'s "Pipeline execution order → Rolling pipeline (DEFAULT)" section for a
+> short, up-to-date summary of the same current architecture that §19 documents in full.
+
+---
+
 ## 1. Why B2C — Motivation vs C2B
 
 | Dimension | C2B (old) | B2C (new) |
@@ -114,8 +138,10 @@ Spare-minutes check — a machine with leftover minutes is only FREE for a new S
  │  ├─ Daily Running Moulds   (which curing press runs which SKU today)    │
  │  ├─ Master_Curing_Design_CycleTime  (raw cure time per SKU from DB)     │
  │  ├─ Master_Curing_Allowable_Machines_source  (SKU ↔ curing press)       │
- │  ├─ Master_Building_Allowable_Machines_source (SKU ↔ building machine)  │
- │  ├─ Building_Stage1/2_Best_Machines  (building history — fallback)      │
+ │  ├─ Master_Building_Allowable_Machines  (SKU ↔ building machine;         │
+ │  │    single comma-separated `Machines` column, parsed via `_parse()`)  │
+ │  ├─ Building_Stage1/2_Best_Machines  (loaded but NOT used for building   │
+ │  │    eligibility since Jul 2026 — union removed, see §4.1)             │
  │  ├─ Master_Building_ChangeoverTime  (building machine CO times)          │
  │  └─ feed_map.json          (curing press → feeder building machines)    │
  │                                                                         │
@@ -151,17 +177,31 @@ Spare-minutes check — a machine with leftover minutes is only FREE for a new S
 Every demand SKU is checked against two source pools before entering planning.
 SKUs that fail are **excluded entirely** and shown in the "Excluded SKUs" sheet.
 
-```
-Building pool = Master_Building_Allowable_Machines_source
-              ∪ Building_Stage1_Best_Machines
-              ∪ Building_Stage2_Best_Machines
-
-Curing pool   = Master_Curing_Allowable_Machines_source
-              ∪ testing_Daily_Running_Moulds  (historical curing press data)
-
-SKU is ELIGIBLE  : SKU ∈ Building_pool  AND  SKU ∈ Curing_pool
-SKU is EXCLUDED  : fails either check
-```
+> **Jul 2026 change (commit `63d193f`): the historical-production union was removed.**
+> Both pools are now the **master table alone** — no fallback to history:
+> ```
+> Building pool = Master_Building_Allowable_Machines   (only)
+> Curing pool   = Master_Curing_Allowable_Machines_source   (only)
+>
+> SKU is ELIGIBLE  : SKU ∈ Building_pool  AND  SKU ∈ Curing_pool
+> SKU is EXCLUDED  : fails either check
+> ```
+> `SKUEligibilityFilter.filter()` in `curing_consumption.py` still *accepts*
+> `bld_history_skus` / `cur_history_skus` parameters (backed by
+> `load_building_history_skus()` reading `Building_Stage1_Best_Machines` +
+> `Building_Stage2_Best_Machines`, and `load_curing_history_skus()` reading
+> `testing_Daily_Running_Moulds`), but the method body builds `bld_pool` /
+> `cur_pool` from the master-table sets only — the history sets are loaded,
+> passed in, and silently ignored. Same removal happened on the building side:
+> `building_b2c.py`'s `load_machine_allowable()` no longer unions
+> `history_map` (from `Building_Stage1/2_Best_Machines`) into `df_allow`;
+> `history_map` is still loaded and passed to `HybridDailyScheduler` for
+> legacy heuristic scoring, but it no longer widens which machines a SKU is
+> eligible on.
+> **Why:** the union let SKUs run on machines with no current master-data
+> certification, inflating output by scheduling against outdated 3-month
+> history. Removing it is a deliberate correctness trade-off — total curing
+> output dropped ~618k vs ~623k the run before, per the commit message.
 
 **Remark format for excluded SKUs** (written to "Excluded SKUs" sheet):
 ```
@@ -189,9 +229,9 @@ This default silently applies — no remark, SKU proceeds to planning normally.
 | `gt_inventory_manual` | `sizeCode`, `gtInventory` | Phase 0, 4 | Opening GT inventory per SKU at plan start |
 | `Master_Curing_Design_CycleTime` | `Sapcode`, `Cure Time` | Phase 0 | Raw cure time per SKU; missing → default 17.0 min |
 | `Master_Curing_Allowable_Machines_source` | `SKU Code`, machine cols (`Yes`) | Phase 0 (eligibility), 1b, 2a | Which presses a SKU is allowed to run on |
-| `Master_Building_Allowable_Machines_source` | `SKU Code`, machine cols | Phase 0 (eligibility), 1a, 1b, 2a | Which building machines can make each SKU |
-| `Building_Stage1_Best_Machines` | `MachineNo`, `sizeCode`, `count` | Phase 0 (eligibility fallback) | 3-month Stage-1 building history; used when master data absent |
-| `Building_Stage2_Best_Machines` | `MachineNo`, `sizeCode`, `count` | Phase 0 (eligibility fallback) | 3-month Stage-2/Unistage building history; used when master data absent |
+| `Master_Building_Allowable_Machines` | `SKUCode`, `Machines` (single comma-separated string, e.g. `"6001,6002,7501"`) | Phase 0 (eligibility), 1a, 1b, 2a | Which building machines can make each SKU. **Renamed from `Master_Building_Allowable_Machines_source` and reshaped from per-machine Y/Yes columns to one comma-string column (commit `63d193f`)** — parsed via `_parse()` in `building.py`/`building_b2c.py`. |
+| `Building_Stage1_Best_Machines` | `MachineNo`, `sizeCode`, `count` | Phase 0 (loaded, unused for eligibility) | 3-month Stage-1 building history. **Union into the building allow-map was removed (Jul 2026, commit `63d193f`)** — table is still queried (`load_building_history_skus()` / `load_history_map()`) but no longer widens eligibility or the allow-map; retained only as a scoring input for the legacy `building.py` heuristic assigner. |
+| `Building_Stage2_Best_Machines` | `MachineNo`, `sizeCode`, `count` | Phase 0 (loaded, unused for eligibility) | 3-month Stage-2/Unistage building history. Same removal as above. |
 | `Master_Building_ChangeoverTime` | `MachineCode`, `Same Size(min)`, `Diff Size(min)` | Phase 1a, 1b | Building changeover cost |
 | `Master_WC_Master` | `wcID`, `WCNAME` | Phase 0 | Press code normalisation |
 | `Master_Mapping_Mould_SKU` | `MouldNo`, `Matl.Code`, `Active Flag` | Phase 2a | Mould ↔ SKU compatibility for changeover target check |
@@ -392,7 +432,7 @@ Compute the full changeover plan from Day 0 data alone:
      **Exception (demand_done_free):** When a Runner-In press's demand hits 0 mid-horizon, it joins `demand_done_free`. These presses bypass the Class A gate and may CO to any target (Class A or B). Guard: Class B target requires `gt_inventory[target] ≥ _cure_qty_per_shift(ct)` to avoid starvation next shift.
    - Sort: `(urgency_class ASC, after_co_days ASC, −Priority_Score, −gt_signal, sku)`
    - Rationale for Class A only (general): firing Class B COs broadly activates too many NRI SKUs simultaneously → building CO explosion. demand_done_free exception is safe because those presses are already idle — any production is strictly better than idle.
-4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **10**; set in `bc_config.py` — single source of truth); excess deferred to next day.
+4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **14**; set in `bc_config.py` — single source of truth); excess deferred to next day. History: 8/day → ~594k GT; 10/day → ~615k; 14/day → ~650k target (activates more NRI COs, e.g. TTMX0/MSXT0/TUHL0/HURL0).
 5. CO takes effect same day (new SKU's press count updates on CO day; Shift B produces for new SKU — mould-clean removed).
 6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
    in the main loop are sorted by the same urgency score. For each, search for an RI press
@@ -431,7 +471,11 @@ Simulate 31 days using the CO schedule from Pass 1:
 ### 7.0 Machine Stages — Physical Setup (CONFIRMED)
 
 Three building stage groups — 39 machines total.
-**Source of truth:** column names of `Master_Building_Allowable_Machines_source` (39 numeric columns).
+**Source of truth (historical):** the machine group/machine lists below were originally derived from
+the column names of the old `Master_Building_Allowable_Machines_source` table (39 numeric Y/Yes
+columns, one per machine). That table was replaced (commit `63d193f`) by `Master_Building_Allowable_Machines`,
+which has a single `SKUCode` + comma-separated `Machines` string column — the 39 machine numbers
+themselves are unchanged, only the storage schema changed.
 
 ```
 Stage-1  (Carcass machines — 15 machines)
@@ -560,29 +604,58 @@ Pass 2 — Fill remaining machines with lower-priority SKUs:
   - LOCKED_TO_PRIORITY machines are not available to lower-priority SKUs
 ```
 
-**Capacity note (building CT ≠ curing CT):**
+**Capacity note (building CT ≠ curing CT) — UPDATED, no longer a proxy:**
 ```
-No building cycle-time table exists in DB. Curing CT (avg ~17 min) is used as a proxy.
-Actual building CT is much shorter (~2–3 min/tyre for PCR building machines).
-All capacity figures below are APPROXIMATIONS.
+STALE (pre-Jul 2026): this section used to say "no building cycle-time table
+exists in DB; curing CT (~17 min) is used as a proxy" and marked all capacity
+figures as approximations. That is no longer true.
 
-Stage-2 capacity (6 machines, curing CT proxy @17 min):  6 × 90 × 56 = 30,240 GTs
-Unistage capacity (18 machines, curing CT proxy @17 min): 18 × 90 × 56 = 90,720 GTs
+CURRENT: b2c_pipeline.py has a real per-machine building CT dict, `_BLD_CT_SEC`
+(seconds/unit), corrected against plant production norms in commit `f86f70b`
+("Corrected CT as per production and norms, building and curing output of
+650k"). Every value in the dict changed in that commit (e.g. 6801: 150→127s,
+8101: 300→230s, 7101: 102.0→83.0s). Sample values:
+  7001=51.6s  7002=52.6s  7003=56.0s  7004=53.0s   (VMIMAXX)
+  7101=83.0s  7104=87.0s  7501=90.0s  7502=90.0s   (BJ / UNISTAGE)
+  8101=230s   6801=127s   7601=186s                (Stage-1, much slower — carcass)
+These are ~0.85–1.5 min/tyre for GT machines — faster than the old curing-CT
+proxy (17 min) implied, and in the same ballpark as the "~2–3 min/tyre"
+approximation the old text guessed at, but now an exact per-machine figure
+sourced from plant norms rather than a curing-CT stand-in.
+
+Recomputed theoretical capacity (31-day horizon = 93 shifts, no CO/idle time,
+i.e. an unattainable upper bound — actual scheduled output is always lower):
+  Stage-2  (6 machines):   2,659 units/shift × 93  ≈ 247,300 GTs
+  Unistage (18 machines):  8,022 units/shift × 93  ≈ 746,000 GTs
+These replace the old proxy-based figures (30,240 / 90,720) — both were
+understated because the 17-min curing-CT proxy was far slower than real
+building CT.
 ```
 
 **7001–7004 constraint (within Unistage):**
 ```
-SKUs allowed on any of 7001–7004: 48 SKUs
-Combined demand for those SKUs:   ~224,340 units
-Physical capacity (building CT @2.5 min, 1 cavity): 4×90×192 = 69,120 units
-Physical capacity (building CT @3.0 min, 1 cavity): 4×90×160 = 57,600 units
+Recomputed with real CT (7001=51.6s, 7002=52.6s, 7003=56.0s, 7004=53.0s):
+Physical capacity, 4 machines × 93 shifts, no CO/idle: ≈ 201,000 units.
+This supersedes the old estimate (57,600–69,120 units) that assumed a
+2.5–3.0 min/tyre CT — real CT is ~2.7× faster, so true capacity is ~3× higher
+than previously assumed.
 
-→ Even at real building CT, demand (224k) is 3–4× capacity (58k–69k).
-  These 4 machines CANNOT satisfy all 224k demand in a 30-day plan.
-  Actual production ~54k ≈ theoretical max → machines were nearly fully utilised.
-  Root cause of low output: 48 SKUs on 4 machines → very short campaigns per SKU,
-  excessive CO time, low effective utilisation per SKU.
-  Fix: reduce distinct SKUs on 7001–7004, run longer campaigns.
+The demand figure quoted below (~224,340 units across 48 SKUs) predates this
+CT correction and the Jul 2026 demand-file updates (2 SKUs added, per
+b2c_pipeline.py's dev notes) — it has NOT been revalidated against the
+corrected CT or current demand file. Do not treat the "3–4× capacity" and
+"CANNOT satisfy demand" conclusions below as current; the capacity side of
+that ratio is now known to be understated. A fresh demand-vs-capacity pull
+for 7001–7004 specifically is needed before drawing a new conclusion.
+
+Original (now superseded) analysis, kept for reference:
+  SKUs allowed on any of 7001–7004: 48 SKUs
+  Combined demand for those SKUs:   ~224,340 units (as of the original study)
+  Physical capacity (building CT @2.5 min, 1 cavity): 4×90×192 = 69,120 units
+  Physical capacity (building CT @3.0 min, 1 cavity): 4×90×160 = 57,600 units
+  Root cause of low output cited at the time: 48 SKUs on 4 machines → very
+  short campaigns per SKU, excessive CO time, low effective utilisation.
+  Fix cited at the time: reduce distinct SKUs on 7001–7004, run longer campaigns.
 ```
 
 ### 7.1 The Two-Level Availability Chain
@@ -1076,7 +1149,7 @@ Step 3 (curing_b2c.py):
 | `DEFAULT_CYCLE_TIME_MIN` | 17.0 | effective CT when SKU missing from DB |
 | `CAVITIES_PER_MOULD` | 2 | tyres per curing cycle |
 | `MOULDS_PER_PRESS` | 2 | tracked for mould-life; not in output formula |
-| `MAX_CHANGEOVERS_PER_DAY` | **10** — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
+| `MAX_CHANGEOVERS_PER_DAY` | **14** (current value, up from 10) — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
 | `CURING_CO_CHANGEOVER_MINS` | **490** | changeover duration — full shift (press OCCUPIED) |
 | `CURING_CO_DURATION_SHIFTS` | **1** | shifts idle per CO: Shift A only; Shift B is RUNNING |
 | `OPENING_GT_INVENTORY` | from DB | loaded from `gt_inventory_manual` at plan start |
@@ -1189,7 +1262,7 @@ Effective Stage-1 needed ≈ 1,886 / 164 ≈ 11.5 machines
   further reduced because carcass cold start blocks Stage-2 on Shift 1 (Day 1)
 ```
 
-Stage-1 utilisation improves only if Stage-2 GT demand grows — i.e., more Runner-In or NRI SKUs are assigned to Stage-2 (two-piece tyre) building machines. This is driven by `Master_Building_Allowable_Machines_source`.
+Stage-1 utilisation improves only if Stage-2 GT demand grows — i.e., more Runner-In or NRI SKUs are assigned to Stage-2 (two-piece tyre) building machines. This is driven by `Master_Building_Allowable_Machines` (renamed from `Master_Building_Allowable_Machines_source`, see §5.1).
 
 ### 18.4 NRI SKUs with Zero Production — Root Cause
 
@@ -1197,7 +1270,7 @@ NRI SKUs can have zero production for two distinct reasons:
 
 | Root Cause | Skip_Reason in output | Fix |
 |---|---|---|
-| No allowable building machine in master data or history | `NRI: no building machine allocated — check allowable machines master data` | Add SKU to `Master_Building_Allowable_Machines_source` or source from history |
+| No allowable building machine in master data or history | `NRI: no building machine allocated — check allowable machines master data` | Add SKU to `Master_Building_Allowable_Machines` (renamed from `Master_Building_Allowable_Machines_source`). **Status Jul 10 2026:** confirmed fixed — in the latest output (`bc_building_schedule_2026-05-01.xlsx`, Demand Fulfillment (B2C) sheet) 0 of 97 SKUs have `Eligible_Machines == 0`; every SKU has at least one certified building machine. Remaining UNMET SKUs (8, gap 3,687 units) all have eligible machines assigned — their gap is production-days/curing-throughput limited, not a missing-machine-data issue. |
 | Building capacity already consumed by higher-priority SKUs | `NRI: partial build — building capacity shared with higher-priority SKUs` | Free up capacity by tightening Runner-In demand cap; check CO budget |
 | Curing CO deferred past horizon | `NRI: curing CO deferred — 8 CO/day cap reached` | Extend horizon or allow more COs in early days |
 
@@ -1817,7 +1890,7 @@ to any SKU absent from the size master. Verified: `"1325216814085SURL0"[8:10] = 
 | `curing_consumption_dynamic.py` | **DONE** | CO from curing allowable table. CO sort: min-CT first → exclusive press first. CO over-aggressiveness guard in main CO loop (line ~339): skip CO if `remaining_demand / ((n-1) × rate_per_day) > horizon_left`. Rescue pass has equivalent guard. |
 | `bc_config.py` | **DONE** | `GT_BUFFER_SHIFTS`, `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT`, building CO time maps. **Jul 2026:** `CURING_CO_DURATION_SHIFTS=1`, `CURING_CO_CHANGEOVER_MINS=490` (mould-clean removed from model). |
 | `curing_b2c.py` | **DONE** | `cured = min(capacity, gt_available)` — GT-balance curing simulation. **Jul 2026:** MOULD_CLEAN removed: `co_trans` sets Shift B = RUNNING (not MOULD_CLEAN); MOULD_CLEAN branch removed from press simulation loop and Excel formatting. Curing Machine Utilization sheet now shows separate Prod_Mins and CO_Mins columns. |
-| DB `Master_Building_Allowable_Machines_source` | **DONE** | 2 SKUs inserted; 7501 extended. |
+| DB `Master_Building_Allowable_Machines` (renamed from `_source`, schema changed to single `Machines` comma-string column — commit `63d193f`) | **DONE** | 2 SKUs inserted; 7501 extended; 7104 added for HURL0 (confirmed FULLY MET, 102% of demand, in the Jul 10 2026 output). |
 
 ### 19.15 Rolling Pipeline — Implementation Details (`b2c_pipeline.py`)
 
@@ -1934,9 +2007,10 @@ for day D in 1..31:
 | Gap | Size | Required action |
 |-----|------|----------------|
 | BJ structural oversubscription | ~20k | Add BJ curing presses or certify BJ SKUs on VMI |
-| No-machine-data SKUs (7 SKUs) | ~51k | Add to `Master_Building_Allowable_Machines_source` |
-| Curing-limited RI SKUs | ~20k | Schedule curing COs to add presses for these SKUs |
-| **Permanent ceiling (scheduler only)** | **~91k gap remains** | — |
+| No-machine-data SKUs | **RESOLVED as of Jul 10 2026** — 0 of 97 SKUs now show `Eligible_Machines == 0` in the building Demand Fulfillment sheet | Was: add to `Master_Building_Allowable_Machines_source` (table since renamed to `Master_Building_Allowable_Machines`) |
+| Curing-limited RI SKUs | ~20k (e.g. `1D25212812086FXPC0` gap 19,937 in the latest run) | Schedule curing COs to add presses for these SKUs |
+| **Permanent ceiling (scheduler only)** | **~91k gap remains** | *(historical estimate — superseded by the confirmed Jul 10 2026 run below)* |
 | **Actual rolling pipeline (May 2026, Jul 2026 run — after demand_done CO fix + CT fix)** | **617,939 cured / 693,748 demand = 89.1%** | demand_done_free presses CO immediately; real CTs loaded from DB (was always 17.0 due to wrong column key) |
 | **Achievable with data fix (add 7104 to HURL0 allowable + allowable master updates)** | **~620–625k / 693k ≈ 89–90%** | +5,876 from HURL0; remaining gap = structural |
 | **True ceiling (more BJ presses + all master data certified)** | **~640k+ / 693k ≈ 92%+** | All structural gaps closed |
+| **Confirmed Jul 10 2026 (commit `f86f70b`, corrected `_BLD_CT_SEC` per-machine building CT)** | **GT built 647,521 / GT cured (Machine Schedule total) 648,992 / demand 693,748 → building coverage 93.3%** | Source: `data/output/main_output/bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C)) and `bc_curing_b2c.xlsx` (Machine Schedule), both generated 2026-07-10 02:33, same session as the `f86f70b` commit. HURL0 (`1325218614088HURL0`) now FULLY MET (102%); TVECE (`1325218614088TVECE`) now FULLY MET (96.5%). 98 curing COs; 1,409 building COs (1,391 same_size_CO / 18 diff_size_CO). Remaining gap (~46k) is dominated by 9 PARTIAL SKUs (41,559 units, led by FXPC0 at 19,937 — curing-throughput limited) + 8 UNMET SKUs (3,687 units, all with eligible building machines — production-days/curing-limited, not missing data). |

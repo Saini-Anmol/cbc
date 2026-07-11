@@ -236,7 +236,7 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 **Tension 1 — Idle vs CO:** Every CO on a building machine costs production time. VMI same-size CO = 20 min (4.2%). Stage-1/Unistage diff-size CO = 180 min (37.5%). Never go idle if a genuine NRI SKU has spare curing capacity and CO cost is low relative to remaining shift. Accept idle when demand is fulfilled or remaining time < CO cost.
 
 **Tension 2 — Low utilisation + unfulfilled demand (5 root causes):**
-- **Case A:** Machine pool missing the right SKU → check `Master_Building_Allowable_Machines_source`
+- **Case A:** Machine pool missing the right SKU → check `Master_Building_Allowable_Machines` (renamed from `Master_Building_Allowable_Machines_source`; schema is now a single comma-separated `Machines` column)
 - **Case B:** CO budget starved (7001–7004 pattern) → campaign consolidation
 - **Case C:** LP cap collapse Day 2+ → `OVERBUILD_BUFFER_FRAC = 0.2` prevents this
 - **Case D:** NRI CO deferred past horizon → allow earlier CO scheduling
@@ -256,9 +256,11 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `MIN_CAMPAIGN_UNITS` | 40 | Minimum units per campaign. |
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. |
-| `MAX_CHANGEOVERS_PER_DAY` | **14** | Curing CO cap per calendar day. Single source of truth in `bc_config.py`. |
+| `MAX_CHANGEOVERS_PER_DAY` | **14** | Curing CO cap per calendar day. Single source of truth in `bc_config.py`. Tuning history (from inline comments in `bc_config.py`): 8/day → ~594k GT baseline; 10/day → ~615k (balanced NRI activation); 14/day → ~650k target (activates more NRI COs — TTMX0/MSXT0/TUHL0/HURL0 gain ~20k units; also routes more Runner-Out presses to FXPC0). |
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
 | `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: shifts of GT to pre-build as buffer. VMI uses 2; BJ/UNI/STAGE use 1. |
+| `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | **2** | Cap on changeovers a single building machine may perform in one shift (rolling pipeline only). Plant averages 0.57 CO/shift/machine; upper bound of 2 lets one machine serve up to 3 SKU campaigns/shift. Must be `same_size_CO` to hold the 80% utilisation floor — 2× `diff_size_CO` (240 min VMI) would blow past it and is blocked. |
+| `MIN_SHIFT_UTILISATION` | **0.80** | Target: each building machine should hit ≥80% production time per shift (384 of 480 min). **Defined in `bc_config.py` but not currently imported/referenced by `b2c_pipeline.py`, `building_b2c.py`, or `building.py`** — grep confirms no other file reads this constant. Treat it as an aspirational target documented in `bc.md` §19, not an enforced guard, until it is wired into the rolling-pipeline code. |
 | `CURING_CO_DURATION_SHIFTS` | **1** | Shifts a curing press is idle during CO: Shift A only. Mould-clean removed from model. |
 | `CURING_CO_CHANGEOVER_MINS` | **490** | Shift A duration for curing CO (full shift occupied). |
 | `PRE_START_SHIFTS` | **2** | Building pre-starts N shifts before plan_start. |
@@ -329,12 +331,12 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 |-------|-----------|--------|
 | Stage-1 util 0% in output | Stage-1 excluded from GT scheduling | **Fixed:** Step 3b added — carcass production simulated per shift; real util shows in output |
 | 1325217613082TUNE0 (13") gap | 7106 (dom=13") was serving 15" truck SKUs due to high deficit | **Fixed:** BJ hard-inch filters in `_HARD` dict — 7106/7103/7105 restricted to 13" only |
-| HURL0 (1325218614088HURL0) zero production | 7104 missing from DB allowable for HURL0 | **Data fix needed:** add 7104 to `Master_Building_Allowable_Machines_source` for HURL0 |
-| TVECE (1325218614088TVECE) partial production | BJ structural oversubscription (249k demand / 184k capacity = 136%) | Structural — needs more BJ capacity or VMI certification |
-| Starvation events (~3,033) | BJ oversubscription — building cannot supply all BJ presses at full rate | Pre-existing structural; not caused by scheduling changes |
-| VMIMAXX 27k gap | CO overhead + idle tail (scheduling recoverable ~10–15k) | Structural ceiling at 88.6%; VMIMAXX is undersubscribed at 67% capacity |
-| BJ 20k gap | Structurally oversubscribed; 1225221715115SSTL0 capped at curing throughput | **Root cause is curing presses, not building.** Fix = curing CO to add presses |
-| ~59k unmet demand (7 SKUs) | No allowable building machine in master data | Permanently unbuilt until `Master_Building_Allowable_Machines_source` updated |
+| HURL0 (1325218614088HURL0) zero production | 7104 missing from DB allowable for HURL0 | **Fixed and confirmed:** 7104 added to `Master_Building_Allowable_Machines` (table renamed from `Master_Building_Allowable_Machines_source`, schema changed to a comma-string `Machines` column — commit `63d193f`). Jul 10 2026 output shows this SKU FULLY MET (5,995 built / 5,876 demand = 102%). |
+| TVECE (1325218614088TVECE) partial production | BJ structural oversubscription (249k demand / 184k capacity = 136%) | **Improved — confirmed FULLY MET in the Jul 10 2026 output** (both TVECE SKU variants, 96.5% and 95.9% of demand). BJ is still structurally oversubscribed plant-wide (see BJ 20k gap row below); this particular SKU is no longer the visible symptom. |
+| Starvation events (~3,033) | BJ oversubscription — building cannot supply all BJ presses at full rate | **Not currently tracked in rolling-pipeline output.** No "starvation" sheet/column exists in `bc_curing_b2c.xlsx` or `bc_building_schedule_*.xlsx` as of Jul 10 2026 — this number is from a legacy run and cannot be reconfirmed without new instrumentation. Architecturally, curing is derived from building output (zero starvation by construction), so this figure describes the pre-derivation legacy path, not the current rolling pipeline. |
+| VMIMAXX 27k gap | CO overhead + idle tail (scheduling recoverable ~10–15k) | Structural ceiling at 88.6%; VMIMAXX is undersubscribed at 67% capacity. **Not reconfirmed against the Jul 10 2026 run** — the building-CT correction (commit `f86f70b`) changes VMIMAXX per-machine throughput assumptions; this analysis predates that fix. |
+| BJ 20k gap | Structurally oversubscribed | **Still valid, dominant SKU changed.** In the Jul 10 2026 output the largest PARTIAL-status gap is `1D25212812086FXPC0` (Runner-In, demand 21,217, built 1,280, gap 19,937 — curing-throughput limited). `1225121715115SSTL0`'s gap has shrunk to 3,032 (2,517 of 5,549 built, 55% fulfilled) — still curing-limited but no longer the largest contributor. **Root cause is curing presses, not building.** Fix = curing CO to add presses. |
+| ~59k unmet demand (7 SKUs) | No allowable building machine in master data | **Resolved as of Jul 10 2026** — confirmed via `bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C) sheet): 0 of 97 SKUs have `Eligible_Machines == 0`. Table renamed `Master_Building_Allowable_Machines_source` → `Master_Building_Allowable_Machines`. Remaining unmet demand (8 UNMET SKUs, 3,687 units total) all have eligible building machines — the gap is now production-days/curing-throughput limited, not a missing-data problem. |
 | Curing press IDs short by 30 | `_load_press_state` used `wcID` instead of `WCNAME_clean` | **Fixed:** curing_b2c.py uses WCNAME_clean (e.g. "75206") |
 
 ---
@@ -395,25 +397,39 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (May 2026, Jul 2026 run — after soft-lock + allow_new_co removed)
+## Current KPIs (confirmed Jul 10 2026, commit `f86f70b` — "Corrected CT as per production and norms")
 
-| KPI | Value |
-|-----|-------|
-| Total demand (demand_may.xlsx) | 693,748 |
-| GT built | 621,507 |
-| GT cured | 623,230 |
-| Demand coverage | 89.8% |
-| Curing COs scheduled | 98 |
-| GT written off | 2,616 |
-| Starvation events | 2,857 |
+Output history across recent commits (GT built/cured, from commit messages):
+609k/611k → 620k → 623k → 618k (after removing the allowable-matrix history union — a
+deliberate correctness trade-off, see Known Issues) → **~650k** (`f86f70b`, real per-machine
+`_BLD_CT_SEC` building cycle times, replacing the earlier under-specified assumption).
+
+| KPI | Value | Confirmed how |
+|-----|-------|----------------|
+| Total demand (demand_may.xlsx) | 693,748 | Matches across all recent runs |
+| GT built | **647,521** | `bc_building_schedule_2026-05-01.xlsx`, Demand Fulfillment (B2C) sheet, generated 2026-07-10 02:33 (same session as the `f86f70b` commit) |
+| GT cured (total units) | **648,992** | `bc_curing_b2c.xlsx`, Machine Schedule sheet ("Total Units"), same timestamp |
+| Demand coverage (building) | **93.3%** | 647,521 / 693,748 |
+| Curing COs scheduled | 98 | `bc_curing_b2c.xlsx`, Shift Schedule sheet, CHANGEOVER row count — unchanged from prior runs |
+| Building COs scheduled | **1,409** (1,391 same_size_CO / 18 diff_size_CO) | `bc_building_schedule_2026-05-01.xlsx`, Changeover Plan sheet — new metric, not previously tracked here |
+| GT written off | **not tracked in current rolling-pipeline output** | No such sheet/column exists in either output workbook as of Jul 10 2026. The prior figure (2,616) is from an older run and cannot be reconfirmed without new instrumentation. |
+| Starvation events | **not tracked in current rolling-pipeline output** | Same as above (prior figure 2,857 unconfirmed). Architecturally should be ~0 in the rolling pipeline (curing is derived from building output — see invariants), but no explicit counter exists to verify this in the output workbooks. |
+
+**SKU-level status (from the confirmed Jul 10 2026 run):** 68 FULLY MET, 9 PARTIAL (gap 41,559 —
+largest: `1D25212812086FXPC0` at 19,937, curing-throughput limited), 8 UNMET (gap 3,687 — all 8
+have eligible building machines; limited by production days/curing throughput, not missing data).
 
 **Structural ceilings (cannot fix via scheduling alone):**
-- BJ: 249k demand / ~184k capacity = 136% oversubscribed → ~20k permanently unmet
-- No-machine-data SKUs: ~59k unbuilt → needs master data certification
+- BJ: 249,633 demand vs ~184k capacity = 136% oversubscribed → largest single driver is now
+  `1D25212812086FXPC0` (gap 19,937), not the older `1225121715115SSTL0` example (now down to a 3,032 gap)
+- No-machine-data SKUs: **resolved** — 0 of 97 SKUs currently show `Eligible_Machines == 0`
 - Curing-limited RI SKUs: building correct, need more curing presses
 
-**Scheduler ceiling (with HURL0 data fix + allowable master updates): ~620–625k**
+**Scheduler ceiling: confirmed ~647–649k as of Jul 10 2026** (superseding the earlier "~620–625k" estimate, which predates the `_BLD_CT_SEC` correction and the HURL0/7104 fix — both now confirmed done). The user has also reported "around 660k in both building and curing" this session; that figure has not been independently confirmed against an output file and may reflect a run slightly newer than the one cited above. Re-run `python b2c_pipeline.py` for an exact up-to-the-minute figure if precision matters.
 
 **Known calculation pitfall fixed (Jul 2026):**
 - CT bug: `cure_ct_map` was always empty due to wrong column key (`"CT_Min"` vs `"CycleTime_min"`).
   All SKUs fell back to `DEFAULT_CURING_CT = 17.0`. Fixed in `b2c_pipeline.py` line ~1132.
+- Building CT: `_BLD_CT_SEC` (per-machine seconds/unit) corrected against plant production norms
+  in commit `f86f70b` — every value in the dict changed (e.g. `6801` 150→127, `8101` 300→230,
+  `7101` 102.0→83.0).
