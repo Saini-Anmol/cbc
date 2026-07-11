@@ -390,33 +390,7 @@ class ETL:
         print(f"  [History] Loaded {len(hist)} (machine, SKU) pairs.")
         return hist
 
-    def load_running_machines_from_files(self, stage1_path, stage2_path):
-        """Read the cleaned running-machine snapshot (plant export) instead of
-        the live DB tables. Each file's "machine_current_sku" sheet already
-        holds one row per machine = its most recent SKU in the snapshot window.
-        """
-        rows = []
-        for path in (stage1_path, stage2_path):
-            df = pd.read_excel(path, sheet_name="machine_current_sku")
-            for _, r in df.iterrows():
-                rows.append({"Machine": str(r["Machine"]), "SKUCode": str(r["SKUCode"])})
-        return (
-            pd.DataFrame(rows) if rows
-            else pd.DataFrame(columns=["Machine", "SKUCode"])
-        )
-
     def load_running_machines(self):
-        try:
-            import bc_config as _bcc
-            s1_path = getattr(_bcc, "RUNNING_MACHINES_STAGE1_FILE", None)
-            s2_path = getattr(_bcc, "RUNNING_MACHINES_STAGE2_FILE", None)
-            if s1_path and s2_path and os.path.exists(s1_path) and os.path.exists(s2_path):
-                print("  [Running] Loading machine_current_sku from cleaned snapshot files "
-                      "(not live DB) …")
-                return self.load_running_machines_from_files(s1_path, s2_path)
-        except Exception as e:
-            print(f"  ⚠️  Running-machine snapshot files unavailable, falling back to DB: {e}")
-
         rows = []
         for table, name_map in [
             ("TBMStage1_ProductionEventData", self.S1_NAME_MAP),

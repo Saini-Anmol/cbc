@@ -97,20 +97,6 @@ MIN_SHIFT_UTILISATION = 0.80
 # 4. BUILDING SCHEDULER  →  building_b2c.py  +  building.py Config
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Running-machine snapshot (seeds machine_current_sku at plan start) ───────
-# Cleaned plant export: which building machine was producing which SKU as of
-# the plan-start snapshot (30 Apr 23:00 -> 1 May 07:00). Each file's
-# "machine_current_sku" sheet already holds one row per machine = its most
-# recent RecipeCode in the window (machines with no event in the window are
-# absent = idle, not fabricated). When both files exist, ETL.load_running_machines()
-# reads them instead of querying the live TBMStage1/2_ProductionEventData tables.
-RUNNING_MACHINES_STAGE1_FILE = os.path.join(
-    cbc_env.HERE, "data", "running_prod", "building_Stage1_running_1stMAY_cleaned.xlsx"
-)
-RUNNING_MACHINES_STAGE2_FILE = os.path.join(
-    cbc_env.HERE, "data", "running_prod", "building_Stage2_running_1stMAY_cleaned.xlsx"
-)
-
 # ── Building machine changeover times (minutes) ──────────────────────────────
 # Two CO types: same_size_CO (inch unchanged, only recipe/compound changes)
 #               diff_size_CO (inch changes — mould size must change)
