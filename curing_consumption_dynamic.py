@@ -84,6 +84,12 @@ from bc_config import (
     CO_CLASS_B_THRESHOLD,
 )
 
+# Curing-side ratio alignment: replaces Priority_Score in _urgency_sort_key with
+# static demand[target]/press_total_demand[press] (never decremented), mirroring
+# the building-side _BUILDING_RATIO_ENABLED mechanism in b2c_pipeline.py. Class
+# A/B urgency gating is untouched — this only changes ranking within a class.
+_CURING_RATIO_ENABLED = True
+
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
 _BLUE  = "D6E4F0"
@@ -202,6 +208,33 @@ class COScheduler:
             for p in presses:
                 press_to_demand_targets.setdefault(p, []).append(sku)
 
+        # Static per-press total demand for _CURING_RATIO_ENABLED — computed once
+        # from the fixed demand file, never decremented (mirrors machine_total_demand
+        # in b2c_pipeline.py's _priority_tier).
+        press_total_demand: dict[str, float] = {
+            p: sum(demand_map.get(s, 0.0) for s in targets)
+            for p, targets in press_to_demand_targets.items()
+        }
+
+        def _priority_signal(target: str, p: str) -> float:
+            # RI keeps existing Priority_Score-driven urgency untouched — its
+            # eligibility/urgency logic already reflects real running-press state.
+            # Ratio only re-ranks NRI candidates (mirrors _priority_tier on the
+            # building side: RI stays governed by its existing signal, NRI gets ratio).
+            if _CURING_RATIO_ENABLED and target in nri_skus:
+                return demand_map.get(target, 0.0) / press_total_demand.get(p, 1e-9)
+            return float(priority_map.get(target, 0))
+
+        def _sku_priority_signal(s: str) -> float:
+            # Rescue pass has no single press yet — use the most-favorable ratio
+            # across the SKU's own compatible press pool (still fully static).
+            if _CURING_RATIO_ENABLED:
+                presses = sku_to_presses.get(s, set())
+                if not presses:
+                    return 0.0
+                return max(_priority_signal(s, p) for p in presses)
+            return float(priority_map.get(s, 0))
+
         # ── Running state ─────────────────────────────────────────────────────
         press_count: dict[str, int] = {}
         for _, r in df_day0.iterrows():
@@ -290,7 +323,7 @@ class COScheduler:
                         continue
 
                     key = _urgency_sort_key(
-                        priority_score=float(priority_map.get(target, 0)),
+                        priority_score=_priority_signal(target, p),
                         current_press_count=n_t,
                         updated_demand=rem,
                         rate_per_day=rate_t,
@@ -379,7 +412,7 @@ class COScheduler:
             nri_skus - scheduled_nri,
             key=lambda s: (
                 *_urgency_sort_key(
-                    float(priority_map.get(s, 0)),
+                    _sku_priority_signal(s),
                     0,
                     float(updated_demand.get(s, 0)),
                     _qty_per_press_per_day(ct_map.get(s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)),
