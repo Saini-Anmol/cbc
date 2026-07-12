@@ -353,7 +353,7 @@ def _assign_building_shift(
                 and _deficit(s) > 0
             ]
             if partner_candidates:
-                partner = max(partner_candidates, key=lambda s: _deficit(s))
+                partner = max(partner_candidates, key=lambda s: (_deficit(s), s))
                 partner_inch = sku_inch.get(partner, "")
                 partner_dwell = max(
                     MIN_CAMPAIGN_MINS,
@@ -370,7 +370,7 @@ def _assign_building_shift(
         if not cur_sku:
             best_start = min(
                 (s for s in eligible if _deficit(s) > 0),
-                key=lambda s: (0 if sku_inch.get(s, "") == dom_inch else 1, -_deficit(s)),
+                key=lambda s: (0 if sku_inch.get(s, "") == dom_inch else 1, -_deficit(s), s),
                 default=None,
             )
             if best_start is not None:

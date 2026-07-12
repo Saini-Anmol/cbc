@@ -1729,6 +1729,42 @@ Carry-over (GT overloaded):
 
 ---
 
+### 19.8a Round-trip buffer sizing (current -- widens 19.8's flat buffer per shift)
+
+Live in `_assign_building_shift` (`b2c_pipeline.py`, function starts ~line 274), gated by the
+module-level flag `_ROUND_TRIP_BUFFER_ENABLED = True` (~line 99). This is a scheduling-logic
+mechanism, not a new `bc_config.py` constant -- it reuses `MIN_CAMPAIGN_MINS`, `SHIFT_MINS`, and
+the existing CO-cost tables.
+
+The flat buffer from 19.8 (`GT_BUFFER_SHIFTS` = 2 for VMI, 1 for BJ/Unistage/Stage-2) assumes a
+machine keeps serving its current SKU. That understates the buffer a SKU actually needs when its
+machine is about to CO away to serve a second live SKU and come back -- the current SKU's press
+can starve while the machine is away. Each shift, before Campaign 1 runs, the machine computes an
+`effective_buf` for its current SKU (`cur_sku`):
+
+```
+Skip conditions (fall back to flat _buf from 19.8):
+  - machine has only one eligible SKU              (len(eligible) <= 1)
+  - no other eligible SKU has unmet demand         (demand_remaining[s] <= 0 for all s != cur_sku)
+  - no other eligible SKU has a real current deficit (_deficit(s) <= 0 for all s != cur_sku)
+
+Otherwise, pick the rotation partner = eligible SKU (!= cur_sku, demand_remaining > 0,
+  _deficit > 0) with the highest _deficit.
+
+  partner_dwell   = max(MIN_CAMPAIGN_MINS, _deficit(partner) / rate)
+  round_trip_mins = CO(cur_sku -> partner) + partner_dwell + CO(partner -> cur_sku)
+  effective_buf   = max(flat_buf, round_trip_mins / SHIFT_MINS)
+```
+
+`effective_buf` only ever **widens** the buffer relative to the flat `19.8` rule -- it never
+shrinks it. Applies to every machine group (VMI, BJ, Unistage, Stage-2), not just VMI.
+
+Net effect (confirmed Jul 12 2026 run): GT built rose from 647,521 to 654,572 and GT cured from
+648,992 to 655,845 relative to the prior flat-buffer-only state -- see §20.4 for the updated KPI
+row.
+
+---
+
 ### 19.9 Starvation Prevention Guarantee
 
 ```
@@ -1949,7 +1985,7 @@ for day D in 1..31:
 ## 20. KPI Comparison — Old Architecture vs New Architecture (May 2026)
 
 > **Old architecture:** 31-day upfront LP; building first, curing derived after; TOPUP = 3 days.
-> **New architecture (rolling pipeline):** Per-shift rolling loop; simultaneous building + curing; max 2 COs/shift; GT_BUFFER_SHIFTS = 2 (VMI) / 1 (others).
+> **New architecture (rolling pipeline):** Per-shift rolling loop; simultaneous building + curing; max 2 COs/shift; GT_BUFFER_SHIFTS = 2 (VMI) / 1 (others), widened per-shift via round-trip buffer sizing (§19.8a) when a genuine rotation partner exists.
 > Numbers marked **[ACTUAL]** are measured from May 2026 runs. Old arch = legacy LP pipeline; New arch = rolling pipeline (current default).
 
 ### 20.1 Building Schedule KPIs
@@ -2013,4 +2049,5 @@ for day D in 1..31:
 | **Actual rolling pipeline (May 2026, Jul 2026 run — after demand_done CO fix + CT fix)** | **617,939 cured / 693,748 demand = 89.1%** | demand_done_free presses CO immediately; real CTs loaded from DB (was always 17.0 due to wrong column key) |
 | **Achievable with data fix (add 7104 to HURL0 allowable + allowable master updates)** | **~620–625k / 693k ≈ 89–90%** | +5,876 from HURL0; remaining gap = structural |
 | **True ceiling (more BJ presses + all master data certified)** | **~640k+ / 693k ≈ 92%+** | All structural gaps closed |
-| **Confirmed Jul 10 2026 (commit `f86f70b`, corrected `_BLD_CT_SEC` per-machine building CT)** | **GT built 647,521 / GT cured (Machine Schedule total) 648,992 / demand 693,748 → building coverage 93.3%** | Source: `data/output/main_output/bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C)) and `bc_curing_b2c.xlsx` (Machine Schedule), both generated 2026-07-10 02:33, same session as the `f86f70b` commit. HURL0 (`1325218614088HURL0`) now FULLY MET (102%); TVECE (`1325218614088TVECE`) now FULLY MET (96.5%). 98 curing COs; 1,409 building COs (1,391 same_size_CO / 18 diff_size_CO). Remaining gap (~46k) is dominated by 9 PARTIAL SKUs (41,559 units, led by FXPC0 at 19,937 — curing-throughput limited) + 8 UNMET SKUs (3,687 units, all with eligible building machines — production-days/curing-limited, not missing data). |
+| **Jul 10 2026 (commit `f86f70b`, corrected `_BLD_CT_SEC` per-machine building CT)** | **GT built 647,521 / GT cured (Machine Schedule total) 648,992 / demand 693,748 → building coverage 93.3%** | Source: `data/output/main_output/bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C)) and `bc_curing_b2c.xlsx` (Machine Schedule), both generated 2026-07-10 02:33, same session as the `f86f70b` commit. HURL0 (`1325218614088HURL0`) now FULLY MET (102%); TVECE (`1325218614088TVECE`) now FULLY MET (96.5%). 98 curing COs; 1,409 building COs (1,391 same_size_CO / 18 diff_size_CO). Remaining gap (~46k) is dominated by 9 PARTIAL SKUs (41,559 units, led by FXPC0 at 19,937 — curing-throughput limited) + 8 UNMET SKUs (3,687 units, all with eligible building machines — production-days/curing-limited, not missing data). Superseded by the row below. |
+| **Confirmed Jul 12 2026 (round-trip buffer sizing added to `_assign_building_shift`, §19.8a; this is the only scheduling-logic change since `f86f70b` — running-machine seeding, machine-scarcity-first ordering, and demand-ratio candidate ranking were all tried and reverted this session)** | **GT built 654,572 / GT cured 655,845 / demand 693,748 → demand coverage 94.5%** | Source: console output of `python b2c_pipeline.py` ("ROLLING PIPELINE — Results"), re-run and confirmed Jul 12 2026. 98 curing COs. GT written off 3,440; starvation events 1,908 (both printed directly by the pipeline). `starvation_n` counts press-shift rows where status is RUNNING but `GT_Inventory == 0` and `Qty == 0` (`b2c_pipeline.py` ~line 1750) — this is a nonzero, measured figure and is in tension with §19.9's "impossible by construction" framing; treat §19.9 as the design intent, not a guarantee verified against this counter. Worst remaining SKU by demand: `1D25212812086FXPC0` at 9,562 units (curing-throughput limited). |

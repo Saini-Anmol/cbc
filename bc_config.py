@@ -57,7 +57,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 14
+MAX_CHANGEOVERS_PER_DAY = 28
 # Hard cap on CURING PRESS COs scheduled per calendar day (unchanged in new arch).
 # 8  → ~594k GT (May 2026 baseline).
 # 10 → ~615k (balanced NRI activation).
@@ -86,7 +86,7 @@ MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2
 #   2 × same_size_CO (VMI 20 min) =  40 min overhead → 91.7% production  ✓ (max allowed)
 #   2 × diff_size_CO (VMI 120 min) = 240 min overhead → 50% production   ✗ BLOCKED
 
-MIN_SHIFT_UTILISATION = 0.80
+MIN_SHIFT_UTILISATION = 0.77
 # Each building machine must achieve ≥ 80% production time per shift.
 # Expressed as fraction of SHIFT_MINS (480 min): floor = 384 production minutes.
 # Used to: (a) block a CO if remaining time after it < 384 min, (b) trigger

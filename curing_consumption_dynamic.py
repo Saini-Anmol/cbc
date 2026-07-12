@@ -249,9 +249,9 @@ class COScheduler:
             # 2. Demand-running presses whose SKU demand just hit 0
             #    → tracked in demand_done_free: these presses are producing NOTHING useful,
             #      so any CO (Class A or B) is strictly better than sitting idle.
-            newly_free: list[str] = list(pending_ro_presses)
+            newly_free: list[str] = sorted(pending_ro_presses)
             demand_done_free: set[str] = set()
-            for p in demand_running_presses:
+            for p in sorted(demand_running_presses):
                 current_sku = press_to_sku.get(p)
                 if current_sku and updated_demand.get(current_sku, 0) <= 0:
                     newly_free.append(p)
@@ -263,7 +263,7 @@ class COScheduler:
             # Score candidates: target = NRI (any) OR under-supplied RI
             # Under-supplied RI: current press count cannot meet demand in time
             candidates: list[tuple] = []
-            for p in set(newly_free):          # deduplicate
+            for p in dict.fromkeys(newly_free):  # deduplicate, order-preserving
                 old_sku = press_to_sku.get(p, "")
                 for target in press_to_demand_targets.get(p, []):
                     if target == old_sku:
@@ -304,6 +304,7 @@ class COScheduler:
                 x[0][1], x[0][2],                                  # −priority, after_days (urgency first)
                 ct_map.get(x[3], _dct),                            # CT as tiebreaker (throughput)
                 len(press_to_demand_targets.get(x[1], [])),         # exclusive press first (fewer targets)
+                x[1], x[3],                                        # press, target SKU — final deterministic tiebreak
             ))
 
             assigned: set = set()
@@ -376,12 +377,15 @@ class COScheduler:
         scheduled_nri = {ev["new_sku"] for ev in co_events if ev["new_sku"] in nri_skus}
         rescue_nri = sorted(
             nri_skus - scheduled_nri,
-            key=lambda s: _urgency_sort_key(
-                float(priority_map.get(s, 0)),
-                0,
-                float(updated_demand.get(s, 0)),
-                _qty_per_press_per_day(ct_map.get(s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)),
-                0,
+            key=lambda s: (
+                *_urgency_sort_key(
+                    float(priority_map.get(s, 0)),
+                    0,
+                    float(updated_demand.get(s, 0)),
+                    _qty_per_press_per_day(ct_map.get(s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)),
+                    0,
+                ),
+                s,  # final deterministic tiebreak
             ),
         )
         n_rescued = 0

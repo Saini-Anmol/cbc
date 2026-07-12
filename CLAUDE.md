@@ -268,6 +268,31 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | Stage-1 carcass shelf life: 1 day. |
 | `Stage-2 CO time multiplier` | **2.0×** | Stage-2 `co_time_map` uses `diff × 2.0` (88 → 176 min) to discourage LP from overloading Stage-2. |
 
+### Round-trip buffer sizing (scheduling-logic mechanism, not a new config constant)
+
+Live in `_assign_building_shift` (`b2c_pipeline.py`, function starts ~line 274), gated by the
+module-level flag `_ROUND_TRIP_BUFFER_ENABLED = True` (~line 99). Reuses existing constants
+(`MIN_CAMPAIGN_MINS`, `SHIFT_MINS`, the CO-cost tables) — no dedicated `bc_config.py` parameter.
+
+Previously the buffer target for how far a machine builds ahead of curing consumption was a
+flat multiplier: `_buf = GT_BUFFER_SHIFTS` (2) for VMI machines, `1` for everyone else. Now, each
+shift, before Campaign 1 runs, the machine computes an `effective_buf` for its current SKU:
+
+- **Skip conditions (fall back to flat `_buf`):** machine has only one eligible SKU
+  (`len(eligible) <= 1`); no other eligible SKU has unmet demand
+  (`demand_remaining[s] <= 0`); or no other eligible SKU has a real current deficit
+  (`_deficit(s) <= 0`).
+- **When a genuine rotation partner exists** (another eligible SKU with unmet demand and a real
+  deficit, picked by `max(_deficit)`), the buffer is sized to survive: `CO(cur→partner)` +
+  partner's own deficit-driven dwell time (floored at `MIN_CAMPAIGN_MINS`) + `CO(partner→cur)`,
+  divided by `SHIFT_MINS`.
+- `effective_buf = max(flat_buf, round_trip_buf)` — it only ever **widens** the buffer, never
+  shrinks it below the old flat behavior.
+
+Intent: if a machine is about to CO away to serve another live SKU and come back later, the
+current SKU's press shouldn't starve while the machine is away. Applies to all machine groups
+(VMI, BJ, Unistage, Stage-2), not just VMI.
+
 ---
 
 ## Pipeline execution order
@@ -293,6 +318,9 @@ for Day D in 1..31:
 
     Step 2 — Greedy building assignment (_assign_building_shift)
       For each machine M (VMI first, then BJ, Unistage, Stage2):
+        Round-trip buffer sizing: widen the buffer for cur_sku if a genuine
+          rotation partner (other eligible SKU, real deficit + unmet demand)
+          exists — see "Round-trip buffer sizing" under Key config parameters
         Campaign 1: serve current SKU (no CO)
         Campaign 2+: CO to deficit SKUs any shift (A/B/C), same-inch first (dominant inch preferred)
         guard: CO_cost ≤ 30% remaining, max 2 COs/shift
@@ -397,35 +425,32 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed Jul 10 2026, commit `f86f70b` — "Corrected CT as per production and norms")
+## Current KPIs (confirmed Jul 12 2026 — round-trip buffer sizing live, `python b2c_pipeline.py`)
 
-Output history across recent commits (GT built/cured, from commit messages):
+Output history across recent commits/sessions (GT built/cured):
 609k/611k → 620k → 623k → 618k (after removing the allowable-matrix history union — a
-deliberate correctness trade-off, see Known Issues) → **~650k** (`f86f70b`, real per-machine
-`_BLD_CT_SEC` building cycle times, replacing the earlier under-specified assumption).
+deliberate correctness trade-off, see Known Issues) → 647,521/648,992 (`f86f70b`, real
+per-machine `_BLD_CT_SEC` building cycle times) → **654,572/655,845** (round-trip buffer
+sizing added to `_assign_building_shift`; running-machine seeding, scarcity-first machine
+ordering, and demand-ratio candidate ranking were all tried this session and explicitly
+reverted — only round-trip buffer sizing is live).
 
 | KPI | Value | Confirmed how |
 |-----|-------|----------------|
 | Total demand (demand_may.xlsx) | 693,748 | Matches across all recent runs |
-| GT built | **647,521** | `bc_building_schedule_2026-05-01.xlsx`, Demand Fulfillment (B2C) sheet, generated 2026-07-10 02:33 (same session as the `f86f70b` commit) |
-| GT cured (total units) | **648,992** | `bc_curing_b2c.xlsx`, Machine Schedule sheet ("Total Units"), same timestamp |
-| Demand coverage (building) | **93.3%** | 647,521 / 693,748 |
-| Curing COs scheduled | 98 | `bc_curing_b2c.xlsx`, Shift Schedule sheet, CHANGEOVER row count — unchanged from prior runs |
-| Building COs scheduled | **1,409** (1,391 same_size_CO / 18 diff_size_CO) | `bc_building_schedule_2026-05-01.xlsx`, Changeover Plan sheet — new metric, not previously tracked here |
-| GT written off | **not tracked in current rolling-pipeline output** | No such sheet/column exists in either output workbook as of Jul 10 2026. The prior figure (2,616) is from an older run and cannot be reconfirmed without new instrumentation. |
-| Starvation events | **not tracked in current rolling-pipeline output** | Same as above (prior figure 2,857 unconfirmed). Architecturally should be ~0 in the rolling pipeline (curing is derived from building output — see invariants), but no explicit counter exists to verify this in the output workbooks. |
-
-**SKU-level status (from the confirmed Jul 10 2026 run):** 68 FULLY MET, 9 PARTIAL (gap 41,559 —
-largest: `1D25212812086FXPC0` at 19,937, curing-throughput limited), 8 UNMET (gap 3,687 — all 8
-have eligible building machines; limited by production days/curing throughput, not missing data).
+| GT built | **654,572** | Console output of `python b2c_pipeline.py`, "ROLLING PIPELINE — Results" ("Total GT built"), re-run and confirmed Jul 12 2026 |
+| GT cured (total units) | **655,845** | Same console output ("Total cured") |
+| Demand coverage | **94.5%** | 655,845 / 693,748, printed directly by the pipeline |
+| Curing COs scheduled | 98 | Console output ("Curing COs scheduled") |
+| GT written off | **3,440** | Console output ("GT written off") — cumulative `_writeoff_stale_gt` over the 31-day run |
+| Starvation events | **1,908** | Console output ("Starvation events") — a press RUNNING with insufficient GT that shift; not necessarily zero because the rolling loop can still schedule a press to run before that shift's GT lands |
 
 **Structural ceilings (cannot fix via scheduling alone):**
-- BJ: 249,633 demand vs ~184k capacity = 136% oversubscribed → largest single driver is now
-  `1D25212812086FXPC0` (gap 19,937), not the older `1225121715115SSTL0` example (now down to a 3,032 gap)
-- No-machine-data SKUs: **resolved** — 0 of 97 SKUs currently show `Eligible_Machines == 0`
-- Curing-limited RI SKUs: building correct, need more curing presses
+- BJ: still structurally oversubscribed (249k demand vs ~184k capacity)
+- No-machine-data SKUs: resolved — 0 of 97 SKUs show `Eligible_Machines == 0`
+- Curing-limited RI SKUs: building correct, need more curing presses (worst remaining: `1D25212812086FXPC0` at 9,562 units, per the Jul 12 2026 run's "Worst 10 SKUs by remaining demand")
 
-**Scheduler ceiling: confirmed ~647–649k as of Jul 10 2026** (superseding the earlier "~620–625k" estimate, which predates the `_BLD_CT_SEC` correction and the HURL0/7104 fix — both now confirmed done). The user has also reported "around 660k in both building and curing" this session; that figure has not been independently confirmed against an output file and may reflect a run slightly newer than the one cited above. Re-run `python b2c_pipeline.py` for an exact up-to-the-minute figure if precision matters.
+**Scheduler ceiling: confirmed ~654–656k as of Jul 12 2026** (superseding the earlier "~647–649k" figure, which predates round-trip buffer sizing). Re-run `python b2c_pipeline.py` for an exact up-to-the-minute figure if precision matters — starvation/writeoff counts can vary slightly run-to-run.
 
 **Known calculation pitfall fixed (Jul 2026):**
 - CT bug: `cure_ct_map` was always empty due to wrong column key (`"CT_Min"` vs `"CycleTime_min"`).
