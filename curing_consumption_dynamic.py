@@ -177,8 +177,23 @@ class COScheduler:
         df_running_moulds: pd.DataFrame,
         ct_map: dict[str, float],
         max_co_per_day: int = MAX_CO_PER_DAY,
+        planning_days: int = PLANNING_DAYS,
+        ratio_demand_map: dict | None = None,
     ) -> list[dict]:
-        """Returns sorted list of CO events."""
+        """Returns sorted list of CO events.
+
+        planning_days: horizon length for THIS call (defaults to the module
+        constant, preserving legacy behavior exactly). Rolling-horizon callers
+        pass a shrinking remaining-horizon length instead of the fixed project
+        total.
+
+        ratio_demand_map: when provided, used instead of demand_map (built
+        from df_demand["Quantity"]) for the two ratio computations only
+        (press_total_demand, _priority_signal's numerator) — lets a caller
+        keep ratio ranking anchored to static/original total demand even when
+        df_demand["Quantity"] itself carries live/remaining demand. Defaults
+        to None, preserving legacy behavior exactly (both read demand_map).
+        """
 
         # ── press → current SKU map ───────────────────────────────────────────
         press_to_sku: dict[str, str] = {}
@@ -210,9 +225,13 @@ class COScheduler:
 
         # Static per-press total demand for _CURING_RATIO_ENABLED — computed once
         # from the fixed demand file, never decremented (mirrors machine_total_demand
-        # in b2c_pipeline.py's _priority_tier).
+        # in b2c_pipeline.py's _priority_tier). ratio_demand_map lets a rolling-horizon
+        # caller keep this anchored to static/original total demand even when
+        # demand_map itself (from df_demand["Quantity"]) carries live/remaining
+        # demand for THIS call — defaults to demand_map, matching legacy behavior.
+        _ratio_map = ratio_demand_map if ratio_demand_map is not None else demand_map
         press_total_demand: dict[str, float] = {
-            p: sum(demand_map.get(s, 0.0) for s in targets)
+            p: sum(_ratio_map.get(s, 0.0) for s in targets)
             for p, targets in press_to_demand_targets.items()
         }
 
@@ -222,7 +241,7 @@ class COScheduler:
             # Ratio only re-ranks NRI candidates (mirrors _priority_tier on the
             # building side: RI stays governed by its existing signal, NRI gets ratio).
             if _CURING_RATIO_ENABLED and target in nri_skus:
-                return demand_map.get(target, 0.0) / press_total_demand.get(p, 1e-9)
+                return _ratio_map.get(target, 0.0) / press_total_demand.get(p, 1e-9)
             return float(priority_map.get(target, 0))
 
         def _sku_priority_signal(s: str) -> float:
@@ -260,8 +279,8 @@ class COScheduler:
         daily_co_used: dict[int, int] = {}
 
         # ── Day-by-day simulation ─────────────────────────────────────────────
-        for day in range(1, PLANNING_DAYS + 1):
-            horizon_left = PLANNING_DAYS - day + 1
+        for day in range(1, planning_days + 1):
+            horizon_left = planning_days - day + 1
             co_used = daily_co_used.get(day, 0)
 
             # Drain demand by previous day's production
@@ -458,7 +477,7 @@ class COScheduler:
 
                     # Find earliest day with CO budget (needed for capacity check)
                     _co_day = next(
-                        (d for d in range(1, PLANNING_DAYS + 1)
+                        (d for d in range(1, planning_days + 1)
                          if daily_co_used.get(d, 0) < max_co_per_day),
                         None,
                     )
@@ -467,7 +486,7 @@ class COScheduler:
 
                     # Capacity: n_ri presses run days 1.._co_day, then n_ri−1 for rest
                     cap_before = n_ri * ri_rate * _co_day
-                    cap_after  = max(0, n_ri - 1) * ri_rate * (PLANNING_DAYS - _co_day)
+                    cap_after  = max(0, n_ri - 1) * ri_rate * (planning_days - _co_day)
                     if (cap_before + cap_after) < ri_full_demand:
                         continue  # CO would leave RI SKU demand unmet
 
@@ -494,7 +513,7 @@ class COScheduler:
                      if still_missing else ""))
 
         # ── Summary ───────────────────────────────────────────────────────────
-        total_slots = max_co_per_day * PLANNING_DAYS
+        total_slots = max_co_per_day * planning_days
         used_slots  = len(co_events)
         co_by_day   = {}
         for ev in co_events:
@@ -505,7 +524,7 @@ class COScheduler:
               f"({used_slots/total_slots*100:.1f}%)")
         print(f"  [CO Scheduler] Peak: Day {peak_day} "
               f"({co_by_day.get(peak_day,0)} COs)  |  "
-              f"Zero-CO days: {sum(1 for d in range(1,PLANNING_DAYS+1) if d not in co_by_day)}")
+              f"Zero-CO days: {sum(1 for d in range(1,planning_days+1) if d not in co_by_day)}")
 
         if pending_ro_presses:
             print(f"  [WARN] {len(pending_ro_presses)} RO presses still stranded at Day 31 "

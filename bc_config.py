@@ -57,7 +57,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 28
+MAX_CHANGEOVERS_PER_DAY = 18
 # Hard cap on CURING PRESS COs scheduled per calendar day (unchanged in new arch).
 # 8  → ~594k GT (May 2026 baseline).
 # 10 → ~615k (balanced NRI activation).

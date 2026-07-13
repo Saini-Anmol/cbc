@@ -113,7 +113,7 @@ Last planning day: no Day+1 demand → falls back to today's demand automaticall
 Changeover always takes Shift A (of the assigned day). Mould-clean is NOT modelled.
 First production of new SKU = Shift B onward (CURING_CO_DURATION_SHIFTS=1).
 
-> **Curing changeover cap: configurable (currently **14/day**); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
+> **Curing changeover cap: configurable (currently **18/day** — hard plant constraint); set `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` — single source of truth.**
 > Building machine changeovers are UNLIMITED — no daily cap applies.
 
 ### 3.2 Building Machine — FREE in shift S means ALL of:
@@ -432,7 +432,7 @@ Compute the full changeover plan from Day 0 data alone:
      **Exception (demand_done_free):** When a Runner-In press's demand hits 0 mid-horizon, it joins `demand_done_free`. These presses bypass the Class A gate and may CO to any target (Class A or B). Guard: Class B target requires `gt_inventory[target] ≥ _cure_qty_per_shift(ct)` to avoid starvation next shift.
    - Sort: `(urgency_class ASC, after_co_days ASC, −Priority_Score, −gt_signal, sku)`
    - Rationale for Class A only (general): firing Class B COs broadly activates too many NRI SKUs simultaneously → building CO explosion. demand_done_free exception is safe because those presses are already idle — any production is strictly better than idle.
-4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **14**; set in `bc_config.py` — single source of truth); excess deferred to next day. History: 8/day → ~594k GT; 10/day → ~615k; 14/day → ~650k target (activates more NRI COs, e.g. TTMX0/MSXT0/TUHL0/HURL0).
+4. **Max `MAX_CHANGEOVERS_PER_DAY` COs per day** (currently **18**; set in `bc_config.py` — single source of truth); excess deferred to next day. Sweep at current baseline: 18→670,744; 22→669,919; 26→671,058; 30→671,472 (climbs but 18 is the plant limit).
 5. CO takes effect same day (new SKU's press count updates on CO day; Shift B produces for new SKU — mould-clean removed).
 6. **CO Rescue pass** (runs after the main 31-day loop): NRI SKUs that received no CO
    in the main loop are sorted by the same urgency score. For each, search for an RI press
@@ -1149,7 +1149,7 @@ Step 3 (curing_b2c.py):
 | `DEFAULT_CYCLE_TIME_MIN` | 17.0 | effective CT when SKU missing from DB |
 | `CAVITIES_PER_MOULD` | 2 | tyres per curing cycle |
 | `MOULDS_PER_PRESS` | 2 | tracked for mould-life; not in output formula |
-| `MAX_CHANGEOVERS_PER_DAY` | **14** (current value, up from 10) — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
+| `MAX_CHANGEOVERS_PER_DAY` | **18** (current value; hard plant constraint) — set in `bc_config.py` (single source) | curing press changeovers only; **no limit on building machine COs**. Propagates to `building_b2c.py` and `curing_consumption_dynamic.py` automatically. |
 | `CURING_CO_CHANGEOVER_MINS` | **490** | changeover duration — full shift (press OCCUPIED) |
 | `CURING_CO_DURATION_SHIFTS` | **1** | shifts idle per CO: Shift A only; Shift B is RUNNING |
 | `OPENING_GT_INVENTORY` | from DB | loaded from `gt_inventory_manual` at plan start |
@@ -1917,6 +1917,41 @@ to any SKU absent from the size master. Verified: `"1325216814085SURL0"[8:10] = 
 
 ---
 
+### 19.13a Inch-Flexibility — Tier 3 (`_INCH_FLEX_ENABLED = True`, LIVE, generalizes the soft-lock)
+
+Plant production data (`data/plant_data/production_stage2_as.csv`, May 33-day window) proves the
+plant runs its multi-inch groups far more freely than our Tier-1 hard locks: **VMI 4.6 inches/machine,
+BJ 2.4, UNI 2.3, IRM 1.5**. Inch-flexibility unlocks the machine set the plant actually runs multi-inch,
+found by **brute-force over machine combinations**:
+
+- **Flex set = all VMI (6001-6004, 7001-7004) + all BJ (7101-7106, 7201)** = 15 machines, dropped from
+  `_HARD` (`_HARD.pop`) so their full DB allowable (14–18") becomes eligible. UNI_NARROW and STAGE2/IRM
+  stay hard-locked.
+- **Brute-force matrix** (flex set → cured / coverage / starvation, all CO=18, deterministic):
+  baseline 668,937/96.4%/2,030 · VMIMAXX 670,212/96.6%/1,951 · VMIMAXX+VMISOFT 670,540/96.7% ·
+  **VMI+BJ 670,744/96.7%/1,845 ← winner (best on every metric)** · any set with STAGE2 ≈ 608–614k/~88%
+  (Stage-1 carcass-dependency disruption — catastrophic) · +UNI 666,852/96.1% (tight 13" supply).
+- **Anti-carry-over reclamation guard** (the critical safety difference from the failed earlier attempts):
+  a flex machine that carried onto an off-inch SKU must return to dominant when a dominant-inch SKU
+  regains deficit — Campaign 1 `_flex_reclaim` guard + a merged-sort in Campaign 2+ that orders by
+  `inch_penalty` FIRST (so dominant always wins, regardless of which inch was carried over). Without
+  this, generalizing the soft-lock reintroduces the carry-over lock-in that regressed prior attempts
+  (starvation-feed 96.4→92.9%). Verified: dominant-inch press starvation went DOWN (14": −47, 15": −36).
+- **Off-inch gate + ordering**: off-inch served only when own-inch demand is done for the shift
+  (`primary_demand_done`, round-trip-buffer filled). Off-inch target ranked `starving_first` (beat
+  `demand_first`), tiebreak within the off-inch bucket only — never overrides inch preference.
+- **Extra CO budget** `_INCH_FLEX_EXTRA_COS = 2` → 4 building COs/shift for flex machines (vs 2), and the
+  30% CO-cost guard is bypassed for a flex machine going off-inch once its own inch is done (else the
+  diff-inch CO, up to 180 min, always exceeds 30% of a shift and the machine idles instead).
+
+**Honest decomposition:** off-inch building itself is a near-no-op (+52 units, ~2 off-inch COs/month —
+building is not the bottleneck, consistent with the whole session's finding). The real **+1,807** gain is
+the **extra CO budget** letting VMI+BJ machines serve more of their *own* dominant-inch SKUs; the
+brute-force isolated the machine set where that pays off and avoids where it backfires. Fully
+toggle-gated: `_INCH_FLEX_ENABLED = False` reproduces 668,937 bit-for-bit.
+
+---
+
 ### 19.14 Implementation Status — CURRENT
 
 | File | Status | What was done |
@@ -2050,4 +2085,5 @@ for day D in 1..31:
 | **Achievable with data fix (add 7104 to HURL0 allowable + allowable master updates)** | **~620–625k / 693k ≈ 89–90%** | +5,876 from HURL0; remaining gap = structural |
 | **True ceiling (more BJ presses + all master data certified)** | **~640k+ / 693k ≈ 92%+** | All structural gaps closed |
 | **Jul 10 2026 (commit `f86f70b`, corrected `_BLD_CT_SEC` per-machine building CT)** | **GT built 647,521 / GT cured (Machine Schedule total) 648,992 / demand 693,748 → building coverage 93.3%** | Source: `data/output/main_output/bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C)) and `bc_curing_b2c.xlsx` (Machine Schedule), both generated 2026-07-10 02:33, same session as the `f86f70b` commit. HURL0 (`1325218614088HURL0`) now FULLY MET (102%); TVECE (`1325218614088TVECE`) now FULLY MET (96.5%). 98 curing COs; 1,409 building COs (1,391 same_size_CO / 18 diff_size_CO). Remaining gap (~46k) is dominated by 9 PARTIAL SKUs (41,559 units, led by FXPC0 at 19,937 — curing-throughput limited) + 8 UNMET SKUs (3,687 units, all with eligible building machines — production-days/curing-limited, not missing data). Superseded by the row below. |
-| **Confirmed Jul 12 2026 (round-trip buffer sizing added to `_assign_building_shift`, §19.8a; this is the only scheduling-logic change since `f86f70b` — running-machine seeding, machine-scarcity-first ordering, and demand-ratio candidate ranking were all tried and reverted this session)** | **GT built 654,572 / GT cured 655,845 / demand 693,748 → demand coverage 94.5%** | Source: console output of `python b2c_pipeline.py` ("ROLLING PIPELINE — Results"), re-run and confirmed Jul 12 2026. 98 curing COs. GT written off 3,440; starvation events 1,908 (both printed directly by the pipeline). `starvation_n` counts press-shift rows where status is RUNNING but `GT_Inventory == 0` and `Qty == 0` (`b2c_pipeline.py` ~line 1750) — this is a nonzero, measured figure and is in tension with §19.9's "impossible by construction" framing; treat §19.9 as the design intent, not a guarantee verified against this counter. Worst remaining SKU by demand: `1D25212812086FXPC0` at 9,562 units (curing-throughput limited). |
+| Confirmed Jul 12 2026 (round-trip buffer sizing, §19.8a) | GT built 654,572 / GT cured 655,845 / 94.5% | Superseded by the row below. |
+| **Confirmed Jul 13 2026 (round-trip buffer + building-ratio + curing-ratio + overbuild fix + inch-flexibility §19.13a, brute-forced machine set; `MAX_CHANGEOVERS_PER_DAY=18`)** | **GT built 664,355 / GT cured 670,744 / demand 693,748 → demand coverage 96.7%** | Source: console output of `python b2c_pipeline.py`, deterministic (bit-for-bit reproducible). GT written off **627** (down from 3,440 — the overbuild fix: `_deficit()` cap now subtracts `projected_gt`, so total build ≤ demand). Starvation events **1,845**. 98 curing COs. Progression this cycle (all CO=18): 668,937/96.4% (ratios + overbuild fix) → 670,212 (VMIMAXX inch-flex) → **670,744/96.7%** (VMI+BJ flex, brute-force winner). CO-cap sweep: 22→669,919, 26→671,058, 30→671,472 (climbs, but 18 is a hard plant constraint). Plant-data benchmark (`Plant_vs_Scheduler_Report.pdf`): our AI plan (96.7% cured, 0 overbuild) beats the plant's demand-capped effective 95.9% (61k wasted overbuild) — the residual gap is externally confirmed curing-press/15"-tooling-limited, not scheduling. |

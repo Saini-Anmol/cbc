@@ -222,7 +222,10 @@ class ConsumptionETL:
                 .reset_index()
         )
         grouped.columns = ["Machine", "SKUCode", "MouldNos", "MouldLife_remaining", "Num_Moulds"]
-        return grouped[["Machine", "SKUCode", "MouldNos", "MouldLife_remaining", "Num_Moulds"]]
+        # Defensive determinism (see load_curing_allowable): groupby sorts keys by
+        # default, but sort explicitly so this holds even if that default ever changes.
+        return (grouped[["Machine", "SKUCode", "MouldNos", "MouldLife_remaining", "Num_Moulds"]]
+                .sort_values("Machine").reset_index(drop=True))
 
     def load_curing_allowable(self) -> pd.DataFrame:
         """Load SKU → eligible curing presses. Returns [SKUCode, Machines (list of str)]."""
@@ -234,7 +237,11 @@ class ConsumptionETL:
         df["Machines"] = df.apply(
             lambda r: [str(c) for c in mcols if str(r[c]).strip().lower() == "yes"], axis=1
         )
-        return df[["SKUCode", "Machines"]]
+        # Deterministic row order: SELECT * has no ORDER BY, so MySQL row order is not
+        # guaranteed stable across connections/queries. Downstream CO-scheduling code
+        # iterates these rows to build press->SKU candidate lists; unstable input order
+        # here was a real source of run-to-run non-determinism in the CO schedule.
+        return df[["SKUCode", "Machines"]].sort_values("SKUCode").reset_index(drop=True)
 
     def load_building_allowable_skus(self) -> set:
         """SKUs that appear in building allowable master with at least one machine."""

@@ -68,6 +68,15 @@ it's a known/by-design pattern).
   exclusions (see the KPI-universe-mismatch pitfall in CLAUDE.md).
 
 ### B. Building — shift-by-shift machine feasibility (all 31 days × 3 shifts)
+- The `Shift Schedule` / `Shift Schedule (Clean)` sheets carry `StartTime` and
+  `EndTime` columns (wall-clock, `YYYY-MM-DD HH:MM`) — a per-machine timeline
+  meant as input to a downstream scheduler. Verify: (a) EndTime > StartTime on
+  every row; (b) per (machine, date, shift), rows are non-overlapping and
+  contiguous — each row's StartTime == previous row's EndTime, starting at the
+  shift clock start (A=07:00, B=15:00, C=23:00); (c) each row's duration
+  matches its work: CHANGEOVER duration == CO_Cost_Mins, production duration ==
+  Qty × CT_per_unit (_BLD_CT_SEC[machine] seconds ÷ 60); (d) total per-machine
+  span within a shift ≤ SHIFT_MINS (480). Flag any row that overruns the shift.
 - For every (machine, date, shift) in `Shift Schedule`: production `Qty` ×
   that machine's cycle-time-per-unit must fit within `SHIFT_MINS`, minus any
   CO minutes consumed in that same shift on that same machine. Flag any

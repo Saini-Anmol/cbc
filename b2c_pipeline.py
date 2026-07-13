@@ -37,15 +37,16 @@ Usage:
 """
 
 import os
+import math
 import sys
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 import cbc_env
-from curing_consumption_dynamic import run_dynamic_consumption, ConsumptionConfig
+from curing_consumption_dynamic import run_dynamic_consumption, ConsumptionConfig, COScheduler
 from building_b2c import run_from_database_b2c
 from curing_b2c import run_curing_b2c
 from curing_consumption import ConsumptionETL
@@ -103,7 +104,7 @@ _ROUND_TRIP_BUFFER_ENABLED = True
 # static demand[sku]/machine_total_demand[machine] instead of raw deficit; RI
 # candidates (any live press) keep raw-deficit ranking unchanged and always
 # sort ahead of NRI (tier 0 vs tier 1) — see _priority_tier.
-_BUILDING_RATIO_ENABLED = False
+_BUILDING_RATIO_ENABLED = True
 
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
@@ -111,12 +112,44 @@ _BUILDING_RATIO_ENABLED = False
 # residual demand last.
 _MACHINE_ORDER_REVERSED = False
 
+# Scarcity-first machine ordering: process machines with the FEWEST eligible
+# SKUs first, so captive/specialized machines (e.g. 7301, eligible only for
+# LSTL0) claim their specific SKU's deficit before flexible machines that
+# share that SKU but have many other options poach it. Complements the ratio
+# formula (which ranks WHICH SKU a machine picks); this fixes WHICH MACHINE
+# claims a shared SKU first. Fixes the 7301-at-7%-util problem generally.
+_SCARCITY_ORDER_ENABLED = False
+
+# Starvation-feed: when a machine would otherwise IDLE and an eligible SKU has
+# starving presses (curing demand this shift but zero GT), let the machine take
+# the CO to feed it as a LAST RESORT. Inch preference is FULLY preserved — the
+# starving SKU stays low priority (same/diff bucketing + inch_penalty unchanged),
+# so a machine only feeds an off-inch starving SKU when it has no same-inch work
+# left. Only the 30%-CO-cost guard is relaxed for starving SKUs (generalizing
+# the existing curing-CO-target bypass to ANY starving SKU); MIN_CAMPAIGN
+# feasibility and the demand cap stay enforced, so no overbuild, no forced
+# infeasible CO. General case — all machines, all SKUs.
+_STARVATION_FEED_ENABLED = False
+
+# Reactive "instant CO" mechanism (dynamic_co_tracker): when a curing press
+# finishes its SKU's demand mid-month, it is immediately changed over to a new
+# needed SKU. Default True = current behaviour ("dynamic consumption": upfront
+# pre-planned Phase-0 schedule PLUS reactive COs). Set False for a "static
+# consumption" run where curing follows ONLY the pre-planned schedule.
+_DYNAMIC_CO_TRACKER_ENABLED = True
+
 # Dynamic per-day curing CO planner: replaces the static, upfront 31-day CO
 # schedule (COScheduler's proxy-simulated demand drain) with a fresh decision
 # made once per day, before Shift A, using REAL live state (demand_remaining,
 # press_state, gt_inventory) — same real-state discipline as the existing
 # reactive dynamic_co_tracker mechanism, extended to the whole press fleet.
 # COScheduler/co_by_day stays completely untouched when this is off.
+# ABANDONED — a purely reactive planner (no lookahead) regressed severely
+# (670k->~594k GT, 96.7%->~86% coverage) across three attempts; root cause:
+# it can only redistribute capacity from presses already idle today, never
+# proactively reassign a press ahead of a deadline the way a whole-horizon
+# simulation can. Code kept in place, toggle permanently off. Superseded by
+# _ROLLING_HORIZON_CO_ENABLED below.
 _DYNAMIC_CO_PLANNER_ENABLED = False
 
 # Nested sub-toggle (only meaningful when _DYNAMIC_CO_PLANNER_ENABLED=True):
@@ -127,6 +160,49 @@ _DYNAMIC_CO_PLANNER_ENABLED = False
 # tiebreak-only role (never a primary gating signal) — avoids the live
 # per-shift-signal thrashing failure mode seen earlier this session.
 _CAMPAIGN_TIER_TIEBREAK_ENABLED = False
+
+# Rolling-Horizon COScheduler: reuses the existing, proven COScheduler.schedule()
+# (the artifact behind the 670,431/670,649/96.7% baseline) as a receding-horizon
+# planner — called once per simulated day, seeded from live rolling-pipeline
+# state (press_state/press_count/demand_remaining), with a SHRINKING remaining
+# horizon (Day 1 plans 31 days ahead, Day 10 plans 22, ...). Only that call's
+# relative-day-1 events are kept; the rest of its lookahead is discarded and
+# recomputed fresh tomorrow. The scheduling ALGORITHM is not rewritten — only
+# its inputs change per call. See plan file for the full design rationale.
+_ROLLING_HORIZON_CO_ENABLED = False
+
+# Ratio-based curing CO allocation: no proactive CO at all — a press keeps
+# producing its current SKU until that SKU's demand is FULLY exhausted (no
+# urgency/Class A/B/horizon-threshold early CO). When a press frees up, pick
+# the highest-static-ratio compatible SKU that still needs more press
+# capacity to finish within the remaining horizon (a "presses needed" tracker
+# skips SKUs that already have enough). Building scheduler untouched. Reuses
+# the existing reactive trigger site (press's demand hits 0, mid-shift) —
+# only the SELECTION function changes; co_by_day is emptied so nothing
+# proactive from the static schedule fires under this toggle.
+_RATIO_CO_ALLOCATION_ENABLED = False
+
+# Nested sub-toggle (only meaningful when _RATIO_CO_ALLOCATION_ENABLED=True):
+# enriches _select_ratio_co_target's ranking with COScheduler's other four
+# levels (Class A/B, after_days, cycle time, target-side scarcity) on top of
+# ratio, testing whether a richer ranking recovers ground among whatever
+# candidates are ALREADY eligible right now. Does NOT touch eligibility
+# timing — a press still only frees up once its current SKU is fully done,
+# exactly as specified; this only changes which SKU wins once it's free.
+_RATIO_CO_RICH_RANKING_ENABLED = False
+
+# Early-CO (dynamic consumption via surplus-press reassignment): the one lever
+# every prior dynamic attempt left unpulled. All of them waited for a press's
+# demand to hit ZERO before reassigning, so COs clustered late and regressed.
+# The static approach wins because its proxy sim frees presses EARLY. This adds
+# that: a press may CO away from its current SKU BEFORE its demand is complete,
+# IFF that SKU is already on track to finish with its REMAINING presses (n-1)
+# within the horizon — i.e. this press is surplus to it. The next SKU is chosen
+# by the same max-ratio formula as building (via _select_ratio_co_target), and
+# only fires if a genuinely under-served target exists. Builds ON TOP of the
+# current hybrid (static co_by_day base + reactive layer) — it can only ADD COs,
+# so it has a real shot at beating baseline rather than replacing what works.
+_EARLY_CO_ENABLED = False
 
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
@@ -163,6 +239,59 @@ _MACHINE_DOMINANT_INCH: dict[str, str] = {
 # All other machines (BJ etc.) were never hard-locked; their Campaign 2+ inch freedom is unchanged.
 _SOFT_LOCK_MACHINES: frozenset[str] = frozenset({"7001", "7003"})
 
+# ── Inch-flexibility (_INCH_FLEX_ENABLED) ──────────────────────────────────────
+# Generalizes the 7001/7003 soft-lock to the remaining HARD-locked machines so
+# they don't sit idle once their own inch is met — plant data proves these run
+# 4-7 inches. When off (empty flex set) the scheduler runs bit-for-bit baseline.
+# UNI_NARROW (7501-7503) is a separate sub-toggle: CLAUDE.md says they can't
+# physically run 14"+, so it's independently back-out-able.
+_INCH_FLEX_ENABLED            = True   # master
+_INCH_FLEX_INCLUDE_UNI_NARROW = False   # add 7501-7503 (trust DB allowable)
+# Off-inch candidate ordering (tiebreak WITHIN the off-inch bucket only — never
+# overrides inch preference). "starving_first" = feed urgent starving presses
+# first; "demand_first" = largest remaining demand first (best amortization of
+# the expensive diff-inch CO). Tested both ways — see plan verification.
+_INCH_FLEX_OFFINCH_ORDER      = "starving_first"
+_INCH_FLEX_EXTRA_COS          = 2   # extra building-CO budget for flex machines (off-inch excursions)
+
+# Machine groups for the flex brute-force (plant multi-inch ranking: VMI 4.6 >
+# BJ 2.4 ~ UNI 2.3 > IRM 1.5 inches/machine).
+_FLEX_GROUPS: dict[str, frozenset[str]] = {
+    "VMIMAXX": frozenset({"6001", "6002", "6003", "6004", "7002", "7004"}),
+    "VMISOFT": frozenset({"7001", "7003"}),
+    "BJ":      frozenset({"7101", "7102", "7103", "7104", "7105", "7106", "7201"}),
+    "UNI":     frozenset({"7501", "7502", "7503"}),
+    "STAGE2":  frozenset({"8201", "8301", "8302", "8501", "8502", "7301"}),
+}
+_INCH_FLEX_VMIMAXX = _FLEX_GROUPS["VMIMAXX"]
+_INCH_FLEX_UNI     = _FLEX_GROUPS["UNI"]
+
+# Brute-force override: env FLEX_SET="VMIMAXX,BJ" (group names) selects the flex
+# set for a run without editing code. Falls back to the toggle-based default.
+def _resolve_flex_machines() -> frozenset:
+    _env = os.environ.get("FLEX_SET")
+    if _env is not None:
+        out: set = set()
+        for tok in _env.split(","):
+            tok = tok.strip()
+            if tok in _FLEX_GROUPS:
+                out |= set(_FLEX_GROUPS[tok])
+            elif tok:
+                out.add(tok)
+        return frozenset(out)
+    if not _INCH_FLEX_ENABLED:
+        return frozenset()
+    # Brute-force winner (plant-guided): the multi-inch groups VMI (VMIMAXX +
+    # VMISOFT) + BJ = 670,744 cured / 96.7% / 1,845 starvation / 627 write-off,
+    # best on every metric. STAGE2/IRM is catastrophic in the flex set (-57k,
+    # carcass-dependency disruption) and UNI hurts (tight 13") — both excluded.
+    _sel = _FLEX_GROUPS["VMIMAXX"] | _FLEX_GROUPS["VMISOFT"] | _FLEX_GROUPS["BJ"]
+    if _INCH_FLEX_INCLUDE_UNI_NARROW:
+        _sel = _sel | _FLEX_GROUPS["UNI"]
+    return _sel
+
+_INCH_FLEX_MACHINES: frozenset[str] = _resolve_flex_machines()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROLLING PIPELINE HELPERS
@@ -171,6 +300,27 @@ _SOFT_LOCK_MACHINES: frozenset[str] = frozenset({"7001", "7003"})
 def _bld_qty_per_shift(machine: str) -> int:
     ct_min = _BLD_CT_SEC.get(str(machine), 120.0) / 60.0
     return int(SHIFT_MINS / ct_min)
+
+
+def _shift_start_dt(date_str: str, shift: str) -> "datetime":
+    """Wall-clock datetime at which (date_str, shift) begins.
+
+    Uses SHIFT_STARTS from bc_config ("07:00"/"15:00"/"23:00"). Shift C starts
+    at 23:00 on the plan date and runs into 07:00 the next calendar day — the
+    date_str is still the shift's own calendar day, matching how every other
+    sheet keys shifts. Downstream schedulers consuming StartTime/EndTime get a
+    monotonic per-machine timeline because within a shift the cursor only ever
+    advances (production + changeover minutes), and shift boundaries never
+    overlap for a given machine.
+    """
+    d  = datetime.strptime(date_str, "%Y-%m-%d")
+    hh, mm = SHIFT_STARTS.get(shift, "07:00").split(":")
+    return d.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+
+
+def _fmt_dt(dt: "datetime") -> str:
+    """Format a building-schedule row timestamp for the output sheet."""
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _urgency_score(
@@ -299,6 +449,80 @@ def _select_dynamic_co_target(
         return None
     candidates.sort()
     return candidates[0][4]
+
+
+def _select_ratio_co_target(
+    old_sku: str,
+    press: str,
+    demand_remaining: dict,
+    press_count: dict,
+    pending_counts: dict,
+    demand_dict: dict,
+    cure_ct_map: dict,
+    press_to_demand_targets: dict,
+    press_total_demand: dict,
+    horizon_left: int,
+    sku_to_press_count: dict | None = None,
+    rich_ranking: bool = False,
+) -> "str | None":
+    """Select the next SKU for a press whose current SKU demand just hit zero
+    (_RATIO_CO_ALLOCATION_ENABLED). Eligibility timing is untouched by
+    rich_ranking — this is called ONLY once a press has already fully
+    exhausted its current SKU (no urgency/Class A/B/horizon-threshold
+    early-CO, per spec); rich_ranking only changes which candidate wins
+    among those already eligible right now.
+
+    rich_ranking=False (default): ranked purely by static ratio
+    (demand_dict[target]/press_total_demand[press], same formula as the
+    building scheduler's NRI ranking, never decremented).
+
+    rich_ranking=True (_RATIO_CO_RICH_RANKING_ENABLED): adds COScheduler's
+    other four ranking levels on top of ratio — Class A/B (is the target
+    under-resourced relative to its own deadline?), after_days (prefer
+    targets closest to completion once this press joins), cycle time
+    (faster-curing preferred), and target-side scarcity (SKU with fewer
+    compatible presses preferred — protects thin SKUs). Still only reorders
+    candidates that pass the presses-needed eligibility gate below; never
+    makes a press eligible sooner than "current SKU fully done."
+
+    Before ranking (either mode), a press-allocation tracker skips any SKU
+    that already has enough presses (assigned + in-flight/pending this
+    evaluation window) to finish its remaining demand within the remaining
+    horizon — so a free press is never handed to an already-adequately-served
+    SKU merely because it ranks well.
+
+    Compatibility is enforced by construction: only SKUs in
+    press_to_demand_targets[press] (the physical mould/allowable-machines
+    mapping) are ever considered.
+    """
+    candidates: list[tuple] = []
+    for target in press_to_demand_targets.get(press, []):
+        if target == old_sku:
+            continue
+        rem = demand_remaining.get(target, 0.0)
+        if rem <= 0:
+            continue
+        ct   = cure_ct_map.get(target, DEFAULT_CURING_CT)
+        rate = _cure_qty_per_shift(ct) * 3  # per-press per-day rate
+        if rate <= 0 or horizon_left <= 0:
+            continue
+        effective_n = press_count.get(target, 0) + pending_counts.get(target, 0)
+        presses_needed = max(1, math.ceil(rem / (rate * horizon_left)))
+        if effective_n >= presses_needed:
+            continue  # already has enough presses assigned — try next-highest ratio
+        ratio = demand_dict.get(target, 0.0) / press_total_demand.get(press, 1e-9)
+        if rich_ranking:
+            current_days = rem / (effective_n * rate) if effective_n > 0 else float("inf")
+            cls = 0 if current_days > horizon_left * CO_CLASS_B_THRESHOLD else 1
+            after_days = rem / ((effective_n + 1) * rate)
+            scarcity = (sku_to_press_count or {}).get(target, 0)
+            candidates.append((cls, -ratio, after_days, ct, scarcity, target))
+        else:
+            candidates.append((-ratio, target))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][-1]
 
 
 def _score_co_candidate(
@@ -516,6 +740,103 @@ def _plan_day_cos(
     return today_events
 
 
+def _rolling_horizon_co_call(
+    day: int,
+    planning_days: int,
+    press_state: dict,
+    press_count: dict,
+    demand_remaining: dict,
+    demand_dict: dict,
+    priority_score_map: dict,
+    df_allowable: "pd.DataFrame",
+    ct_map: dict,
+    dynamic_co_tracker: dict,
+    scheduler: "COScheduler",
+    max_co_per_day: int = MAX_CHANGEOVERS_PER_DAY,
+) -> list:
+    """Rolling-Horizon COScheduler call (_ROLLING_HORIZON_CO_ENABLED). Reuses
+    the existing, proven COScheduler.schedule() unchanged — only synthesizes
+    fresh Day-0-shaped inputs from live rolling-pipeline state each day, with
+    a shrinking remaining horizon, and keeps only that call's relative-day-1
+    events (the rest of its lookahead is discarded and recomputed tomorrow).
+
+    Finding 2: presses mid-transition in dynamic_co_tracker are excluded from
+    this day's snapshot — press_count already reflects them, but press_state
+    won't until the shift their transition resolves; including them would let
+    schedule() assign them a second, conflicting CO.
+
+    Finding 1: Category mirrors SKUClassifier exactly — press_count>0 is
+    always "Runner-In" for a demand SKU (even at zero remaining demand;
+    schedule()'s own demand_done_free logic handles that case with the
+    any-class bypass it already has). Only a non-demand SKU occupying a press
+    is "Runner-Out".
+    """
+    horizon_left = planning_days - day + 1
+    demand_skus = set(demand_remaining.keys())
+
+    running_rows = [
+        {"Machine": p, "SKUCode": st["sku"]}
+        for p, st in sorted(press_state.items())
+        if p not in dynamic_co_tracker
+    ]
+    df_running_moulds = pd.DataFrame(running_rows, columns=["Machine", "SKUCode"])
+
+    day0_rows = [
+        {
+            "SKUCode": sku,
+            "Category": "Runner-In" if press_count.get(sku, 0) > 0 else "Non-Runner-In",
+            "Running_Press_Count": press_count.get(sku, 0),
+        }
+        for sku in sorted(demand_skus)
+    ]
+    ro_counts: dict[str, int] = defaultdict(int)
+    for p, st in sorted(press_state.items()):
+        if p in dynamic_co_tracker:
+            continue
+        if st["sku"] not in demand_skus:
+            ro_counts[st["sku"]] += 1
+    for sku in sorted(ro_counts):
+        day0_rows.append({
+            "SKUCode": sku, "Category": "Runner-Out",
+            "Running_Press_Count": ro_counts[sku],
+        })
+    df_day0 = pd.DataFrame(day0_rows, columns=["SKUCode", "Category", "Running_Press_Count"])
+
+    df_demand = pd.DataFrame(
+        [
+            {
+                "SKUCode": sku,
+                "Quantity": max(0.0, demand_remaining.get(sku, 0.0)),
+                "Priority": priority_score_map.get(sku, 0.0),
+            }
+            for sku in sorted(demand_skus)
+        ],
+        columns=["SKUCode", "Quantity", "Priority"],
+    )
+
+    if os.environ.get("ROLLCO_DEBUG"):
+        print(f"    [RollCO-debug] Day {day}: horizon_left={horizon_left} "
+              f"presses={len(df_running_moulds)} skus={len(demand_skus)}")
+
+    co_events = scheduler.schedule(
+        df_day0=df_day0,
+        df_demand=df_demand,
+        df_allowable=df_allowable,
+        df_running_moulds=df_running_moulds,
+        ct_map=ct_map,
+        max_co_per_day=max_co_per_day,
+        planning_days=horizon_left,
+        ratio_demand_map=demand_dict,
+    )
+    today = sorted(
+        (ev["press"], ev["old_sku"], ev["new_sku"])
+        for ev in co_events if ev["day"] == 1
+    )
+    if os.environ.get("ROLLCO_DEBUG"):
+        print(f"    [RollCO-debug] Day {day}: {len(today)} events {today}")
+    return today
+
+
 def _assign_building_shift(
     shift_cure_demand:      dict,
     machine_skus:           dict,
@@ -547,6 +868,10 @@ def _assign_building_shift(
       co_type: "start" | "same_size_CO" | "diff_size_CO"
     """
     def _max_cos(mach: str) -> int:
+        # Flex machines get extra CO budget so they can take an off-inch
+        # excursion AFTER exhausting same-inch work (which uses the normal 2).
+        if mach in _INCH_FLEX_MACHINES:
+            return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT + _INCH_FLEX_EXTRA_COS
         return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
     projected_gt: dict[str, float] = dict(gt_inventory)
 
@@ -554,10 +879,28 @@ def _assign_building_shift(
         _pri = {"STAGE2": 0, "UNISTAGE": 1, "BJ": 2, "VMI": 3, "STAGE1": 9}
     else:
         _pri = {"VMI": 0, "BJ": 1, "UNISTAGE": 2, "STAGE2": 3, "STAGE1": 9}
-    sorted_machines = sorted(
-        machine_skus.keys(),
-        key=lambda m: (_pri.get(_MACHINE_GROUP.get(m, ""), 9), m),
-    )
+    if _SCARCITY_ORDER_ENABLED:
+        # Scarcity-first: machines with the FEWEST eligible SKUs claim their
+        # shared-SKU deficit before flexible machines can poach it. A captive
+        # machine (e.g. 7301, eligible for only LSTL0) can build nothing else,
+        # so it must lock in its specialty first — freeing flexible machines
+        # (which share that SKU but have many others) for SKUs only they serve.
+        # Stage-1 stays last (carcass, not GT). Eligible-count is the primary
+        # key; group priority + machine name break ties deterministically.
+        sorted_machines = sorted(
+            machine_skus.keys(),
+            key=lambda m: (
+                9 if _MACHINE_GROUP.get(m, "") == "STAGE1" else 0,
+                len(machine_skus.get(m, ())),
+                _pri.get(_MACHINE_GROUP.get(m, ""), 9),
+                m,
+            ),
+        )
+    else:
+        sorted_machines = sorted(
+            machine_skus.keys(),
+            key=lambda m: (_pri.get(_MACHINE_GROUP.get(m, ""), 9), m),
+        )
 
     plan: dict[str, list] = {}
 
@@ -566,10 +909,18 @@ def _assign_building_shift(
         _buf = GT_BUFFER_SHIFTS if group == "VMI" else 1
 
         def _deficit(sku: str, _b: float = _buf) -> float:
+            built_ahead = projected_gt.get(sku, 0.0)
             need = shift_cure_demand.get(sku, 0.0) * _b
-            gap  = need - projected_gt.get(sku, 0.0)
-            cap  = max(0.0, demand_remaining.get(sku, 0.0))
-            return min(max(0.0, gap), cap)
+            gap  = need - built_ahead
+            # Hard demand cap — subtract projected_gt (= gt_inventory + GT already
+            # built THIS shift by earlier machines). demand_remaining is cured-
+            # decremented and projected_gt is build-tracked, so
+            # (demand_remaining - projected_gt) = D - total_GT_built_so_far.
+            # Without the projected_gt term, two machines eligible for the same
+            # SKU each build up to the full remaining demand in one shift → the
+            # 1-4% overbuild seen across ~26 SKUs. This keeps total build ≤ demand.
+            cap  = demand_remaining.get(sku, 0.0) - built_ahead
+            return min(max(0.0, gap), max(0.0, cap))
 
         def _priority_tier(sku: str, d: float) -> tuple:
             # RI (has a live/CO'd press) always outranks NRI — tier 0 < tier 1.
@@ -618,7 +969,22 @@ def _assign_building_shift(
                 and _deficit(s) > 0
             ]
             if partner_candidates:
-                partner = max(partner_candidates, key=lambda s: (_deficit(s), s))
+                if machine in _INCH_FLEX_MACHINES:
+                    # Flex machines may rotate to an OFF-inch partner (expensive
+                    # diff-inch CO both ways). Size the own-inch buffer for the
+                    # worst-case round trip so the own-inch press never starves
+                    # while the machine is away — pick the partner with the
+                    # largest CO round-trip cost, then deficit, then name.
+                    partner = max(
+                        partner_candidates,
+                        key=lambda s: (
+                            _co_cost(machine, cur_inch, sku_inch.get(s, ""))
+                            + _co_cost(machine, sku_inch.get(s, ""), cur_inch),
+                            _deficit(s), s,
+                        ),
+                    )
+                else:
+                    partner = max(partner_candidates, key=lambda s: (_deficit(s), s))
                 partner_inch = sku_inch.get(partner, "")
                 partner_dwell = max(
                     MIN_CAMPAIGN_MINS,
@@ -655,10 +1021,35 @@ def _assign_building_shift(
             and demand_remaining.get(s, 0.0) > 0
         )
 
+        # starving_set: eligible SKUs whose curing presses are running THIS shift
+        # but have zero GT to cure (they will starve). Generalizes urgent_co_set
+        # to any starving SKU so an otherwise-idle machine can feed it as a last
+        # resort — see _STARVATION_FEED_ENABLED. Only relaxes the 30% cost guard;
+        # inch preference and MIN_CAMPAIGN feasibility are untouched.
+        starving_set = frozenset(
+            s for s in eligible
+            if s != cur_sku
+            and shift_cure_demand.get(s, 0.0) > 0
+            and projected_gt.get(s, 0.0) <= 0
+            and demand_remaining.get(s, 0.0) > 0
+        ) if _STARVATION_FEED_ENABLED else frozenset()
+
         # Default: allow non-dominant inch in Campaign 2+ unless Campaign 1 had unfinished demand.
         primary_demand_done = True
 
-        if cur_sku in eligible and _deficit(cur_sku, effective_buf) > 0:
+        # Reclamation guard (flex machines): if the machine carried over onto an
+        # OFF-inch SKU but a dominant-inch SKU now has real deficit, do NOT
+        # continue the off-inch campaign — force a return to the dominant inch
+        # via Campaign 2+ (merged sort prefers dominant). This is the anti-
+        # carry-over protection that lets us generalize the 7001/7003 soft-lock
+        # to the high-demand VMIMAXX inches without the prior regression.
+        _flex_reclaim = (
+            machine in _INCH_FLEX_MACHINES
+            and cur_inch != dom_inch
+            and any(sku_inch.get(s, "") == dom_inch and _deficit(s) > 0 for s in eligible)
+        )
+        if (cur_sku in eligible and _deficit(cur_sku, effective_buf) > 0
+                and not _flex_reclaim):
             mins = min(remaining, _deficit(cur_sku, effective_buf) / rate if rate > 0 else remaining)
             qty  = int(mins * rate)
             if mins >= MIN_CAMPAIGN_MINS and qty > 0:
@@ -671,9 +1062,11 @@ def _assign_building_shift(
             primary_demand_done = _deficit(cur_sku, effective_buf) <= 0
 
         # ── Campaign 2+: CO to deficit SKUs ──────────────────────────────
+        _is_flex = machine in _INCH_FLEX_MACHINES
         while remaining >= MIN_CAMPAIGN_MINS and co_count < MAX_COS:
             same_cands: list = []
             diff_cands: list = []
+            flex_cands: list = []
             seen_in_plan = {sku for sku, _, _ in campaigns}
 
             for sku in eligible:
@@ -681,24 +1074,61 @@ def _assign_building_shift(
                 if sku == cur_sku or d <= 0:
                     continue
                 to_inch = sku_inch.get(sku, "")
-                is_urgent = sku in urgent_co_set
-                # Soft-lock guard: only 7001/7003 serve non-dominant inch when primary demand done.
-                # BJ and other machines were never hard-locked — their inch freedom is unchanged.
-                if machine in _SOFT_LOCK_MACHINES and to_inch != dom_inch and not primary_demand_done:
+                is_urgent = sku in urgent_co_set or sku in starving_set
+                # Off-inch gate: soft-lock AND flex machines serve non-dominant
+                # inch ONLY when primary (dominant, buffer-sized) demand is done
+                # this shift. BJ/other machines were never locked — unchanged.
+                if (machine in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
+                        and to_inch != dom_inch and not primary_demand_done):
                     continue
                 cost = _co_cost(machine, cur_inch, to_inch)
                 if remaining - cost < MIN_CAMPAIGN_MINS:
                     continue
-                # Bypass 30% cost guard for urgent co_target_skus (reservation already accounted for it).
-                if cost > 0.30 * remaining and not is_urgent:
+                # 30% cost guard normally blocks expensive COs. Bypass for urgent
+                # co_target SKUs, AND for a flex machine taking an off-inch CO once
+                # its own inch is done this shift (primary_demand_done): the diff-
+                # inch CO (up to 180 min) exceeds 30% of a shift, but the machine
+                # would otherwise IDLE the whole shift, so any production beats idle.
+                _flex_offinch_ok = (_is_flex and to_inch != dom_inch and primary_demand_done)
+                if cost > 0.30 * remaining and not is_urgent and not _flex_offinch_ok:
                     continue
                 revisit_penalty = 1 if sku in seen_in_plan else 0
                 inch_penalty    = 0 if to_inch == dom_inch else 1
                 tier, primary   = _priority_tier(sku, d)
-                bucket = same_cands if to_inch == cur_inch else diff_cands
-                bucket.append((tier, primary, inch_penalty, revisit_penalty, cost, sku))
+                if _is_flex:
+                    # Flex tuple puts inch_penalty FIRST so dominant inch always
+                    # wins (strict reclamation), then off_key orders WITHIN the
+                    # off-inch group only (dominant candidates get neutral 0).
+                    if inch_penalty == 0:
+                        off_key = 0.0
+                    elif _INCH_FLEX_OFFINCH_ORDER == "starving_first":
+                        _starving = (shift_cure_demand.get(sku, 0.0) > 0
+                                     and projected_gt.get(sku, 0.0) <= 0
+                                     and demand_remaining.get(sku, 0.0) > 0)
+                        off_key = 0.0 if _starving else 1.0
+                    else:  # "demand_first" — largest deficit first (best CO amortization)
+                        off_key = -float(d)
+                    flex_cands.append((inch_penalty, off_key, tier, primary,
+                                       revisit_penalty, cost, sku))
+                else:
+                    bucket = same_cands if to_inch == cur_inch else diff_cands
+                    bucket.append((tier, primary, inch_penalty, revisit_penalty, cost, sku))
 
-            if same_cands:
+            if _is_flex:
+                if flex_cands:
+                    flex_cands.sort()
+                    best_cost, best_sku = flex_cands[0][-2], flex_cands[0][-1]
+                    co_type = ("same_size_CO"
+                               if sku_inch.get(best_sku, "") == cur_inch else "diff_size_CO")
+                    if os.environ.get("FLEX_DEBUG"):
+                        _noff = sum(1 for c in flex_cands if c[0] == 1)  # inch_penalty==1
+                        if _noff:
+                            print(f"    [FLEX] {machine} cur_inch={cur_inch} "
+                                  f"off_cands={_noff} best={best_sku}({sku_inch.get(best_sku,'')}) "
+                                  f"co={co_type} rem={remaining:.0f}")
+                else:
+                    break
+            elif same_cands:
                 same_cands.sort()
                 _, _, _, _, best_cost, best_sku = same_cands[0]
                 co_type = "same_size_CO"
@@ -793,6 +1223,16 @@ def _write_rolling_building_excel(
     def _bold(s=10): return Font(bold=True, size=s)
     def _ctr():      return Alignment(horizontal="center", vertical="center")
 
+    # Present the shift schedule as a chronological timeline: ascending StartTime,
+    # then Machine as a stable tiebreak. StartTime is "YYYY-MM-DD HH:MM" so its
+    # lexical order IS chronological (post-midnight Shift-C rows carry the real
+    # next-day date, so they sort correctly). Display-only — every aggregate
+    # sheet below sums over the rows and is order-independent.
+    bld_shift_rows = sorted(
+        bld_shift_rows,
+        key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
+    )
+
     _SENTINEL = {"CHANGEOVER", "MOULD_CLEAN", "C/O", "CO"}
 
     wb = openpyxl.Workbook()
@@ -803,7 +1243,8 @@ def _write_rolling_building_excel(
     ws.cell(row=1, column=1, value="BC Building Schedule (Rolling Pipeline)").font = _bold(12)
     # Row 2: blank
     # Row 3: headers
-    bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty", "Machine_Group", "CO_Type"]
+    bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty",
+                "StartTime", "EndTime", "Machine_Group", "CO_Type"]
     _xl_header(ws, 3, bld_cols)
     for ri, row in enumerate(bld_shift_rows, 4):
         is_co = str(row.get("SKUCode", "")).upper() in _SENTINEL
@@ -1135,6 +1576,7 @@ def _write_rolling_building_excel(
 def _write_rolling_curing_excel(
     output_path: str,
     cure_shift_rows: list,         # per-shift press events
+    cure_co_events: list,          # curing press CO events (Planned + Dynamic) — Changeover Plan sheet
     press_stats: dict,             # {press: {running_mins, co_mins, clean_mins, skus, cycles, units}}
     press_sku_stats: dict,         # {(press,sku): {cycles, units, mins_used}}
     daily_cured: dict,             # {date_str: qty}
@@ -1295,6 +1737,34 @@ def _write_rolling_curing_excel(
     ws.column_dimensions["A"].width = 14; ws.column_dimensions["D"].width = 32
     ws.column_dimensions["I"].width = 16; ws.freeze_panes = "A2"
 
+    # ── Sheet 3b: Changeover Plan — every curing press CO (Planned + Dynamic) ──
+    # Makes dynamic/reactive COs visible in the output, not just the console log.
+    ws = wb.create_sheet("Changeover Plan")
+    co_cols = ["Date", "Day", "Shift", "Press", "From_SKU", "Target_SKU", "CO_Type"]
+    _hdr(ws, 1, co_cols)
+    _co_sorted = sorted(
+        (cure_co_events or []),
+        key=lambda e: (int(e.get("Day", 0)),
+                       {"A": 0, "B": 1, "C": 2}.get(e.get("Shift", "A"), 0),
+                       str(e.get("Press", ""))),
+    )
+    for ri, e in enumerate(_co_sorted, 2):
+        f = _fill(_ORANGE) if e.get("CO_Type") == "Dynamic" else _fill(_LYELL)
+        for ci, h in enumerate(co_cols, 1):
+            cell = ws.cell(row=ri, column=ci, value=e.get(h, ""))
+            cell.fill = f; cell.alignment = _ctr()
+            if h == "CO_Type":
+                cell.font = Font(bold=True)
+    _n_plan = sum(1 for e in _co_sorted if e.get("CO_Type") == "Planned")
+    _n_dyn  = sum(1 for e in _co_sorted if e.get("CO_Type") == "Dynamic")
+    _foot = len(_co_sorted) + 3
+    ws.cell(row=_foot, column=1,
+            value=f"Total curing COs: {len(_co_sorted)}  "
+                  f"(Planned: {_n_plan}, Dynamic: {_n_dyn})").font = Font(bold=True)
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["E"].width = 32; ws.column_dimensions["F"].width = 32
+    ws.freeze_panes = "A2"
+
     # ── Sheet 4: Mould Tracker (placeholder) ─────────────────────────────────
     ws = wb.create_sheet("Mould Tracker")
     mt_cols = ["MouldNo", "Compatible_SKUs", "Life_Remaining", "Assigned_Machine"]
@@ -1452,7 +1922,7 @@ def run_rolling_pipeline(
     # seeding, today_cos lookup, the reactive mechanism's "tomorrow" lookahead)
     # is neutralized by this single reset. df_day0/co_events themselves are
     # still needed (SKU classification) so run_dynamic_consumption still runs.
-    if _DYNAMIC_CO_PLANNER_ENABLED:
+    if _DYNAMIC_CO_PLANNER_ENABLED or _ROLLING_HORIZON_CO_ENABLED or _RATIO_CO_ALLOCATION_ENABLED:
         co_by_day = {}
 
     # ── B: Master data ────────────────────────────────────────────────────────
@@ -1467,6 +1937,17 @@ def run_rolling_pipeline(
     }
 
     # Building CTs are hardcoded in _BLD_CT_SEC above (sourced from plant data)
+
+    # ── _ROLLING_HORIZON_CO_ENABLED pre-computation (zero cost when off) ───────
+    # Static, reused unchanged for every one of the 31 daily schedule() calls —
+    # physical press<->SKU compatibility doesn't change day to day. Uses
+    # cc_result["ct_map"], not cure_ct_map above, which has no NaN guard/default
+    # (see plan Finding 3) — schedule() has no NaN guard of its own.
+    _df_curing_allow_static: "pd.DataFrame | None" = None
+    _rolling_co_scheduler: "COScheduler | None" = None
+    if _ROLLING_HORIZON_CO_ENABLED:
+        _df_curing_allow_static = cetl.load_curing_allowable()
+        _rolling_co_scheduler = COScheduler()
 
     machine_skus: dict[str, set]  = defaultdict(set)
     sku_machine_map: dict[str, set] = defaultdict(set)
@@ -1511,6 +1992,11 @@ def run_rolling_pipeline(
             # 7501 dominant=12" but can also run 13" (confirmed allowable)
             "7501":{"12","13"},  "7502":{"13"},        "7503":{"13"},
         }
+        # Inch-flexibility: drop flex machines from _HARD so their full DB
+        # allowable (all eligible inches) passes through — off-inch access is
+        # then gated at Campaign-2+ (primary_demand_done) + reclamation guard.
+        for _fm in _INCH_FLEX_MACHINES:
+            _HARD.pop(_fm, None)
         for idx, row in df_allow.iterrows():
             sku = str(row["SKUCode"]); si = sku_inch.get(sku, "")
             ml  = list(row.get("Machines", []) or [])
@@ -1593,9 +2079,10 @@ def run_rolling_pipeline(
     # press fleet once a day, so this is required here).
     press_to_demand_targets: dict[str, list] = {}
     press_total_demand: dict[str, float] = {}
+    sku_to_press_count: dict[str, int] = {}
     ri_skus: frozenset = frozenset()
     nri_skus: frozenset = frozenset()
-    if _DYNAMIC_CO_PLANNER_ENABLED:
+    if _DYNAMIC_CO_PLANNER_ENABLED or _RATIO_CO_ALLOCATION_ENABLED or _EARLY_CO_ENABLED:
         df_curing_allow = cetl.load_curing_allowable()
         _all_demand_skus = set(demand_dict.keys())
         sku_to_presses: dict[str, set] = {}
@@ -1612,6 +2099,9 @@ def run_rolling_pipeline(
             _p: sum(demand_dict.get(_s, 0.0) for _s in _targets)
             for _p, _targets in press_to_demand_targets.items()
         }
+        # Target-side scarcity for _RATIO_CO_RICH_RANKING_ENABLED — how many
+        # presses could physically serve this SKU (fewer = protect it).
+        sku_to_press_count = {_s: len(_p) for _s, _p in sku_to_presses.items()}
         ri_skus  = frozenset(df_day0.loc[df_day0["Category"] == "Runner-In",     "SKUCode"])
         nri_skus = frozenset(df_day0.loc[df_day0["Category"] == "Non-Runner-In", "SKUCode"])
 
@@ -1659,6 +2149,7 @@ def run_rolling_pipeline(
     bld_shift_rows:  list[dict] = []   # building Shift Schedule rows (+ CO sentinels)
     bld_co_events:   list[dict] = []   # building machine CO events
     cure_shift_rows: list[dict] = []   # curing Shift Schedule rows
+    cure_co_events:  list[dict] = []   # curing press CO events (Planned + Dynamic)
     press_stats:     dict = defaultdict(lambda: {
         "running_mins": 0.0, "co_mins": 0.0, "clean_mins": 0.0,
         "skus": set(), "cycles": 0, "units": 0,
@@ -1691,6 +2182,31 @@ def run_rolling_pipeline(
     # Only accumulated when _DYNAMIC_CO_PLANNER_ENABLED (zero cost otherwise).
     sku_campaign_tier: dict[str, int] = {}
 
+    if os.environ.get("ROLLCO_STAGE2_CHECK"):
+        _stage2_scheduler = COScheduler()
+        _stage2_allow = cetl.load_curing_allowable()
+        _rolling_today = _rolling_horizon_co_call(
+            day=1, planning_days=planning_days,
+            press_state=press_state, press_count=press_count,
+            demand_remaining=demand_remaining, demand_dict=demand_dict,
+            priority_score_map=priority_score_map,
+            df_allowable=_stage2_allow, ct_map=cc_result["ct_map"],
+            dynamic_co_tracker=dynamic_co_tracker,
+            scheduler=_stage2_scheduler, max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
+        )
+        _legacy_today = sorted(
+            (ev["press"], ev["old_sku"], ev["new_sku"])
+            for ev in co_events if int(ev["day"]) == 1
+        )
+        print(f"\n  [Stage2Check] Rolling Day-1: {len(_rolling_today)} events")
+        print(f"  [Stage2Check] Legacy  Day-1: {len(_legacy_today)} events")
+        _rolling_set = set(_rolling_today)
+        _legacy_set  = set(_legacy_today)
+        print(f"  [Stage2Check] Match: {_rolling_set == _legacy_set}")
+        print(f"  [Stage2Check] Rolling-only: {sorted(_rolling_set - _legacy_set)}")
+        print(f"  [Stage2Check] Legacy-only : {sorted(_legacy_set - _rolling_set)}")
+        import sys; sys.exit(0)
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
@@ -1698,7 +2214,20 @@ def run_rolling_pipeline(
     for day in range(1, planning_days + 1):
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
-        if _DYNAMIC_CO_PLANNER_ENABLED:
+        if _ROLLING_HORIZON_CO_ENABLED:
+            today_cos = _rolling_horizon_co_call(
+                day=day, planning_days=planning_days,
+                press_state=press_state, press_count=press_count,
+                demand_remaining=demand_remaining, demand_dict=demand_dict,
+                priority_score_map=priority_score_map,
+                df_allowable=_df_curing_allow_static,
+                ct_map=cc_result["ct_map"],
+                dynamic_co_tracker=dynamic_co_tracker,
+                scheduler=_rolling_co_scheduler,
+                max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
+            )
+            daily_co_count[day] += len(today_cos)
+        elif _DYNAMIC_CO_PLANNER_ENABLED:
             today_cos = _plan_day_cos(
                 day, press_state, demand_remaining, press_count,
                 cure_ct_map, priority_score_map, demand_dict,
@@ -1802,18 +2331,30 @@ def run_rolling_pipeline(
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
+            # StartTime/EndTime: per-machine wall-clock cursor within the shift.
+            # It starts at the shift's clock start and advances by each event's
+            # own duration (CO minutes, then production minutes = qty × CT), so a
+            # downstream scheduler reads an exact, non-overlapping timeline of
+            # what each machine does and when. CT-per-unit = _BLD_CT_SEC[machine].
+            _shift_start = _shift_start_dt(date_str, shift)
             for machine, campaigns in shift_plan.items():
                 prev_sku  = machine_current_sku.get(machine, "")
                 prev_inch = sku_inch.get(prev_sku, "")
+                _cursor   = _shift_start
+                _ct_sec   = _BLD_CT_SEC.get(str(machine), 120.0)
                 for _tier_idx, (sku, qty, co_type) in enumerate(campaigns):
                     if co_type != "start":
                         co_mins = _co_cost(machine, prev_inch, sku_inch.get(sku, ""))
+                        _co_start = _cursor
+                        _cursor   = _cursor + timedelta(minutes=co_mins)
                         bld_shift_rows.append({
                             "Machine":       machine,
                             "Date":          date_str,
                             "Shift":         shift,
                             "SKUCode":       "CHANGEOVER",
                             "Qty":           co_mins,
+                            "StartTime":     _fmt_dt(_co_start),
+                            "EndTime":       _fmt_dt(_cursor),
                             "Machine_Group": _MACHINE_GROUP.get(machine, ""),
                             "CO_Type":       co_type,
                         })
@@ -1829,12 +2370,16 @@ def run_rolling_pipeline(
                             "CO_Cost_Mins": co_mins,
                             "Status":       f"Rolling CO ({co_type})",
                         })
+                    _prod_start = _cursor
+                    _cursor     = _cursor + timedelta(minutes=qty * _ct_sec / 60.0)
                     bld_shift_rows.append({
                         "Machine":       machine,
                         "Date":          date_str,
                         "Shift":         shift,
                         "SKUCode":       sku,
                         "Qty":           qty,
+                        "StartTime":     _fmt_dt(_prod_start),
+                        "EndTime":       _fmt_dt(_cursor),
                         "Machine_Group": _MACHINE_GROUP.get(machine, ""),
                         "CO_Type":       "production",
                     })
@@ -1918,12 +2463,20 @@ def run_rolling_pipeline(
                     alloc = min(cap, remaining_need)
                     s1_machines_used_this_shift.add(m)
                     remaining_need -= alloc
+                    # One SKU per Stage-1 machine per shift → carcass run starts
+                    # at the shift clock start; duration = alloc × CT.
+                    _c_start = _shift_start
+                    _c_end   = _c_start + timedelta(
+                        minutes=round(alloc) * _BLD_CT_SEC.get(str(m), 120.0) / 60.0
+                    )
                     bld_shift_rows.append({
                         "Machine":       m,
                         "Date":          date_str,
                         "Shift":         shift,
                         "SKUCode":       sku,
                         "Qty":           round(alloc),
+                        "StartTime":     _fmt_dt(_c_start),
+                        "EndTime":       _fmt_dt(_c_end),
                         "Machine_Group": "STAGE1",
                         "CO_Type":       "carcass",
                     })
@@ -1975,7 +2528,25 @@ def run_rolling_pipeline(
                     # time = CHANGEOVER).  Next shift = PRODUCTION for new SKU.
                     # Conditions: no pre-planned CO today, not already in a
                     # dynamic CO, and no pre-planned CO tomorrow (avoid conflict).
-                    if (demand_remaining.get(sku, 0.0) <= 0
+                    _demand_done = demand_remaining.get(sku, 0.0) <= 0
+                    # Early-CO (_EARLY_CO_ENABLED): a press may reassign BEFORE its
+                    # SKU's demand is done, IFF that SKU's remaining demand is met by
+                    # its OTHER (n-1) presses within the horizon — i.e. this press is
+                    # surplus. Replicates the static proxy's early freeing, on real
+                    # state. Only fires if _select_ratio_co_target finds a needy target.
+                    _early_co = False
+                    if (_EARLY_CO_ENABLED and not _demand_done
+                            and press not in co_press_map
+                            and press not in dynamic_co_tracker):
+                        _n_cur = press_count.get(sku, 0)
+                        if _n_cur > 1:
+                            _rate_cur = _cure_qty_per_shift(ct) * 3
+                            _rem_cur  = demand_remaining.get(sku, 0.0)
+                            _hz_cur   = planning_days - day + 1
+                            if (_rate_cur > 0
+                                    and _rem_cur / ((_n_cur - 1) * _rate_cur) <= _hz_cur):
+                                _early_co = True
+                    if (((_DYNAMIC_CO_TRACKER_ENABLED and _demand_done) or _early_co)
                             and press not in co_press_map
                             and press not in dynamic_co_tracker):
                         _next_day_cos = {p for p, _, _ in co_by_day.get(day + 1, [])}
@@ -1983,13 +2554,26 @@ def run_rolling_pipeline(
                             _slots_left = MAX_CHANGEOVERS_PER_DAY - daily_co_count[day]
                             if _slots_left > 0:
                                 _horizon_left = planning_days - day + 1
-                                _already = set(dynamic_co_tracker[p][1]
-                                               for p in dynamic_co_tracker)
-                                _target = _select_dynamic_co_target(
-                                    sku, demand_remaining, press_count,
-                                    cure_ct_map, priority_score_map,
-                                    gt_inventory, _horizon_left, _already,
-                                )
+                                if _RATIO_CO_ALLOCATION_ENABLED or _EARLY_CO_ENABLED:
+                                    _pending_counts = Counter(
+                                        dynamic_co_tracker[p][1] for p in dynamic_co_tracker
+                                    )
+                                    _target = _select_ratio_co_target(
+                                        sku, press, demand_remaining, press_count,
+                                        _pending_counts, demand_dict, cure_ct_map,
+                                        press_to_demand_targets, press_total_demand,
+                                        _horizon_left,
+                                        sku_to_press_count=sku_to_press_count,
+                                        rich_ranking=_RATIO_CO_RICH_RANKING_ENABLED,
+                                    )
+                                else:
+                                    _already = set(dynamic_co_tracker[p][1]
+                                                   for p in dynamic_co_tracker)
+                                    _target = _select_dynamic_co_target(
+                                        sku, demand_remaining, press_count,
+                                        cure_ct_map, priority_score_map,
+                                        gt_inventory, _horizon_left, _already,
+                                    )
                                 if _target is not None:
                                     # CO starts now (cur_shift_global); next shift = RUNNING
                                     press_count[sku] = max(
@@ -1997,6 +2581,15 @@ def run_rolling_pipeline(
                                     )
                                     dynamic_co_tracker[press] = (cur_shift_global, _target)
                                     daily_co_count[day] += 1
+                                    cure_co_events.append({
+                                        "Date":       date_str,
+                                        "Day":        day,
+                                        "Shift":      shift,
+                                        "Press":      press,
+                                        "From_SKU":   sku,
+                                        "Target_SKU": _target,
+                                        "CO_Type":    "Early-CO" if (_early_co and not _demand_done) else "Dynamic",
+                                    })
                                     print(
                                         f"    [DynCO] Day {day} Shift {shift}: "
                                         f"press {press} {sku}→{_target} "
@@ -2010,6 +2603,31 @@ def run_rolling_pipeline(
                     elif status == "MOULD_CLEAN":
                         press_stats[press]["clean_mins"] += SHIFT_MINS
 
+                # Transparent Remarks — makes the output sheet self-consistent with
+                # the printed Starvation KPI. A RUNNING press with zero output is only
+                # STARVED if it still has demand left AND no GT; if its demand is
+                # already met it is correctly IDLE, not starved (this is exactly the
+                # KPI's guard — the sheet's STARVED count now equals the KPI number).
+                if status == "CHANGEOVER":
+                    _co_tgt = co_press_map.get(press)
+                    if _co_tgt is None and press in dynamic_co_tracker:
+                        _co_tgt = dynamic_co_tracker[press][1]
+                    remark = f"CO → {_co_tgt}" if _co_tgt else "CHANGEOVER"
+                elif status == "MOULD_CLEAN":
+                    remark = "MOULD_CLEAN"
+                elif status == "RUNNING":
+                    _dleft = demand_remaining.get(sku, 0.0)
+                    if cured > 0:
+                        remark = ""                      # producing normally
+                    elif _dleft <= 0:
+                        remark = "IDLE (demand met)"      # NOT starvation — job done
+                    elif int(round(gt_avail)) == 0:
+                        remark = "STARVED (no GT)"        # genuine starvation
+                    else:
+                        remark = ""                      # has GT + demand but capped (rare)
+                else:
+                    remark = status
+
                 cure_shift_rows.append({
                     "Date":          date_str,
                     "Shift":         shift,
@@ -2020,8 +2638,9 @@ def run_rolling_pipeline(
                     "Qty":           cured,
                     "CycleTime_min": round(ct, 1),
                     "GT_Inventory":  int(round(gt_avail)),
-                    "Remarks":       status if status != "RUNNING" else "",
+                    "Remarks":       remark,
                     "_status":       status,
+                    "_demand_left":  demand_remaining.get(sku, 0.0) if status == "RUNNING" else None,
                 })
 
         # ── 5. Pool replacement: swap out any finished SKUs ─────────────────
@@ -2065,6 +2684,18 @@ def run_rolling_pipeline(
             press_count[new_sku] = press_count.get(new_sku, 0) + 1
             press_state[press]   = {"sku": new_sku, "status": "RUNNING"}
             curing_allowable[new_sku].append(press)
+            # Planned COs execute the CHANGEOVER in Shift A of this day (co_press_map).
+            # Record here (once per day) so both static-schedule and rolling-horizon
+            # planned COs appear in the curing Changeover Plan output sheet.
+            cure_co_events.append({
+                "Date":       date_str,
+                "Day":        day,
+                "Shift":      "A",
+                "Press":      press,
+                "From_SKU":   old_sku,
+                "Target_SKU": new_sku,
+                "CO_Type":    "Planned",
+            })
 
         # Daily summary — report GT-only (not carcass) for "built" KPI
         d_gt_built = sum(day_gt_built.values())  # real GT (excludes Stage-1 carcass)
@@ -2090,9 +2721,15 @@ def run_rolling_pipeline(
     total_cured  = sum(r["GT_Cured"]  for r in daily_summary)
     dem_met      = total_demand - sum(max(0, v) for v in demand_remaining.values())
     final_cov    = dem_met / total_demand * 100 if total_demand > 0 else 0
+    # A press only "starves" when it's RUNNING, has zero GT, produced zero units,
+    # AND still has real demand left to cure. If demand_left is already 0, the
+    # SKU's job is done — the press is correctly idle, not starved (see the
+    # false-positive case this excluded: press finishes a SKU's demand, GT drains
+    # to 0 naturally, and the old formula counted that success as a failure).
     starvation_n = sum(
         1 for r in cure_shift_rows
-        if r.get("_status") == "RUNNING" and r.get("GT_Inventory", 1) == 0 and r.get("Qty", 0) == 0
+        if r.get("_status") == "RUNNING" and r.get("GT_Inventory", 1) == 0
+        and r.get("Qty", 0) == 0 and (r.get("_demand_left") or 0) > 0
     )
 
     print("\n" + "=" * 70)
@@ -2121,6 +2758,7 @@ def run_rolling_pipeline(
     _write_rolling_curing_excel(
         output_path       = curing_output,
         cure_shift_rows   = cure_shift_rows,
+        cure_co_events    = cure_co_events,
         press_stats       = dict(press_stats),
         press_sku_stats   = dict(press_sku_stats),
         daily_cured       = dict(daily_cured),
