@@ -106,6 +106,52 @@ _ROUND_TRIP_BUFFER_ENABLED = True
 # sort ahead of NRI (tier 0 vs tier 1) — see _priority_tier.
 _BUILDING_RATIO_ENABLED = True
 
+# ── EXPERIMENT: RI-by-ratio (two approaches, both default OFF = bit-for-bit) ────
+# User request: assign RI SKUs by the max-ratio formula instead of raw deficit.
+# Approach 1 (_RI_RATIO_ENABLED): ranking-only. In _priority_tier, RI candidates
+#   (live press) are ranked by static demand[sku]/machine_total_demand[machine]
+#   (same formula as NRI) instead of raw curing-deficit. RI still outranks NRI
+#   (tier 0 vs 1); only the WITHIN-RI order changes. Machine order + Campaign
+#   loop unchanged. NOTE: drops the live deficit (starvation-urgency) signal for
+#   RI, so this may raise starvation — that is what the experiment measures.
+# Approach 2 (_RI_RATIO_GLOBAL): drop the fixed VMI->BJ->US->Stage2 machine order
+#   and instead process machines in DESCENDING order of the best (highest) ratio
+#   deficit-SKU each can serve, so the ratio — not the group order — drives which
+#   machine-SKU combination is claimed first. Stage-1 stays last. Implies the
+#   ratio ranking (auto-enables Approach 1's _priority_tier branch for RI).
+_RI_RATIO_ENABLED = os.environ.get("RI_RATIO") == "1"
+_RI_RATIO_GLOBAL  = os.environ.get("RI_RATIO_GLOBAL") == "1"
+
+# EXPERIMENT: seed each building machine's starting SKU from the plant's ACTUAL
+# running-machine snapshot (data/running_prod/building_running_machines_39_near7AM.xlsx)
+# instead of the DB loader (which returns empty here -> machines start blank and
+# the scheduler derives its own machine->SKU). Off = current behaviour (blank/DB).
+_SEED_FROM_PLANT_RUNNING = os.environ.get("PLANT_SEED") == "1"
+_PLANT_RUNNING_FILE = "data/running_prod/building_running_machines_39_near7AM.xlsx"
+
+# EXPERIMENT: captive-first ordering. A captive building machine (eligible for
+# exactly ONE SKU, e.g. 7301 -> only LSTL0) sits idle whenever flexible machines
+# processed earlier in the VMI->BJ->US->Stage2 order drain that SKU's deficit
+# first. Promoting captives to the FRONT of the machine loop lets them claim
+# their sole SKU before flexible machines, maxing captive utilisation and freeing
+# the flexible (oversubscribed) machines for SKUs only they can serve. Stage-1
+# captives are NOT promoted (carcass, always last). Off = current behaviour.
+# _CAPTIVE_FIRST_ENABLED = os.environ.get("CAPTIVE_FIRST") == "1"
+_CAPTIVE_FIRST_ENABLED = True
+
+# EXPERIMENT: global machine-SKU scoring assignment. Replaces the sequential
+# VMI->BJ->US->Stage2 per-machine greedy with ONE global pass: after each machine
+# continues its current SKU (Phase A, no CO), all remaining (machine,SKU) pairs are
+# scored together and assigned best-first (Phase B). The score includes
+# constraint = min(flex_machine, flex_sku), so a captive machine (e.g. 7301) OR a
+# sole-supplier SKU wins WITHOUT any hardcoded rule — symmetric on both sides,
+# unlike the machine-only _SCARCITY_ORDER that regressed. When on, it early-returns
+# before the captive-first re-sort (so it fully supersedes it). Off = per-machine greedy.
+_GLOBAL_ASSIGN_ENABLED  = True
+# constraint placement in the pair sort key: "above" (constraint before SKU tier),
+# "below" (after tier), or "captive" (only min(flex)<=1 boosted). Sensitivity knob.
+_GLOBAL_CONSTRAINT_MODE = "below"
+
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
 # groups should claim their deficit signal before flexible VMI machines mop up
@@ -207,7 +253,7 @@ _EARLY_CO_ENABLED = False
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
     "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
-    "6001":53.0,  "6002":52.0,  "6003":63.0,  "6004":60.0,
+    "6001":53.0,  "6002":52.0,  "6003":73.8,  "6004":60.0,
     "7101":83.0, "7102":86.0, "7103":60.0,  "7104":87.0,
     "7105":60.0, "7106":60,  "7201":70.0,
     "7501":90.0, "7502":90.0, "7503":90.0,
@@ -875,11 +921,182 @@ def _assign_building_shift(
         return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
     projected_gt: dict[str, float] = dict(gt_inventory)
 
+    if _GLOBAL_ASSIGN_ENABLED:
+        # ══ Global machine-SKU scoring assignment (supersedes per-machine greedy) ══
+        # Phase A: each machine continues its current SKU (no CO). Phase B: all
+        # remaining (machine,SKU) pairs are scored together and assigned best-first,
+        # with constraint=min(flex_machine,flex_sku) so constrained machines/SKUs win.
+        def _buf_of(m: str) -> float:
+            return GT_BUFFER_SHIFTS if _MACHINE_GROUP.get(m, "") == "VMI" else 1
+
+        def _defc(sku: str, _b: float) -> float:
+            built_ahead = projected_gt.get(sku, 0.0)
+            gap = shift_cure_demand.get(sku, 0.0) * _b - built_ahead
+            cap = demand_remaining.get(sku, 0.0) - built_ahead
+            return min(max(0.0, gap), max(0.0, cap))
+
+        def _tierg(sku: str, m: str, d: float) -> tuple:
+            _is_ri = press_count.get(sku, 0) > 0
+            _ri_ratio = (_RI_RATIO_ENABLED or _RI_RATIO_GLOBAL) and _is_ri
+            if (_BUILDING_RATIO_ENABLED and (press_count.get(sku, 0) <= 0 or _ri_ratio)
+                    and demand_dict is not None and machine_total_demand is not None):
+                ratio = demand_dict.get(sku, 0.0) / machine_total_demand.get(m, 1e-9)
+                return (0 if _is_ri else 1, -ratio)
+            return (0, -d)
+
+        machines = [m for m in machine_skus if _MACHINE_GROUP.get(m, "") != "STAGE1"]
+        stg = {
+            m: {
+                "remaining": float(SHIFT_MINS), "co_count": 0, "max_cos": _max_cos(m),
+                "cur_sku": machine_current_sku.get(m, ""),
+                "rate": _bld_qty_per_shift(m) / SHIFT_MINS,
+                "dom": _MACHINE_DOMINANT_INCH.get(
+                    str(m), sku_inch.get(machine_current_sku.get(m, ""), "")),
+                "primary_done": True, "campaigns": [],
+            }
+            for m in machines
+        }
+
+        # ── Phase A: continuation anchor (no CO) ──
+        for m in sorted(machines):
+            s = stg[m]; buf = _buf_of(m); rate = s["rate"]
+            eligible = machine_skus.get(m, set()); dom = s["dom"]
+            cur = s["cur_sku"]
+            # seed empty machine with a dom-inch-preferred deficit SKU (== "start")
+            if not cur:
+                cands = [x for x in eligible if _defc(x, buf) > 0]
+                if cands:
+                    cur = min(cands, key=lambda x: (
+                        0 if sku_inch.get(x, "") == dom else 1,
+                        *_tierg(x, m, _defc(x, buf)), x))
+                    s["cur_sku"] = cur
+            cur_inch = sku_inch.get(cur, "")
+            # round-trip buffer sizing (same as per-machine path)
+            eff_buf = buf
+            if _ROUND_TRIP_BUFFER_ENABLED and cur and len(eligible) > 1:
+                pc = [x for x in eligible if x != cur
+                      and demand_remaining.get(x, 0.0) > 0 and _defc(x, buf) > 0]
+                if pc:
+                    if m in _INCH_FLEX_MACHINES:
+                        partner = max(pc, key=lambda x: (
+                            _co_cost(m, cur_inch, sku_inch.get(x, ""))
+                            + _co_cost(m, sku_inch.get(x, ""), cur_inch), _defc(x, buf), x))
+                    else:
+                        partner = max(pc, key=lambda x: (_defc(x, buf), x))
+                    p_inch = sku_inch.get(partner, "")
+                    p_dwell = max(MIN_CAMPAIGN_MINS,
+                                  _defc(partner, buf) / rate if rate > 0 else MIN_CAMPAIGN_MINS)
+                    rt = _co_cost(m, cur_inch, p_inch) + p_dwell + _co_cost(m, p_inch, cur_inch)
+                    eff_buf = max(buf, rt / SHIFT_MINS)
+            flex_reclaim = (m in _INCH_FLEX_MACHINES and cur_inch != dom
+                            and any(sku_inch.get(x, "") == dom and _defc(x, buf) > 0
+                                    for x in eligible))
+            if cur in eligible and _defc(cur, eff_buf) > 0 and not flex_reclaim:
+                mins = min(s["remaining"],
+                           _defc(cur, eff_buf) / rate if rate > 0 else s["remaining"])
+                qty = int(mins * rate)
+                if mins >= MIN_CAMPAIGN_MINS and qty > 0:
+                    s["campaigns"].append((cur, qty, "start"))
+                    projected_gt[cur] = projected_gt.get(cur, 0.0) + qty
+                    s["remaining"] -= mins
+                s["primary_done"] = _defc(cur, eff_buf) <= 0
+
+        # ── Phase B: global pair-scoring greedy for remaining capacity ──
+        _guard = 0
+        while _guard < 100000:
+            _guard += 1
+            pairs = []
+            flex_m: dict = {}
+            flex_s: dict = {}
+            for m in machines:
+                s = stg[m]
+                if s["remaining"] < MIN_CAMPAIGN_MINS or s["co_count"] >= s["max_cos"]:
+                    continue
+                buf = _buf_of(m); rate = s["rate"]; dom = s["dom"]
+                cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
+                for sku in machine_skus.get(m, set()):
+                    if sku == cur:
+                        continue
+                    d = _defc(sku, buf)
+                    if d <= 0:
+                        continue
+                    to_inch = sku_inch.get(sku, "")
+                    if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
+                            and to_inch != dom and not s["primary_done"]):
+                        continue
+                    cost = _co_cost(m, cur_inch, to_inch)
+                    if s["remaining"] - cost < MIN_CAMPAIGN_MINS:
+                        continue
+                    is_urgent = (sku in co_target_skus and projected_gt.get(sku, 0.0) == 0
+                                 and demand_remaining.get(sku, 0.0) > 0)
+                    _flex_off_ok = (m in _INCH_FLEX_MACHINES and to_inch != dom
+                                    and s["primary_done"])
+                    if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok:
+                        continue
+                    avail = s["remaining"] - cost
+                    mins = min(avail, d / rate if rate > 0 else avail)
+                    qty = int(mins * rate)
+                    if mins < MIN_CAMPAIGN_MINS or qty <= 0:
+                        continue
+                    tier, primary = _tierg(sku, m, d)
+                    inch_penalty = 0 if to_inch == dom else 1
+                    pairs.append((m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty))
+                    flex_m[m] = flex_m.get(m, 0) + 1
+                    flex_s[sku] = flex_s.get(sku, 0) + 1
+            if not pairs:
+                break
+
+            def _key(p):
+                m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = p
+                constraint = min(flex_m[m], flex_s[sku])
+                if _GLOBAL_CONSTRAINT_MODE == "below":
+                    return (inch_penalty, tier, primary, constraint, cost, m, sku)
+                elif _GLOBAL_CONSTRAINT_MODE == "captive":
+                    return (inch_penalty, 0 if constraint <= 1 else 1,
+                            tier, primary, cost, m, sku)
+                return (inch_penalty, constraint, tier, primary, cost, m, sku)  # "above"
+
+            m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = min(pairs, key=_key)
+            s = stg[m]
+            co_type = "same_size_CO" if to_inch == sku_inch.get(s["cur_sku"], "") else "diff_size_CO"
+            s["campaigns"].append((sku, qty, co_type))
+            projected_gt[sku] = projected_gt.get(sku, 0.0) + qty
+            s["remaining"] -= (cost + mins)
+            s["co_count"] += 1
+            s["cur_sku"] = sku
+
+        return {m: stg[m]["campaigns"] for m in machines if stg[m]["campaigns"]}
+
     if _MACHINE_ORDER_REVERSED:
         _pri = {"STAGE2": 0, "UNISTAGE": 1, "BJ": 2, "VMI": 3, "STAGE1": 9}
     else:
         _pri = {"VMI": 0, "BJ": 1, "UNISTAGE": 2, "STAGE2": 3, "STAGE1": 9}
-    if _SCARCITY_ORDER_ENABLED:
+    if _RI_RATIO_GLOBAL and demand_dict is not None and machine_total_demand is not None:
+        # Approach 2: ratio-driven machine order — replace the fixed VMI->BJ->US
+        # ->Stage2 group order with DESCENDING best-ratio order, so the machine
+        # whose best-fit deficit SKU has the highest ratio claims first. A SKU is
+        # "in play" for this ordering if it has curing demand this shift and unmet
+        # demand remaining. Stage-1 last (carcass). Group priority + machine name
+        # break ties deterministically.
+        def _best_ratio(m: str) -> float:
+            mtd  = machine_total_demand.get(m, 1e-9)
+            best = 0.0
+            for s in machine_skus.get(m, ()):
+                if shift_cure_demand.get(s, 0.0) > 0 and demand_remaining.get(s, 0.0) > 0:
+                    r = demand_dict.get(s, 0.0) / mtd
+                    if r > best:
+                        best = r
+            return best
+        sorted_machines = sorted(
+            machine_skus.keys(),
+            key=lambda m: (
+                9 if _MACHINE_GROUP.get(m, "") == "STAGE1" else 0,
+                -_best_ratio(m),
+                _pri.get(_MACHINE_GROUP.get(m, ""), 9),
+                m,
+            ),
+        )
+    elif _SCARCITY_ORDER_ENABLED:
         # Scarcity-first: machines with the FEWEST eligible SKUs claim their
         # shared-SKU deficit before flexible machines can poach it. A captive
         # machine (e.g. 7301, eligible for only LSTL0) can build nothing else,
@@ -900,6 +1117,16 @@ def _assign_building_shift(
         sorted_machines = sorted(
             machine_skus.keys(),
             key=lambda m: (_pri.get(_MACHINE_GROUP.get(m, ""), 9), m),
+        )
+
+    # Captive-first: stable re-sort putting non-Stage-1 captive machines (exactly
+    # one eligible SKU) at the FRONT so they claim their sole SKU before flexible
+    # machines drain its deficit. Stable → preserves the base order within groups.
+    if _CAPTIVE_FIRST_ENABLED:
+        sorted_machines = sorted(
+            sorted_machines,
+            key=lambda m: 0 if (len(machine_skus.get(m, ())) == 1
+                                and _MACHINE_GROUP.get(m, "") != "STAGE1") else 1,
         )
 
     plan: dict[str, list] = {}
@@ -927,14 +1154,19 @@ def _assign_building_shift(
             # NRI candidates are ranked by static demand[sku]/machine_total_demand[machine]
             # (never decremented) instead of raw deficit magnitude, so thin NRI SKUs aren't
             # structurally starved by high-volume ones competing for the same machine.
+            _is_ri = press_count.get(sku, 0) > 0
+            # Approach 1/2: when RI-ratio is on, RI candidates are ALSO ranked by
+            # ratio (not raw deficit). RI keeps tier 0 (outranks NRI); only the
+            # within-RI ordering switches from -deficit to -ratio.
+            _ri_ratio = (_RI_RATIO_ENABLED or _RI_RATIO_GLOBAL) and _is_ri
             if (
                 _BUILDING_RATIO_ENABLED
-                and press_count.get(sku, 0) <= 0
+                and (press_count.get(sku, 0) <= 0 or _ri_ratio)
                 and demand_dict is not None
                 and machine_total_demand is not None
             ):
                 ratio = demand_dict.get(sku, 0.0) / machine_total_demand.get(machine, 1e-9)
-                return (1, -ratio)
+                return (0 if _is_ri else 1, -ratio)
             return (0, -d)
 
         eligible = machine_skus.get(machine, set())
@@ -1350,7 +1582,7 @@ def _write_rolling_building_excel(
             prod_by_sku[sku] += int(row.get("Qty", 0) or 0)
 
     dem_cols = ["SKUCode", "Category", "Priority", "Demand", "GT_Inventory",
-                "Planned_Units", "Gap", "Fulfillment_Pct", "Status",
+                "Planned_Units", "Planned+GT", "Gap", "Fulfillment_Pct", "Status",
                 "CycleTime_min", "Eligible_Machines", "Presses_Needed", "Skip_Reason"]
     _xl_header(ws_dem, 1, dem_cols)
 
@@ -1372,18 +1604,25 @@ def _write_rolling_building_excel(
     dem_rows_out = []
     for sku, dem in sorted(demand_dict.items(), key=lambda x: -x[1]):
         planned  = float(prod_by_sku.get(sku, 0))
-        gap      = max(0, int(dem) - int(planned))
-        fill_pct = round(100 * planned / dem, 1) if dem > 0 else 0.0
-        status   = ("FULLY MET" if planned >= dem * 0.95
-                    else "PARTIAL" if planned > 0 else "UNMET")
+        gt_inv   = float(opening_gt.get(sku, 0))
+        # Total GT available to cure = building output THIS horizon + opening
+        # inventory carried in on Day 0. The curing sheet consumes both, so its
+        # Gap/Fulfillment already reflect this; Gap here now matches (previously
+        # Gap = demand − planned ignored the opening GT_Inventory).
+        planned_plus_gt = planned + gt_inv
+        gap      = max(0, int(dem) - int(planned_plus_gt))
+        fill_pct = round(100 * planned_plus_gt / dem, 1) if dem > 0 else 0.0
+        status   = ("FULLY MET" if planned_plus_gt >= dem * 0.95
+                    else "PARTIAL" if planned_plus_gt > 0 else "UNMET")
         avg_ct   = _avg_bld_ct(sku)
         p_needed = (round(dem * avg_ct / _PRESS_NORM, 2) if avg_ct else "NA")
         dem_rows_out.append({
             "SKUCode": sku, "Category": cat_map_d0.get(sku, ""),
             "Priority": round(pri_map_d0.get(sku, 0), 7),
             "Demand": int(dem),
-            "GT_Inventory": int(opening_gt.get(sku, 0)),
-            "Planned_Units": int(planned), "Gap": gap,
+            "GT_Inventory": int(gt_inv),
+            "Planned_Units": int(planned), "Planned+GT": int(planned_plus_gt),
+            "Gap": gap,
             "Fulfillment_Pct": f"{fill_pct}%", "Status": status,
             "CycleTime_min": avg_ct if avg_ct is not None else "NA",
             "Eligible_Machines": len(sku_machine_map.get(sku, set())) or "NA",
@@ -1402,7 +1641,7 @@ def _write_rolling_building_excel(
             if ci == pu_col_idx:
                 cell.font = Font(bold=True)
     ws_dem.column_dimensions["A"].width = 34
-    for ltr in "BCDEFGHIJKLM":
+    for ltr in "BCDEFGHIJKLMN":
         ws_dem.column_dimensions[ltr].width = 15
 
     # KPI footer (matches building_b2c.py _append_b2c_sheets format)
@@ -1411,7 +1650,9 @@ def _write_rolling_building_excel(
     n_unmet = sum(1 for r in dem_rows_out if r["Status"] == "UNMET")
     tot_bld = sum(r["Planned_Units"] for r in dem_rows_out)
     tot_dem = sum(r["Demand"]        for r in dem_rows_out)
+    tot_avail = sum(r["Planned+GT"]  for r in dem_rows_out)  # built + opening GT
     kpi_pct = round(100 * tot_bld / tot_dem, 1) if tot_dem else 0.0
+    kpi_pct_avail = round(100 * tot_avail / tot_dem, 1) if tot_dem else 0.0
     n_co_bld = sum(1 for r in bld_shift_rows if str(r.get("SKUCode","")).upper() in _SENTINEL)
     footer = len(dem_rows_out) + 3
     ws_dem.cell(row=footer,   column=1, value="KPI SUMMARY").font = Font(bold=True)
@@ -1423,13 +1664,18 @@ def _write_rolling_building_excel(
     _kv.font = Font(bold=True)
     _kv2 = ws_dem.cell(row=footer+3, column=2, value=f"{kpi_pct}%")
     _kv2.font = Font(bold=True)
+    _kv3 = ws_dem.cell(row=footer+4, column=1,
+                       value="KPI — (GT Built + Opening GT) / Customer Demand")
+    _kv3.font = Font(bold=True)
+    _kv4 = ws_dem.cell(row=footer+4, column=2, value=f"{kpi_pct_avail}%")
+    _kv4.font = Font(bold=True)
     ws_dem.cell(row=footer+5, column=1, value="Total SKUs in demand file")
     ws_dem.cell(row=footer+5, column=2, value=len(dem_rows_out))
-    ws_dem.cell(row=footer+6, column=1, value="Fully Met (≥95% of demand built)")
+    ws_dem.cell(row=footer+6, column=1, value="Fully Met (≥95% of demand, built+opening GT)")
     ws_dem.cell(row=footer+6, column=2, value=n_full)
-    ws_dem.cell(row=footer+7, column=1, value="Partial (0 < built < 95%)")
+    ws_dem.cell(row=footer+7, column=1, value="Partial (0 < built+opening GT < 95%)")
     ws_dem.cell(row=footer+7, column=2, value=n_part)
-    ws_dem.cell(row=footer+8, column=1, value="Unmet (0 built)")
+    ws_dem.cell(row=footer+8, column=1, value="Unmet (built+opening GT = 0)")
     ws_dem.cell(row=footer+8, column=2, value=n_unmet)
     ws_dem.cell(row=footer+9, column=1, value="Total Building COs")
     ws_dem.cell(row=footer+9, column=2, value=n_co_bld)
@@ -2123,6 +2369,20 @@ def run_rolling_pipeline(
         machine_current_sku = {str(r["Machine"]): str(r["SKUCode"]) for _, r in df_running_bld.iterrows()}
     except Exception:
         pass
+    if _SEED_FROM_PLANT_RUNNING:
+        try:
+            _pr = pd.read_excel(_PLANT_RUNNING_FILE)
+            _seed = {}
+            for _, r in _pr.iterrows():
+                _m   = str(r["Machine_Code"]).strip()
+                _sku = str(r["SKUCode"]).strip()
+                if not _sku or _sku.lower() == "nan" or "IDLE" in _sku:
+                    continue
+                _seed[_m] = _sku
+            machine_current_sku = _seed
+            print(f"  [Rolling] Seeded machine_current_sku from plant running file: {len(_seed)} machines")
+        except Exception as _e:
+            print(f"  [Rolling] Plant-running seed FAILED: {_e}")
 
     # ── G: Machine pools + cross-shift minute tracker ─────────────────────────
     # Pool: fixed 2–3 same-inch SKUs per machine, ordered by Day-1 urgency.
