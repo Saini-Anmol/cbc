@@ -152,6 +152,15 @@ _GLOBAL_ASSIGN_ENABLED  = True
 # "below" (after tier), or "captive" (only min(flex)<=1 boosted). Sensitivity knob.
 _GLOBAL_CONSTRAINT_MODE = "below"
 
+# EXPERIMENT (global branch only): force a CAPTIVE machine (exactly 1 eligible SKU,
+# e.g. 7301 -> LSTL0) to build its sole SKU at FULL shift capacity in Phase A —
+# capped ONLY by the demand cap, not by the curing-demand buffer — so it never
+# idles while its SKU still has unmet demand. Remaining demand is filled by the
+# normal global logic on other machines. Off = buffer-throttled (current global).
+# Flip this line True/False to turn captive-max on/off (env CAPTIVE_MAX also works):
+# _CAPTIVE_MAX_ENABLED = os.environ.get("CAPTIVE_MAX") == "1"
+_CAPTIVE_MAX_ENABLED = True
+
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
 # groups should claim their deficit signal before flexible VMI machines mop up
@@ -991,9 +1000,15 @@ def _assign_building_shift(
             flex_reclaim = (m in _INCH_FLEX_MACHINES and cur_inch != dom
                             and any(sku_inch.get(x, "") == dom and _defc(x, buf) > 0
                                     for x in eligible))
-            if cur in eligible and _defc(cur, eff_buf) > 0 and not flex_reclaim:
-                mins = min(s["remaining"],
-                           _defc(cur, eff_buf) / rate if rate > 0 else s["remaining"])
+            # Captive-max experiment: a captive machine (only 1 eligible SKU) builds
+            # its sole SKU to the full demand cap (not just the buffer) so it runs
+            # flat-out and never idles while its SKU has unmet demand.
+            _cap_max = (_CAPTIVE_MAX_ENABLED and len(eligible) == 1
+                        and _MACHINE_GROUP.get(m, "") != "STAGE1")
+            _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0))
+                     if _cap_max else _defc(cur, eff_buf))
+            if cur in eligible and _room > 0 and not flex_reclaim:
+                mins = min(s["remaining"], _room / rate if rate > 0 else s["remaining"])
                 qty = int(mins * rate)
                 if mins >= MIN_CAMPAIGN_MINS and qty > 0:
                     s["campaigns"].append((cur, qty, "start"))
