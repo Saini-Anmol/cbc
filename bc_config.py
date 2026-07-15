@@ -57,7 +57,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 18
+MAX_CHANGEOVERS_PER_DAY = 12   # was 18 — user set 12 for the surplus-release test
 # Hard cap on CURING PRESS COs scheduled per calendar day (unchanged in new arch).
 # 8  → ~594k GT (May 2026 baseline).
 # 10 → ~615k (balanced NRI activation).
@@ -166,6 +166,12 @@ TOPUP_LOOKAHEAD_DAYS_CARCASS = 1
 GT_SHELF_LIFE_DAYS      = 3
 # GT cannot sit more than 3 days before curing (plant rule).
 # TopUp will not pre-build GT beyond this window.
+
+MAX_ENDOFDAY_GT_INVENTORY = 10000
+# Plant capacity constraint: total GT held in inventory at the END of any day
+# (summed over all SKUs, after curing + stale writeoff) cannot exceed this many
+# units. Enforced PROACTIVELY during building (never build past the ceiling) so
+# it is a hard cap, not a reactive writeoff. Bounds the forward-buffer level-load.
 
 GT_BUFFER_SHIFTS        = 2
 # VMI sibling machines (e.g. 6004+7001, both on 16") both need non-zero deficit

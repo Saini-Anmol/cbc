@@ -46,7 +46,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 import cbc_env
-from curing_consumption_dynamic import run_dynamic_consumption, ConsumptionConfig, COScheduler
+from curing_consumption_dynamic import (
+    run_dynamic_consumption, ConsumptionConfig, COScheduler, _SURPLUS_RELEASE_ENABLED,
+)
 from building_b2c import run_from_database_b2c
 from curing_b2c import run_curing_b2c
 from curing_consumption import ConsumptionETL
@@ -57,6 +59,7 @@ from bc_config import (
     PLANNING_DAYS,
     DEMAND_FILE,
     GT_SHELF_LIFE_DAYS,
+    MAX_ENDOFDAY_GT_INVENTORY,
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
     BUILD_LEAD_SHIFTS,
@@ -74,6 +77,19 @@ from bc_config import (
     BUILDING_OUTPUT    as BUILD_OUTPUT,
     CURING_B2C_OUTPUT  as CURING_OUTPUT,
 )
+
+# Optional env override for the daily curing-CO cap — lets us sweep it (e.g. 8-13)
+# without editing bc_config. Unset ⇒ the committed bc_config value.
+if os.environ.get("MAX_CO"):
+    MAX_CHANGEOVERS_PER_DAY = int(os.environ["MAX_CO"])
+
+# Optional OUT_TAG — suffix all output files so parallel runs don't clobber each
+# other (used for concurrent CO-cap sweeps). Unset ⇒ the normal output paths.
+if os.environ.get("OUT_TAG"):
+    _ot = os.environ["OUT_TAG"]
+    BUILD_OUTPUT  = BUILD_OUTPUT.replace(".xlsx", f"_{_ot}.xlsx")
+    CURING_OUTPUT = CURING_OUTPUT.replace(".xlsx", f"_{_ot}.xlsx")
+    CC_OUTPUT     = CC_OUTPUT.replace(".xlsx", f"_{_ot}.xlsx")
 
 # ── Machine group map ─────────────────────────────────────────────────────────
 _MACHINE_GROUP: dict[str, str] = {}
@@ -160,6 +176,39 @@ _GLOBAL_CONSTRAINT_MODE = "below"
 # Flip this line True/False to turn captive-max on/off (env CAPTIVE_MAX also works):
 # _CAPTIVE_MAX_ENABLED = os.environ.get("CAPTIVE_MAX") == "1"
 _CAPTIVE_MAX_ENABLED = True
+
+# EXPERIMENT: End-of-day 12k total GT-inventory cap (hard plant constraint).
+# Plant can hold at most MAX_ENDOFDAY_GT_INVENTORY units of GT overnight (summed
+# over all SKUs). Enforced PROACTIVELY in the build-room calc (never build past the
+# ceiling) — see _defc / captive-max _room. An end-of-day audit column records the
+# actual total so we can confirm it never violates. Off = no cap (current behaviour).
+# env GT_CAP=0 forces OFF for the bit-for-bit baseline check; default ON.
+_ENDOFDAY_GT_CAP_ENABLED = True
+
+# EXPERIMENT: Forward-buffer level-loading. Use idle building capacity (weeks 4-5 run
+# at 51-56% util while presses starve) to pre-build a SHELF-LIFE-SAFE forward buffer
+# for SKUs that WILL be cured in the next 3 days. Phase C (slack-fill) runs after
+# Phase A/B: for a machine that would otherwise idle, build MORE of its most
+# starvation-prone eligible SKU (must have a LIVE cure-draw shift_cure_demand>0 — a
+# press is actively pulling it — and demand remaining), up to min(demand_remaining,
+# 3-day cure-draw) and bounded by the 12k cap. Builds only REQUIRED GT, never random
+# SKUs. Auto-targets building-limited SKUs, auto-skips press-limited ones. Off = idle.
+# env FWD_BUF=0 forces OFF; default ON.
+_FORWARD_BUFFER_ENABLED = True
+
+# Starvation-risk gate for the forward buffer: only pre-build a SKU whose on-hand GT
+# is BELOW this many shifts of its live cure-draw (i.e. it is about to starve). This
+# stops early-month front-loading (weeks 1-3 machines have slack but presses are NOT
+# starving — building keeps up), so the forward buffer fires mainly where presses
+# actually run dry (weeks 4-5), lifting the tail without pulling demand forward.
+# Higher = fires more aggressively (more front-load); lower = only near-starvation.
+# 0 ⇒ gate off (fill whenever slack+demand exist, the pure front-loading behaviour).
+_FWD_RISK_SHIFTS = True
+
+# Shelf-life expressed in shifts (3 days x 3 shifts/day = 9). Forward-buffer never
+# pre-builds a SKU beyond this many shifts of its live cure-draw (so it cannot age
+# out to writeoff within the shelf window).
+GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
 
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
@@ -355,6 +404,53 @@ _INCH_FLEX_MACHINES: frozenset[str] = _resolve_flex_machines()
 def _bld_qty_per_shift(machine: str) -> int:
     ct_min = _BLD_CT_SEC.get(str(machine), 120.0) / 60.0
     return int(SHIFT_MINS / ct_min)
+
+
+def _compute_buildable_rate(engine, demand_path: str) -> dict:
+    """Per-SKU sustainable building GT/day for the surplus-release 5b guard.
+
+    For each eligible building machine, its GT/day (_bld_qty_per_shift * 3) is
+    apportioned across the SKUs it can build by demand share, then summed per SKU.
+    A building-oversubscribed SKU (e.g. BJ 15") gets a rate below its cure demand,
+    so the guard blocks moving more curing presses onto it (which would starve).
+    Stage-1 machines are excluded (carcass, not GT).
+    """
+    import ast
+    from building_b2c import B2C_ETL as _BETL
+    ddf  = pd.read_excel(demand_path)
+    scol = next((c for c in ddf.columns if "SKU" in str(c)), ddf.columns[0])
+    qcol = next((c for c in ddf.columns
+                 if any(x in str(c) for x in ("Requirement", "Demand", "Qty", "Quantity"))),
+                ddf.columns[1])
+    demand_dict = {str(r[scol]).strip(): float(r[qcol] or 0)
+                   for _, r in ddf.iterrows() if pd.notna(r.get(qcol))}
+    df_allow = _BETL(engine).load_machine_allowable()
+    machine_skus: dict[str, set] = {}
+    for _, r in df_allow.iterrows():
+        sku = str(r["SKUCode"]).strip()
+        ms  = r.get("Machines", [])
+        if isinstance(ms, str):
+            try:
+                ms = ast.literal_eval(ms)
+            except Exception:
+                ms = []
+        for m in ms:
+            m = str(m).strip()
+            if _MACHINE_GROUP.get(m, "") == "STAGE1":
+                continue
+            machine_skus.setdefault(m, set()).add(sku)
+    # Building is DYNAMIC: a machine can pour its FULL throughput into one SKU when
+    # its other SKUs don't need production that shift. So a SKU's buildable rate is
+    # the FULL summed throughput of its eligible machines — NOT apportioned by demand
+    # share (which underestimated by median ~44x and blocked almost every valid CO).
+    # The guard then blocks only genuinely building-oversubscribed SKUs (full
+    # capacity < what the added presses would consume).
+    buildable: dict[str, float] = {}
+    for m, skus in machine_skus.items():
+        m_day = _bld_qty_per_shift(m) * 3                      # GT/day this machine
+        for s in skus:
+            buildable[s] = buildable.get(s, 0.0) + m_day       # full throughput, not apportioned
+    return buildable
 
 
 def _shift_start_dt(date_str: str, shift: str) -> "datetime":
@@ -929,6 +1025,11 @@ def _assign_building_shift(
             return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT + _INCH_FLEX_EXTRA_COS
         return MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT
     projected_gt: dict[str, float] = dict(gt_inventory)
+    # GT actually carried INTO this shift (before any building) — the base for the
+    # end-of-day 10k cap. Base Phase A/B build is cure-neutral (curing consumes it
+    # this/next shift, so carry stays flat without a forward buffer); only Phase C's
+    # forward buffer adds NET overnight carry, so we bound entry_carry + forward ≤ 10k.
+    _entry_carry_gt = sum(v for v in gt_inventory.values() if v > 0)
 
     if _GLOBAL_ASSIGN_ENABLED:
         # ══ Global machine-SKU scoring assignment (supersedes per-machine greedy) ══
@@ -943,6 +1044,15 @@ def _assign_building_shift(
             gap = shift_cure_demand.get(sku, 0.0) * _b - built_ahead
             cap = demand_remaining.get(sku, 0.0) - built_ahead
             return min(max(0.0, gap), max(0.0, cap))
+
+        def _gt_headroom(fwd_added: float) -> float:
+            # Strict room under the end-of-day 10k cap for the forward buffer. We do NOT
+            # credit this shift's curing to the forward GT (conservative → even if
+            # nothing cures, carry stays ≤ 10k). Base Phase A/B build is cure-neutral and
+            # is excluded; only entry_carry + forward-added is bounded. Cap OFF ⇒ inf.
+            if not _ENDOFDAY_GT_CAP_ENABLED:
+                return float("inf")
+            return max(0.0, MAX_ENDOFDAY_GT_INVENTORY - (_entry_carry_gt + fwd_added))
 
         def _tierg(sku: str, m: str, d: float) -> tuple:
             _is_ri = press_count.get(sku, 0) > 0
@@ -1079,6 +1189,85 @@ def _assign_building_shift(
             s["remaining"] -= (cost + mins)
             s["co_count"] += 1
             s["cur_sku"] = sku
+
+        # ── Phase C: forward-buffer slack-fill (level-loading) ──
+        # Use building capacity that Phase A/B left idle to PRE-BUILD a shelf-life-safe
+        # forward buffer for SKUs that WILL be cured in the next 3 days. Builds ONLY
+        # required GT: a candidate must have a LIVE cure-draw (shift_cure_demand>0 → a
+        # press is actively pulling it — never a random SKU) and unmet demand. Per-SKU
+        # forward target = min(demand_remaining, 3-day cure-draw); the shelf-safe cap
+        # auto-targets building-limited SKUs (high draw) and auto-skips press-limited
+        # ones (tiny draw → nothing to pre-build). Bounded by the 10k end-of-day cap.
+        if _FORWARD_BUFFER_ENABLED:
+            _fwd_added = 0.0   # total forward GT queued this shift (across all machines)
+            for m in sorted(machines):
+                s = stg[m]; rate = s["rate"]
+                if rate <= 0:
+                    continue
+                _cguard = 0
+                while s["remaining"] >= MIN_CAMPAIGN_MINS and _cguard < 1000:
+                    _cguard += 1
+                    hr = _gt_headroom(_fwd_added)
+                    if _ENDOFDAY_GT_CAP_ENABLED and hr <= 0:
+                        break
+                    dom = s["dom"]; cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
+                    best = None; best_key = None; best_room = 0.0
+                    for sku in machine_skus.get(m, set()):
+                        draw = shift_cure_demand.get(sku, 0.0)
+                        if draw <= 0:                      # not needed soon → not "required"
+                            continue
+                        dr = demand_remaining.get(sku, 0.0)
+                        if dr <= 0:
+                            continue
+                        # starvation-risk gate: skip SKUs that already hold enough GT
+                        # (>= _FWD_RISK_SHIFTS shifts of draw) — they are NOT about to
+                        # starve, so pre-building them would only front-load early month.
+                        if (_FWD_RISK_SHIFTS > 0
+                                and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
+                            continue
+                        need_co = (sku != cur)
+                        if need_co and s["co_count"] >= s["max_cos"]:
+                            continue
+                        to_inch = sku_inch.get(sku, "")
+                        # respect the flex/soft-lock off-dominant-inch gate (as Phase B)
+                        if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
+                                and to_inch != dom and not s["primary_done"]):
+                            continue
+                        target = min(dr, draw * GT_SHELF_LIFE_SHIFTS)
+                        room = target - projected_gt.get(sku, 0.0)
+                        if room <= 0:
+                            continue
+                        key = (0 if to_inch == dom else 1,        # dominant inch first
+                               0 if sku == cur else 1,            # avoid a CO if possible
+                               -(draw / (projected_gt.get(sku, 0.0) + 1.0)),  # most starving
+                               -room, sku)
+                        if best is None or key < best_key:
+                            best = sku; best_key = key; best_room = room
+                    if best is None:
+                        break
+                    to_inch = sku_inch.get(best, "")
+                    cost = 0.0 if best == cur else _co_cost(m, cur_inch, to_inch)
+                    if s["remaining"] - cost < MIN_CAMPAIGN_MINS:
+                        break
+                    room = min(best_room, hr) if _ENDOFDAY_GT_CAP_ENABLED else best_room
+                    avail = s["remaining"] - cost
+                    mins = min(avail, room / rate)
+                    qty = int(mins * rate)
+                    # hard demand-cap clamp (sacred invariant): never build past the
+                    # SKU's remaining demand headroom, even by a min-campaign rounding.
+                    qty = min(qty, max(0, int(demand_remaining.get(best, 0.0)
+                                              - projected_gt.get(best, 0.0))))
+                    if mins < MIN_CAMPAIGN_MINS or qty <= 0:
+                        break
+                    co_type = ("start" if best == cur
+                               else ("same_size_CO" if to_inch == cur_inch else "diff_size_CO"))
+                    s["campaigns"].append((best, qty, co_type))
+                    projected_gt[best] = projected_gt.get(best, 0.0) + qty
+                    _fwd_added += qty
+                    s["remaining"] -= (cost + mins)
+                    if best != cur:
+                        s["cur_sku"] = best
+                        s["co_count"] += 1
 
         return {m: stg[m]["campaigns"] for m in machines if stg[m]["campaigns"]}
 
@@ -2165,10 +2354,23 @@ def run_rolling_pipeline(
 
     # ── A: CO schedule ────────────────────────────────────────────────────────
     print("  [Rolling] Computing CO schedule …")
+    # Surplus-release 5b guard needs a per-SKU building-supply estimate (curing
+    # scheduler is otherwise building-independent). Compute it only when the
+    # feature is on; failure falls back to None (guard becomes a no-op).
+    _buildable_rate = None
+    if _SURPLUS_RELEASE_ENABLED:
+        try:
+            from cbc_env import make_engine as _mk
+            _buildable_rate = _compute_buildable_rate(_mk(), demand_path)
+            print(f"  [Rolling] Surplus-release ON — buildable_rate for "
+                  f"{len(_buildable_rate)} SKUs (5b guard)")
+        except Exception as _e:
+            print(f"  [Rolling] buildable_rate computation failed ({_e}); 5b guard disabled")
     cc_result = run_dynamic_consumption(
         demand_path=demand_path, output_path=CC_OUTPUT,
         plan_start=plan_start, planning_days=planning_days,
         max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
+        buildable_rate=_buildable_rate,
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -2953,6 +3155,13 @@ def run_rolling_pipeline(
         day_writeoff = _writeoff_stale_gt(gt_inventory, last_build_day, day)
         writeoff_total += day_writeoff
 
+        # End-of-day total GT inventory (after curing + writeoff) — audits the 10k
+        # plant cap. Should never exceed MAX_ENDOFDAY_GT_INVENTORY when the cap is on.
+        endday_gt_inv = sum(v for v in gt_inventory.values() if v > 0)
+        if _ENDOFDAY_GT_CAP_ENABLED and endday_gt_inv > MAX_ENDOFDAY_GT_INVENTORY + 1:
+            print(f"  [GT-CAP WARN] Day {day}: end-of-day GT inventory "
+                  f"{endday_gt_inv:,.0f} > cap {MAX_ENDOFDAY_GT_INVENTORY:,}")
+
         # ── 6. Apply CO transitions ───────────────────────────────────────
         for press, old_sku, new_sku in today_cos:
             press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
@@ -2987,6 +3196,7 @@ def run_rolling_pipeline(
             "Day": day, "Date": date_str,
             "GT_Built": int(round(d_gt_built)), "GT_Cured": int(round(d_cured)),
             "GT_Writeoff": int(round(day_writeoff)),
+            "EndDay_GT_Inventory": int(round(endday_gt_inv)),
             "Active_Presses": n_active, "COs_Today": len(today_cos),
             "Demand_Coverage": round(cov, 2),
         })
@@ -3015,6 +3225,14 @@ def run_rolling_pipeline(
     print(f"  GT written off       : {writeoff_total:>10,.0f}")
     print(f"  Starvation events    : {starvation_n:>10,}")
     print(f"  Demand coverage      : {final_cov:>9.1f}%  ({dem_met:,.0f} / {total_demand:,.0f})")
+    _eod_inv = [r["EndDay_GT_Inventory"] for r in daily_summary if "EndDay_GT_Inventory" in r]
+    if _eod_inv:
+        _n_over = sum(1 for v in _eod_inv if v > MAX_ENDOFDAY_GT_INVENTORY)
+        print(f"  End-day GT inventory : max {max(_eod_inv):>6,.0f} | "
+              f"mean {sum(_eod_inv)/len(_eod_inv):>6,.0f} | "
+              f"days>{MAX_ENDOFDAY_GT_INVENTORY//1000}k {_n_over}  (cap "
+              f"{'ON' if _ENDOFDAY_GT_CAP_ENABLED else 'OFF'}, fwd-buf "
+              f"{'ON' if _FORWARD_BUFFER_ENABLED else 'OFF'})")
 
     # ── Write Excel outputs (same format as legacy pipeline) ─────────────────
     closing_gt_bal = {sku: v for sku, v in gt_inventory.items() if v > 0}

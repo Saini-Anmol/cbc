@@ -90,6 +90,19 @@ from bc_config import (
 # A/B urgency gating is untouched — this only changes ranking within a class.
 _CURING_RATIO_ENABLED = True
 
+# Surplus RI-press early-release (env SURPLUS_RELEASE=1, default OFF). Detects
+# over-provisioned Runner-In SKUs (press_count > presses_needed to meet demand by
+# the horizon) and releases the SURPLUS presses EARLY, spread across days, instead
+# of dumping them all at once when demand finally hits 0 (the month-end CO cliff).
+# Guards: (5a) only to a compatible needy SKU; (5b) only if building can supply the
+# target (buildable_rate passed in from b2c_pipeline); n-1 RI-protection preserved.
+# Flip True/False to turn surplus-release on/off (env SURPLUS_RELEASE also works):
+# _SURPLUS_RELEASE_ENABLED  = os.environ.get("SURPLUS_RELEASE") == "1"
+_SURPLUS_RELEASE_ENABLED  = True
+# (Deprecated by the global-pairing redesign — surplus is now uncapped; the daily
+# CO cap + global pairing + n-1 RI-protection decide how many presses actually move.)
+_SURPLUS_PER_SKU_PER_DAY  = int(os.environ.get("SURPLUS_PER_DAY", "2"))
+
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
 _BLUE  = "D6E4F0"
@@ -179,6 +192,7 @@ class COScheduler:
         max_co_per_day: int = MAX_CO_PER_DAY,
         planning_days: int = PLANNING_DAYS,
         ratio_demand_map: dict | None = None,
+        buildable_rate: dict | None = None,
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -309,8 +323,125 @@ class COScheduler:
                     newly_free.append(p)
                     demand_done_free.add(p)
 
+            # ── Surplus RI-press early-release (spread across days) ───────────
+            # An RI SKU running more presses than it needs to meet demand by the
+            # horizon is over-provisioned; release the surplus EARLY (a few/day)
+            # so freed presses reassign to needy SKUs with many production days
+            # left — instead of dumping all at once when demand hits 0 (the cliff).
+            # These presses bypass the Class-B gate (like demand_done_free) and are
+            # subject to the 5b building-supply guard in the firing loop.
+            surplus_free: set[str] = set()
+            if _SURPLUS_RELEASE_ENABLED and horizon_left > 0:
+                _sku_presses: dict[str, list] = {}
+                for p in sorted(demand_running_presses):
+                    cs = press_to_sku.get(p)
+                    if (cs is not None and cs in ri_skus
+                            and updated_demand.get(cs, 0.0) > 0
+                            and p not in demand_done_free):
+                        _sku_presses.setdefault(cs, []).append(p)
+                for sku in sorted(_sku_presses):
+                    n = press_count.get(sku, 0)
+                    if n <= 1:
+                        continue
+                    rate = _qty_per_press_per_day(
+                        ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                    if rate <= 0:
+                        continue
+                    rem = updated_demand.get(sku, 0.0)
+                    presses_needed = max(1, math.ceil(rem / (rate * horizon_left)))
+                    surplus = n - presses_needed
+                    if surplus <= 0:
+                        continue
+                    # Uncapped: pool the TRUE surplus (may be all-but-one of the
+                    # SKU's presses). The global pairing + n-1 RI-protection decide
+                    # how many actually move — no arbitrary per-SKU-per-day throttle.
+                    release = min(surplus, len(_sku_presses[sku]))
+                    for p in _sku_presses[sku][:release]:
+                        newly_free.append(p)
+                        surplus_free.add(p)
+
             if not newly_free:
                 continue
+
+            if _SURPLUS_RELEASE_ENABLED:
+                # ══ Global (free-press, target-SKU) pair assignment ══════════════
+                # Pool = RO + demand-done + surplus presses. Each iteration scores
+                # EVERY eligible (press, target) pair globally by
+                # (urgency_class, constraint=min(flex_press, flex_target), need, …)
+                # and fires the single best, up to the daily cap — mirroring the
+                # building-side _GLOBAL_ASSIGN. Building-supply is a hard filter;
+                # n-1 RI-protection guards the donor. A press with no eligible
+                # buildable target is simply not freed (stays on its donor SKU).
+                _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+                _pool = list(dict.fromkeys(newly_free))
+                _assigned: set = set()
+                while co_used < max_co_per_day:
+                    _pairs: list = []
+                    _flex_p: dict = {}
+                    _flex_t: dict = {}
+                    for p in _pool:
+                        if p in _assigned:
+                            continue
+                        old_sku = press_to_sku.get(p, "")
+                        for target in press_to_demand_targets.get(p, []):
+                            if target == old_sku:
+                                continue
+                            rem = updated_demand.get(target, 0)
+                            if rem <= 0:
+                                continue
+                            n_t = press_count.get(target, 0)
+                            rate_t = _qty_per_press_per_day(ct_map.get(target, _dct))
+                            is_nri = target in nri_skus
+                            is_ri = target in ri_skus
+                            if is_nri:
+                                pass
+                            elif is_ri and n_t > 0:
+                                cur_days = rem / (n_t * rate_t) if rate_t > 0 else float("inf")
+                                if cur_days <= horizon_left:
+                                    continue   # RI already on track
+                            else:
+                                continue
+                            # 5b building-supply hard filter
+                            if buildable_rate is not None:
+                                _br = buildable_rate.get(target)
+                                if _br is not None and (n_t + 1) * rate_t > _br:
+                                    continue
+                            # n-1 RI-protection on the donor (if freeing an RI press)
+                            if old_sku in ri_skus:
+                                n_old = press_count.get(old_sku, 0) - 1
+                                rem_old = updated_demand.get(old_sku, 0)
+                                if rem_old > 0 and n_old > 0:
+                                    rate_old = _qty_per_press_per_day(ct_map.get(old_sku, _dct))
+                                    if rate_old > 0 and rem_old / (n_old * rate_old) > horizon_left:
+                                        continue   # can't spare this press
+                            key0 = _urgency_sort_key(
+                                priority_score=_priority_signal(target, p),
+                                current_press_count=n_t, updated_demand=rem,
+                                rate_per_day=rate_t, horizon_left=horizon_left)
+                            _pairs.append((p, target, old_sku, key0))
+                            _flex_p[p] = _flex_p.get(p, 0) + 1
+                            _flex_t[target] = _flex_t.get(target, 0) + 1
+                    if not _pairs:
+                        break
+                    # Global key: urgency class → constraint (min flex) → need → tiebreaks
+                    best = min(_pairs, key=lambda pr: (
+                        pr[3][0],                                   # urgency_class
+                        min(_flex_p[pr[0]], _flex_t[pr[1]]),        # constraint
+                        pr[3][1], pr[3][2],                         # -priority, after_days
+                        ct_map.get(pr[1], _dct), pr[0], pr[1],      # deterministic tiebreak
+                    ))
+                    p, new_sku, old_sku, _ = best
+                    co_events.append(
+                        {"day": day, "press": p, "old_sku": old_sku, "new_sku": new_sku})
+                    press_to_sku[p] = new_sku
+                    press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
+                    press_count[new_sku] = press_count.get(new_sku, 0) + 1
+                    pending_ro_presses.discard(p)
+                    demand_running_presses.add(p)
+                    _assigned.add(p)
+                    co_used += 1
+                    daily_co_used[day] = co_used
+                continue   # global path handled this day; skip the greedy fire-loop
 
             # Score candidates: target = NRI (any) OR under-supplied RI
             # Under-supplied RI: current press count cannot meet demand in time
@@ -374,8 +505,8 @@ class COScheduler:
                 # immediately regardless of urgency class. Any production > 0 is better.
                 urgency_class = key[0]   # 0 = Class A (critical), 1 = Class B
                 is_demand_done = p in demand_done_free
-                if urgency_class != 0 and not is_demand_done:
-                    continue  # Class B — skip (unless press is idle from demand done)
+                if urgency_class != 0 and not is_demand_done and p not in surplus_free:
+                    continue  # Class B — skip (unless demand-done or surplus-release)
 
                 # Re-check with CURRENT press_count — earlier COs this day may have
                 # already satisfied this target's demand. Without this guard, the same
@@ -404,6 +535,18 @@ class COScheduler:
                         )
                         if rate_old > 0 and rem_old / (n_old_remaining * rate_old) > horizon_left:
                             continue  # remaining n-1 presses cannot cover old_sku demand
+
+                # 5b building-supply guard (surplus releases only): don't move a
+                # surplus press onto a target that building cannot feed — otherwise
+                # the reassigned press just starves (RUNNING, no GT). buildable_rate
+                # is the per-SKU sustainable GT/day building can produce.
+                if p in surplus_free and buildable_rate is not None:
+                    _br = buildable_rate.get(new_sku)
+                    if _br is not None:
+                        _nr = _qty_per_press_per_day(
+                            ct_map.get(new_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                        if (cur_n + 1) * _nr > _br:
+                            continue  # building can't supply the extra press → skip
 
                 co_events.append(
                     {"day": day, "press": p, "old_sku": old_sku, "new_sku": new_sku}
@@ -1234,6 +1377,7 @@ def run_dynamic_consumption(
     plan_start: datetime = PLAN_START,
     planning_days: int = PLANNING_DAYS,
     max_co_per_day: int = MAX_CO_PER_DAY,
+    buildable_rate: dict | None = None,
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1383,7 +1527,8 @@ def run_dynamic_consumption(
     print("\n  [Pass 1] Computing CO schedule …")
     scheduler = COScheduler()
     co_events = scheduler.schedule(
-        df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day
+        df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day,
+        buildable_rate=buildable_rate,
     )
 
     # Pass 2: 31-day simulation
