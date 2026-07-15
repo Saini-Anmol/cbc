@@ -53,7 +53,7 @@ GT built for SKU A cannot be cured as SKU B even if both are 16".
 1. **Demand cap is sacred.** Total GT built for any SKU ≤ `Demand_Qty`. Enforced
    in three layers: `_gt_remaining` tracker, daily `cur_mat` clip, LP ceiling
    constraint. Any proposed change must preserve these.
-2. **Curing press changeover cap** is configurable via `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` (currently **18/day** — hard plant constraint). Building machine changeovers are capped per-machine-per-shift by `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` (=2), **raised to 4 for inch-flex machines** via `_INCH_FLEX_EXTRA_COS`.
+2. **Curing press changeover cap** is configurable via `MAX_CHANGEOVERS_PER_DAY` in `bc_config.py` (currently **12/day** this cycle; plant hard limit is **18/day**). Building machine changeovers are capped per-machine-per-shift by `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` (=2), **raised to 4 for inch-flex machines** via `_INCH_FLEX_EXTRA_COS`.
 3. **Stage-2 cannot run without Stage-1 carcass** (same shift or S-1 preferred).
    Unistage machines have no Stage-1 dependency.
 4. **No waste GT.** Building output ≤ curing consumption. In B2C, this is
@@ -286,7 +286,9 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `MIN_CAMPAIGN_UNITS` | 40 | Minimum units per campaign. |
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. |
-| `MAX_CHANGEOVERS_PER_DAY` | **18** | Curing CO cap per calendar day (hard plant constraint this cycle). Single source of truth in `bc_config.py`. Sweep at current baseline: 18→670,744; 22→669,919; 26→671,058; 30→671,472 (climbs but 18 is the plant limit). |
+| `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap per calendar day (12 this cycle for the surplus-release test; plant hard limit is 18). Single source of truth in `bc_config.py`. Sweep with forward-buffer live (8→14): all 98.9–99.9%; 14→692,988/99.89%, 12→690,180/99.49% (lowest starvation). Total curing COs scale 174→250. |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **10000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 10,000. Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` (verified max ~4,900). |
+| `_FORWARD_BUFFER_ENABLED` / `_FWD_RISK_SHIFTS` | **ON / 1.0** | Forward-buffer (Phase C) + starvation-risk gate. `b2c_pipeline.py:197/206`. Idle machines pre-build about-to-starve SKUs up to `GT_SHELF_LIFE_SHIFTS = 9` ahead, capped at 10k. The +16k win (674k→690k). OFF (`FWD_BUF=0`) = 674,422 baseline. |
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
 | `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: shifts of GT to pre-build as buffer. VMI uses 2; BJ/UNI/STAGE use 1. |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | **2** | Cap on changeovers a single building machine may perform in one shift (rolling pipeline only). Plant averages 0.57 CO/shift/machine; upper bound of 2 lets one machine serve up to 3 SKU campaigns/shift. Must be `same_size_CO` to hold the 80% utilisation floor — 2× `diff_size_CO` (240 min VMI) would blow past it and is blocked. |
@@ -325,6 +327,55 @@ current SKU's press shouldn't starve while the machine is away. Applies to all m
 
 ---
 
+## Forward-buffer + 10k GT cap + starvation-risk gate (NEWEST — LIVE, the +16k win)
+
+The residual gap was NOT curing-press/15"-tooling limited as previously believed — it was **mostly
+building-side starvation**: late-month building machines sit 51–56% utilised (~15k idle machine-min/day)
+while presses run (have demand) with zero GT. Three coupled changes close it: **674,422 → 690,180
+cured (97.2% → 99.5%)**, starvation 1,508 → 911. All toggle-gated; OFF reproduces 674,422 bit-for-bit.
+
+**Feature 1 — 10k end-of-day GT-inventory cap** (`_ENDOFDAY_GT_CAP_ENABLED`, `b2c_pipeline.py:186`,
+env `GT_CAP`; value `MAX_ENDOFDAY_GT_INVENTORY = 10000` in `bc_config.py`). Total GT held overnight
+(sum over all SKUs, after curing + writeoff) ≤ 10,000 — a hard plant storage limit. Enforced
+**proactively** (the forward buffer is bounded so overnight carry never exceeds 10k), NOT reactive
+writeoff. Audit column `EndDay_GT_Inventory` added to building "Daily GT & Carcass" sheet (verified
+max ~4,900, 0 days over). By itself a near no-op (we carried ~0); its job is the legal headroom that
+bounds Feature 2.
+
+**Feature 2 — Forward-buffer (Phase C)** (`_FORWARD_BUFFER_ENABLED`, `b2c_pipeline.py:197`, env
+`FWD_BUF`; `GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS × 3 = 9`, `b2c_pipeline.py:211`). Runs in
+`_assign_building_shift` **after Phase A (continuation) and Phase B (global CO pairing)**. For each
+machine with idle shift-minutes left, while total projected inventory < 10k:
+- Candidate SKU must have a **live cure-draw** (`shift_cure_demand[sku] > 0` — a press is actively
+  pulling it, never a random SKU), `demand_remaining > 0`, AND be at **starvation risk** (see gate).
+- **Shelf-safe forward target** = `min(demand_remaining, draw × 9) − projected_gt`. Never more than
+  3 days of the SKU's own draw → **auto-targets building-limited SKUs** (high draw = big room) and
+  **auto-skips press-limited SKUs** (tiny draw → nothing to pre-build → no writeoff).
+- **10k bound:** `entry_carry_gt + forward_added ≤ 10,000` (base Phase A/B build is cure-neutral so
+  excluded; only the forward buffer adds net overnight carry). Hard demand-cap clamp; respects the
+  flex/soft-lock off-inch gate and CO budget.
+
+**Feature 3 — Starvation-risk gate** (`_FWD_RISK_SHIFTS = 1.0`, `b2c_pipeline.py:206`, env `FWD_RISK`).
+Forward-build a SKU **only if** `projected_gt[sku] < draw × _FWD_RISK_SHIFTS` (on-hand below 1 shift =
+about to run dry). This is the decisive multiplier: without it the buffer front-loads every SKU whenever
+slack exists → **clogs the 10k buffer** (mean inv 7,877) → can't respond when a SKU later starves →
+only 681k. With it, well-supplied SKUs are skipped (mean inv 3,664, lots of headroom) → the scarce
+buffer is always available for the next SKU that runs dry → **690k (+9k over ungated)**. Higher = more
+aggressive/more front-load; `0` = gate off.
+
+**Three buffers, three different jobs:** flat `GT_BUFFER_SHIFTS` (steady curing, 2 shifts) · round-trip
+buffer (survive a rotation to a partner and back — needs a partner) · **forward-buffer** (bank GT for a
+live SKU's own future need using idle time, up to 9 shifts, **no partner required** — the gap the other
+two never covered).
+
+**Honest limit:** forward-buffer is a throughput **accelerator** — it cures more, *earlier*, so it
+**front-loads building** (daily-GT CV 12.4% → 16%), the opposite of the plant's flat ~22.4k/day curve.
+Making the building plan flat (like the plant) needs a separate **pacing lever** (build less early),
+not yet built. `result_checker`-audited: no overbuild beyond the known 162-unit (0.02%) min-campaign
+rounding; every physical/demand invariant holds.
+
+---
+
 ## Pipeline execution order
 
 > **ROLLING PIPELINE IS THE DEFAULT** (`python b2c_pipeline.py`). Legacy available via `--legacy`.
@@ -357,6 +408,11 @@ for Day D in 1..31:
           urgent_co_set = co_target_skus eligible on this machine with gt_inventory=0 AND demand>0
           (urgent targets bypass the 30% cost guard)
         7001/7003 soft-lock: Campaign 2+ non-dominant inch only when primary_demand_done=True
+      (Live path = GLOBAL-ASSIGN: Phase A continuation + captive-max, Phase B global
+       (machine,SKU) pair scoring with constraint=min(flex_m,flex_s), mode="below")
+      Phase C — Forward-buffer (LIVE): idle machines pre-build starvation-risk SKUs
+        (on-hand < 1 shift of draw) up to 9 shifts (3-day shelf), bounded by the 10k
+        end-of-day GT cap. See "Forward-buffer + 10k GT cap" section above.
 
     Step 3 — Add GT to inventory; record building rows
       gt_inventory[sku] += qty_built  (Stage-1 machines excluded — carcass ≠ GT)
@@ -393,7 +449,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | TVECE (1325218614088TVECE) partial production | BJ structural oversubscription (249k demand / 184k capacity = 136%) | **Improved — confirmed FULLY MET in the Jul 10 2026 output** (both TVECE SKU variants, 96.5% and 95.9% of demand). BJ is still structurally oversubscribed plant-wide (see BJ 20k gap row below); this particular SKU is no longer the visible symptom. |
 | Starvation events (~3,033) | BJ oversubscription — building cannot supply all BJ presses at full rate | **Not currently tracked in rolling-pipeline output.** No "starvation" sheet/column exists in `bc_curing_b2c.xlsx` or `bc_building_schedule_*.xlsx` as of Jul 10 2026 — this number is from a legacy run and cannot be reconfirmed without new instrumentation. Architecturally, curing is derived from building output (zero starvation by construction), so this figure describes the pre-derivation legacy path, not the current rolling pipeline. |
 | VMIMAXX 27k gap | CO overhead + idle tail (scheduling recoverable ~10–15k) | Structural ceiling at 88.6%; VMIMAXX is undersubscribed at 67% capacity. **Not reconfirmed against the Jul 10 2026 run** — the building-CT correction (commit `f86f70b`) changes VMIMAXX per-machine throughput assumptions; this analysis predates that fix. |
-| BJ 20k gap | Structurally oversubscribed | **Still valid, dominant SKU changed.** In the Jul 10 2026 output the largest PARTIAL-status gap is `1D25212812086FXPC0` (Runner-In, demand 21,217, built 1,280, gap 19,937 — curing-throughput limited). `1225121715115SSTL0`'s gap has shrunk to 3,032 (2,517 of 5,549 built, 55% fulfilled) — still curing-limited but no longer the largest contributor. **Root cause is curing presses, not building.** Fix = curing CO to add presses. |
+| BJ 20k gap (`1D25212812086FXPC0` etc.) | Believed curing-press limited | **CORRECTED Jul 14 2026 — it was building-side starvation, not curing presses.** The forward-buffer (feed idle machines' GT to starving presses 3 days ahead) closed most of this gap → overall coverage 99.5%. The old "fix = curing CO to add presses" diagnosis was wrong for this class of gap. |
 | ~59k unmet demand (7 SKUs) | No allowable building machine in master data | **Resolved as of Jul 10 2026** — confirmed via `bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C) sheet): 0 of 97 SKUs have `Eligible_Machines == 0`. Table renamed `Master_Building_Allowable_Machines_source` → `Master_Building_Allowable_Machines`. Remaining unmet demand (8 UNMET SKUs, 3,687 units total) all have eligible building machines — the gap is now production-days/curing-throughput limited, not a missing-data problem. |
 | Curing press IDs short by 30 | `_load_press_state` used `wcID` instead of `WCNAME_clean` | **Fixed:** curing_b2c.py uses WCNAME_clean (e.g. "75206") |
 
@@ -455,43 +511,47 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed Jul 13 2026 — inch-flexibility live, `python b2c_pipeline.py`)
+## Current KPIs (confirmed Jul 14 2026 — forward-buffer live, `python b2c_pipeline.py`)
 
-The rolling pipeline is **fully deterministic** (every candidate-selection sort/min/max ends in
-an explicit tiebreak — bit-for-bit reproducible run-to-run). All KPI comparisons this cycle were
-measured against a saved baseline. `MAX_CHANGEOVERS_PER_DAY = 18` (hard plant constraint).
+The rolling pipeline is **fully deterministic** (bit-for-bit reproducible run-to-run). Committed
+default = forward-buffer risk=1.0 + 10k cap ON, surplus-release ON, `MAX_CHANGEOVERS_PER_DAY = 12`.
+`result_checker`-audited (Jul 14): every physical/demand invariant holds; result is trustworthy, not inflated.
 
 | KPI | Value | Confirmed how |
 |-----|-------|----------------|
-| Total demand (demand_may.xlsx) | 693,748 | Matches across all recent runs |
-| GT built | **664,355** | Console "ROLLING PIPELINE — Results" ("Total GT built") |
-| GT cured (total units) | **670,744** | Console ("Total cured") |
-| Demand coverage | **96.7%** | 670,744 / 693,748, printed directly |
-| GT written off | **627** | Console ("GT written off") — cumulative `_writeoff_stale_gt` |
-| Starvation events | **1,845** | Console ("Starvation events") — RUNNING press, zero GT, demand still left |
+| Total demand (demand_may.xlsx) | 693,748 | 85 SKUs, `Requirement` column |
+| GT built | **684,028** | Console "Total GT built" |
+| GT cured (total units) | **690,180** | Console "Total cured" |
+| Demand coverage | **99.5%** | 690,180 / 693,748 |
+| GT written off | **803** | Console "GT written off" (up from 612 — forward buffer pre-builds further ahead) |
+| Starvation events | **911** | Console "Starvation events" (down from 1,508) |
+| End-day GT inventory | **max ~4,900** | New `EndDay_GT_Inventory` column; 10k cap held, 0 days over |
 
 **Live scheduling toggles producing this baseline** (all in `b2c_pipeline.py` unless noted):
-- `_ROUND_TRIP_BUFFER_ENABLED = True` — circular-dependency buffer sizing (widens own-SKU buffer to survive a rotation round trip).
-- `_BUILDING_RATIO_ENABLED = True` — building NRI candidates ranked by static `demand/machine_total_demand`; RI keeps raw-deficit ranking.
-- `_CURING_RATIO_ENABLED = True` (`curing_consumption_dynamic.py`) — curing NRI CO targets ranked by static `demand/press_total_demand`; RI keeps `Priority_Score`. (Full-replacement was a no-op; NRI-only is the win.)
-- `_INCH_FLEX_ENABLED = True` — inch-flexibility on **all VMI (6001-6004, 7001-7004) + all BJ (7101-7106, 7201)**; see "Inch-Flexibility" below. `_INCH_FLEX_EXTRA_COS = 2`, `_INCH_FLEX_OFFINCH_ORDER = "starving_first"`, `_INCH_FLEX_INCLUDE_UNI_NARROW = False`.
-- OFF (tried and reverted this cycle — regressed): `_SCARCITY_ORDER_ENABLED`, `_MACHINE_ORDER_REVERSED`, `_DYNAMIC_CO_PLANNER_ENABLED`, `_ROLLING_HORIZON_CO_ENABLED`, `_RATIO_CO_ALLOCATION_ENABLED`, `_EARLY_CO_ENABLED`, `_STARVATION_FEED_ENABLED`.
+- `_FORWARD_BUFFER_ENABLED = True` / `_FWD_RISK_SHIFTS = 1.0` / `_ENDOFDAY_GT_CAP_ENABLED = True` — the +16k win (see "Forward-buffer + 10k GT cap" section). OFF (`GT_CAP=0 FWD_BUF=0`) = 674,422 / 97.2% bit-for-bit.
+- `_GLOBAL_ASSIGN_ENABLED = True` / `_GLOBAL_CONSTRAINT_MODE = "below"` / `_CAPTIVE_MAX_ENABLED = True` — global (machine,SKU) pair scoring supersedes the sequential per-machine greedy (this was the prior +6.5k win to 681k; captive machine 7301 handled generally, no hardcoded rule).
+- `_ROUND_TRIP_BUFFER_ENABLED = True`, `_BUILDING_RATIO_ENABLED = True`, `_CURING_RATIO_ENABLED = True` (`curing_consumption_dynamic.py`), `_INCH_FLEX_ENABLED = True` (VMI+BJ), `_SURPLUS_RELEASE_ENABLED = True` (`curing_consumption_dynamic.py`).
 
-**KPI progression this cycle** (all at CO=18, deterministic):
-668,937/96.4% (round-trip + building-ratio + curing-ratio + overbuild fix) →
-670,212 (VMIMAXX inch-flex + extra COs) → **670,744/96.7%** (winner: VMI+BJ flex, brute-forced over machine combinations).
+**KPI progression** (deterministic): 668,937/96.4% (round-trip + ratios + overbuild fix) →
+670,744/96.7% (inch-flex) → 681,078 (global-assign + captive-max) → **690,180/99.5%
+(forward-buffer + 10k cap + risk gate)**. Gain decomposition of the last step: forward-buffer
+ungated +6.8k (→681k), risk gate +9k more (→690k, by keeping the 10k buffer unclogged).
 
-**Correctness fixes delivered this cycle (do not regress):**
-- **Overbuild fixed**: `_deficit()`'s demand cap now subtracts `projected_gt` — total build ≤ demand (was 26 SKUs / 3,303 units over; now ~0). Side effect: GT write-off dropped 2,962 → 627.
-- **Starvation transparency**: curing Shift Schedule "Remarks" now distinguishes `STARVED (no GT)` vs `IDLE (demand met)`; the sheet's STARVED count reconciles exactly with the printed KPI (demand-done presses are correctly NOT counted).
-- **Curing CO visibility**: curing output now has a **"Changeover Plan" sheet** listing every curing CO (Planned + Dynamic) — reactive/dynamic COs were previously invisible.
-- **Determinism**: `set(newly_free)` / bare set-iteration / underspecified sorts in `curing_consumption_dynamic.py` + `b2c_pipeline.py` all fixed with explicit tiebreaks (was ±460-unit run-to-run noise).
+**CO-cap sweep (forward-buffer live, 8→14):** all 98.9–99.9%; cap=14 best (692,988 / 99.89%,
+flattest CV 15.9%), cap=12 lowest starvation (911). Total curing COs scale 174→250. All ≤ plant
+limit of 18. The CO cap is now a secondary knob — the forward-buffer dominates.
 
-**Structural ceilings (cannot fix via scheduling alone) — externally validated by plant data:**
-- The residual ~3.3% gap is **curing-press / 15"-tooling limited**, not a building or scheduling flaw. The May plant production data (`data/plant_data/production_stage2_as.csv`) leaves the SAME SKUs unmet even at ~4× our changeover rate. See `Plant_vs_Scheduler_Report.pdf`.
-- Plant benchmark: our AI plan (670k cured / 96.7%, zero overbuild) beats the plant's demand-capped effective fulfilment (95.9%, with 61k wasted overbuild).
+**MAJOR CORRECTION to the old "structural ceiling" claim (do not repeat the old belief):**
+The residual ~3% gap was **previously documented as curing-press / 15"-tooling limited**. The
+forward-buffer proved that was **wrong** — the gap was **mostly building-side starvation**: idle
+late-month machines (51–56% util, ~15k idle machine-min/day) not feeding presses that had demand.
+Feeding them 3 days ahead lifts coverage to 99.5%. The true remaining gap is now <1%.
 
-**Scheduler ceiling: ~670–671k at CO=18.** Raising CO cap keeps climbing (22→669,919; 26→671,058; 30→671,472) but CO=18 is a hard plant constraint this cycle. Re-run `python b2c_pipeline.py` for an exact figure.
+**Honest limit — consistency (NOT yet solved):** the forward-buffer is a throughput **accelerator**
+(cures more, earlier), so it **front-loads building** — daily-GT CV 12.4% → 16%, the opposite of the
+plant's flat ~22.4k/day curve (plant CV 3.8%). Matching the plant's flat building plan needs a
+separate **pacing lever** (build less early to spread demand across the month), which is the next
+piece of work. Forward-buffer (KPI) and pacing (consistency) are opposed levers.
 
 **Known calculation pitfall fixed (Jul 2026):**
 - CT bug: `cure_ct_map` was always empty due to wrong column key (`"CT_Min"` vs `"CycleTime_min"`).

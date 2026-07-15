@@ -167,7 +167,7 @@ GT_SHELF_LIFE_DAYS      = 3
 # GT cannot sit more than 3 days before curing (plant rule).
 # TopUp will not pre-build GT beyond this window.
 
-MAX_ENDOFDAY_GT_INVENTORY = 10000
+MAX_ENDOFDAY_GT_INVENTORY = 8000
 # Plant capacity constraint: total GT held in inventory at the END of any day
 # (summed over all SKUs, after curing + stale writeoff) cannot exceed this many
 # units. Enforced PROACTIVELY during building (never build past the ceiling) so
@@ -210,7 +210,7 @@ DEFAULT_CURING_CT = 17.0
 
 CURING_CO_DURATION_SHIFTS  = 1     # shifts idle during CO: Shift A only (CHANGEOVER).
 #                                    Mould clean removed from scheduler model.
-CURING_CO_CHANGEOVER_MINS  = 490   # Shift A: press occupied for changeover (full shift)
+CURING_CO_CHANGEOVER_MINS  = 480   # Shift A: press occupied for changeover (full shift)
 # Shift B: PRODUCTION begins for new SKU immediately (no mould-clean idle shift).
 # ─────────────────────────────────────────────────────────────────────────────
 
