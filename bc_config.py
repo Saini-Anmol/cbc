@@ -39,7 +39,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -221,6 +221,12 @@ CURING_CO_CHANGEOVER_MINS  = 480   # Shift A: press occupied for changeover (ful
 SHIFT_MINS          = 480    # minutes per shift (8 hours × 60)
 SHIFTS_PER_DAY      = 3      # A (07:00) / B (15:00) / C (23:00)
 CAVITIES_PER_PRESS  = 2      # 2 moulds per press, 1 cavity each = 2 tyres/cycle
+
+# ── Mould clean (curing press) ───────────────────────────────────────────────
+MOULD_CLEAN_CYCLES  = 3000   # cycles a press runs before a mandatory mould clean
+#                              (= 6,000 tyres at CURING_CAVITIES = 2). A curing CO
+#                              also resets mould life (CO includes a clean).
+MOULD_CLEAN_MINS    = 480    # 8-hour mould clean = one full shift of press downtime.
 
 SHIFT_NAMES  = ["A", "B", "C"]
 SHIFT_STARTS = {"A": "07:00", "B": "15:00", "C": "23:00"}

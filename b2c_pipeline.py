@@ -60,6 +60,8 @@ from bc_config import (
     DEMAND_FILE,
     GT_SHELF_LIFE_DAYS,
     MAX_ENDOFDAY_GT_INVENTORY,
+    MOULD_CLEAN_CYCLES,
+    MOULD_CLEAN_MINS,
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
     BUILD_LEAD_SHIFTS,
@@ -209,6 +211,13 @@ _FWD_RISK_SHIFTS = True
 # pre-builds a SKU beyond this many shifts of its live cure-draw (so it cannot age
 # out to writeoff within the shelf window).
 GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
+
+# BUSINESS RULE: curing-press mould clean. After every MOULD_CLEAN_CYCLES cycles
+# (= 6,000 tyres) a press takes an 8h (MOULD_CLEAN_MINS = 480 = 1 shift) mould clean
+# during which it produces nothing; mould life then resets. A curing CO also resets
+# mould life (the CO already includes a clean). env MOULD_CLEAN=0 disables → the
+# pre-mould-clean 690,180 baseline reproduces bit-for-bit.
+_MOULD_CLEAN_ENABLED = True
 
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
@@ -422,8 +431,12 @@ def _compute_buildable_rate(engine, demand_path: str) -> dict:
     qcol = next((c for c in ddf.columns
                  if any(x in str(c) for x in ("Requirement", "Demand", "Qty", "Quantity"))),
                 ddf.columns[1])
-    demand_dict = {str(r[scol]).strip(): float(r[qcol] or 0)
-                   for _, r in ddf.iterrows() if pd.notna(r.get(qcol))}
+    # Sum duplicate SKU rows (see Section E) so buildable-rate isn't understated.
+    _dq = ddf[[scol, qcol]].copy()
+    _dq[scol] = _dq[scol].astype(str).str.strip()
+    _dq[qcol] = pd.to_numeric(_dq[qcol], errors="coerce")
+    _dq = _dq.dropna(subset=[qcol])
+    demand_dict = _dq.groupby(scol)[qcol].sum().to_dict()
     df_allow = _BETL(engine).load_machine_allowable()
     machine_skus: dict[str, set] = {}
     for _, r in df_allow.iterrows():
@@ -2040,6 +2053,7 @@ def _write_rolling_curing_excel(
     planning_days: int,
     plan_start: datetime,
     df_day0: "pd.DataFrame | None" = None,  # Day 0 consumption (has Priority_Score, Category)
+    mould_life: "dict | None" = None,       # {press: remaining mould life (cycles) at horizon end}
 ) -> None:
     """
     Write curing Excel matching the legacy bc_curing_b2c output.
@@ -2142,27 +2156,33 @@ def _write_rolling_curing_excel(
                 value=(f"Avg util: {avg_u:.1%}  |  High(≥90%): {high}  |  Idle(<5%): {low}  |  "
                        f"Presses: {len(all_presses)}  |  Total CO_Mins: {int(total_co):,}")
                 ).font = _bold(10)
-    u_cols = ["Machine", "Available_Mins", "Used_Mins", "CO_Mins", "Idle_Mins",
-              "Utilization_Pct", "CO_Pct", "Idle_Pct",
-              "SKUs_Count", "Total_Cycles", "Total_Units"]
+    _ml = mould_life or {}
+    u_cols = ["Machine", "Available_Mins", "Used_Mins", "CO_Mins", "Mould_Clean_Mins",
+              "Idle_Mins", "Utilization_Pct", "CO_Pct", "Mould_Clean_Utilization_%",
+              "Idle_Pct", "SKUs_Count", "total_cycle", "Total_Units",
+              "Remaining_Mould_Life"]
     _hdr(ws, 2, u_cols)
     for ri, press in enumerate(all_presses, 3):
-        s    = press_stats[press]
-        used = s["running_mins"]
-        co   = s["co_mins"]
-        idle = max(0, avail_mins - used - co - s["clean_mins"])
-        pct      = used / avail_mins if avail_mins else 0.0
-        co_pct   = co   / avail_mins if avail_mins else 0.0
-        idle_pct = idle / avail_mins if avail_mins else 0.0
+        s     = press_stats[press]
+        used  = s["running_mins"]
+        co    = s["co_mins"]
+        clean = s["clean_mins"]
+        idle  = max(0, avail_mins - used - co - clean)
+        pct       = used  / avail_mins if avail_mins else 0.0
+        co_pct    = co    / avail_mins if avail_mins else 0.0
+        clean_pct = clean / avail_mins if avail_mins else 0.0
+        idle_pct  = idle  / avail_mins if avail_mins else 0.0
         color = _GREEN if pct >= 0.90 else (_AMBER if pct >= 0.60 else _RED)
-        vals  = [press, avail_mins, round(used), round(co), round(idle),
-                 pct, co_pct, idle_pct,
-                 len(s["skus"]), s["cycles"], s["units"]]
+        vals  = [press, avail_mins, round(used), round(co), round(clean), round(idle),
+                 pct, co_pct, clean_pct, idle_pct,
+                 len(s["skus"]), s["cycles"], s["units"],
+                 _ml.get(press, MOULD_CLEAN_CYCLES)]
         for ci, v in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=v)
             cell.fill = _fill(color); cell.alignment = _ctr()
-            if ci in (6, 7, 8): cell.number_format = "0.0%"
-    for ltr in "ABCDEFGH": ws.column_dimensions[ltr].width = 17
+            if ci in (7, 8, 9, 10): cell.number_format = "0.0%"
+    for ci in range(1, len(u_cols) + 1):
+        ws.column_dimensions[ws.cell(row=2, column=ci).column_letter].width = 18
     ws.freeze_panes = "A3"
 
     # ── Sheet 3: Shift Schedule ────────────────────────────────────────────────
@@ -2511,6 +2531,13 @@ def run_rolling_pipeline(
         opening_gt = {}
     gt_inventory: dict[str, float] = defaultdict(float, opening_gt)
 
+    # ── D2: Mould-clean state (per press) ─────────────────────────────────────
+    # remaining_mould_life = cycles a press may still run before a mandatory clean
+    # (starts at MOULD_CLEAN_CYCLES; v2 will load real opening life). clean_carry =
+    # minutes of an in-progress clean owed at the start of a press's next shift.
+    mould_life:  dict[str, int]   = defaultdict(lambda: MOULD_CLEAN_CYCLES)
+    clean_carry: dict[str, float] = defaultdict(float)
+
     # ── E: Demand ─────────────────────────────────────────────────────────────
     demand_df = pd.read_excel(demand_path)
     sku_col = next((c for c in demand_df.columns if "SKU"  in str(c)), demand_df.columns[0])
@@ -2519,12 +2546,24 @@ def run_rolling_pipeline(
          if any(x in str(c) for x in ("Requirement","Demand","Qty","Quantity"))),
         demand_df.columns[1],
     )
-    demand_dict: dict[str, float] = {
-        str(r[sku_col]): float(r[qty_col] or 0)
-        for _, r in demand_df.iterrows() if pd.notna(r.get(qty_col))
-    }
+    # Sum duplicate SKU rows (a SKU may appear on several demand line-items).
+    # MUST match curing_consumption.py's groupby-sum, otherwise the building
+    # demand universe silently diverges from curing's: a plain dict keyed by
+    # SKUCode would keep only the LAST duplicate row and drop the rest (e.g.
+    # LSTL0 71,000 + 20,680 → only 20,680 survives), capping building far below
+    # the real demand while curing presses still pull the full amount → mass
+    # starvation on the biggest SKUs.
+    _dq = demand_df[[sku_col, qty_col]].copy()
+    _dq[sku_col] = _dq[sku_col].astype(str).str.strip()
+    _dq[qty_col] = pd.to_numeric(_dq[qty_col], errors="coerce")
+    _dq = _dq.dropna(subset=[qty_col])
+    demand_dict: dict[str, float] = _dq.groupby(sku_col)[qty_col].sum().to_dict()
+    _n_rows_raw = len(_dq)
     demand_remaining: dict[str, float] = dict(demand_dict)
     total_demand = sum(demand_dict.values())
+    if _n_rows_raw != len(demand_dict):
+        print(f"  [Rolling] Demand: collapsed {_n_rows_raw} rows → "
+              f"{len(demand_dict)} unique SKUs (summed {_n_rows_raw - len(demand_dict)} duplicate rows)")
     print(f"  [Rolling] Demand: {len(demand_dict)} SKUs, {total_demand:,.0f} units")
 
     # Static per-machine total demand for _BUILDING_RATIO_ENABLED — computed once
@@ -2574,10 +2613,13 @@ def run_rolling_pipeline(
     )
     priority_score_map: dict[str, float] = {}
     if _prio_col:
-        priority_score_map = {
-            str(r[sku_col]): float(r[_prio_col] or 0)
-            for _, r in demand_df.iterrows() if pd.notna(r.get(_prio_col))
-        }
+        # max per SKU across duplicate rows (matches curing_consumption.py
+        # Priority=max); a plain dict would keep only the last duplicate.
+        _pq = demand_df[[sku_col, _prio_col]].copy()
+        _pq[sku_col] = _pq[sku_col].astype(str).str.strip()
+        _pq[_prio_col] = pd.to_numeric(_pq[_prio_col], errors="coerce")
+        _pq = _pq.dropna(subset=[_prio_col])
+        priority_score_map = _pq.groupby(sku_col)[_prio_col].max().to_dict()
 
     # ── F: Machine current SKU ────────────────────────────────────────────────
     machine_current_sku: dict[str, str] = {}
@@ -2982,10 +3024,31 @@ def run_rolling_pipeline(
                 cap      = _cure_qty_per_shift(ct)
                 gt_avail = max(0.0, gt_inventory.get(sku, 0.0))
 
+                # ── Mould-clean carry-in: a clean that began mid-shift last shift
+                # occupies the front of THIS shift. If it fills the whole shift the
+                # press is in MOULD_CLEAN (no production); otherwise production runs
+                # in the reduced remaining minutes _avail.
+                _avail = float(SHIFT_MINS)
+                if (_MOULD_CLEAN_ENABLED and status == "RUNNING"
+                        and clean_carry.get(press, 0.0) > 0):
+                    _cin = min(clean_carry[press], float(SHIFT_MINS))
+                    clean_carry[press] -= _cin
+                    _avail = SHIFT_MINS - _cin
+                    if _avail <= 0:
+                        status = "MOULD_CLEAN"          # else-branch books SHIFT_MINS clean
+                    else:
+                        press_stats[press]["clean_mins"] += _cin   # partial carry booked here
+
+                _cleaned = False
                 if status == "RUNNING":
                     # Cap curing at remaining demand — never over-produce.
                     demand_left = max(0.0, demand_remaining.get(sku, 0.0))
-                    cured = min(cap, int(gt_avail), int(demand_left))
+                    if _MOULD_CLEAN_ENABLED:
+                        cap_time = int(_avail / ct) * CURING_CAVITIES   # partial-shift cap
+                        cap_life = mould_life[press] * CURING_CAVITIES  # cycles left × cavities
+                        cured = min(cap_time, int(gt_avail), int(demand_left), cap_life)
+                    else:
+                        cured = min(cap, int(gt_avail), int(demand_left))
                     gt_inventory[sku]      = gt_avail - cured
                     day_cured_d[sku]      += cured
                     sku_cured[sku]        += cured
@@ -2999,6 +3062,19 @@ def run_rolling_pipeline(
                     press_sku_stats[(press, sku)]["cycles"]    += cured // CURING_CAVITIES
                     press_sku_stats[(press, sku)]["units"]     += cured
                     press_sku_stats[(press, sku)]["mins_used"] += prod_mins
+
+                    # ── Mould-clean: decrement life; fire an immediate clean when it
+                    # hits 0 (cured was capped by cap_life). The 8h clean fills the
+                    # rest of THIS shift; the remainder bleeds into the next shift.
+                    if _MOULD_CLEAN_ENABLED:
+                        mould_life[press] -= cured // CURING_CAVITIES
+                        if mould_life[press] <= 0:
+                            clean_here = max(0.0, min(float(MOULD_CLEAN_MINS),
+                                                      _avail - prod_mins))
+                            press_stats[press]["clean_mins"] += clean_here
+                            clean_carry[press] = MOULD_CLEAN_MINS - clean_here
+                            mould_life[press]  = MOULD_CLEAN_CYCLES
+                            _cleaned = True
 
                     # ── Instant CO when demand is met ─────────────────────────
                     # Demand just hit 0: CO starts immediately (remaining shift
@@ -3024,6 +3100,7 @@ def run_rolling_pipeline(
                                     and _rem_cur / ((_n_cur - 1) * _rate_cur) <= _hz_cur):
                                 _early_co = True
                     if (((_DYNAMIC_CO_TRACKER_ENABLED and _demand_done) or _early_co)
+                            and not _cleaned          # a just-started clean defers any CO
                             and press not in co_press_map
                             and press not in dynamic_co_tracker):
                         _next_day_cos = {p for p, _, _ in co_by_day.get(day + 1, [])}
@@ -3058,6 +3135,10 @@ def run_rolling_pipeline(
                                     )
                                     dynamic_co_tracker[press] = (cur_shift_global, _target)
                                     daily_co_count[day] += 1
+                                    # Rule 2: a curing CO resets mould life (the CO
+                                    # shift already includes a clean).
+                                    mould_life[press]  = MOULD_CLEAN_CYCLES
+                                    clean_carry[press] = 0.0
                                     cure_co_events.append({
                                         "Date":       date_str,
                                         "Day":        day,
@@ -3168,6 +3249,9 @@ def run_rolling_pipeline(
             press_count[new_sku] = press_count.get(new_sku, 0) + 1
             press_state[press]   = {"sku": new_sku, "status": "RUNNING"}
             curing_allowable[new_sku].append(press)
+            # Rule 2: a curing CO resets mould life (CO includes a clean).
+            mould_life[press]  = MOULD_CLEAN_CYCLES
+            clean_carry[press] = 0.0
             # Planned COs execute the CHANGEOVER in Shift A of this day (co_press_map).
             # Record here (once per day) so both static-schedule and rolling-horizon
             # planned COs appear in the curing Changeover Plan output sheet.
@@ -3265,6 +3349,7 @@ def run_rolling_pipeline(
         planning_days     = planning_days,
         plan_start        = plan_start,
         df_day0           = df_day0,
+        mould_life        = dict(mould_life),
     )
 
     return {
