@@ -23,7 +23,7 @@ Two modes:
     Output: SAME Excel files and sheet names as the legacy pipeline:
       Building → bc_building_schedule_{date}.xlsx
         Sheets: Shift Schedule | Changeover Plan | SKU Classification |
-                Shift Schedule (Clean) | Daily GT & Carcass | Demand Fulfillment (B2C)
+                Daily GT & Carcass | Demand Fulfillment (B2C)
       Curing  → bc_curing_b2c.xlsx
         Sheets: Demand Fulfillment | Machine Utilization | Shift Schedule |
                 Mould Tracker | Machine Schedule | Daily Cured tyres | GT Gap Diagnostic
@@ -62,6 +62,7 @@ from bc_config import (
     MAX_ENDOFDAY_GT_INVENTORY,
     MOULD_CLEAN_CYCLES,
     MOULD_CLEAN_MINS,
+    CURING_CO_CHANGEOVER_MINS,
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
     BUILD_LEAD_SHIFTS,
@@ -71,7 +72,6 @@ from bc_config import (
     BUILDING_CO_DIFF_SIZE,
     SHIFT_MINS,
     SHIFT_STARTS,
-    SHIFT_ENDS,
     POOL_SIZE,
     STARVATION_BUFFER_MINS,
     CO_CLASS_B_THRESHOLD,
@@ -94,6 +94,11 @@ if os.environ.get("OUT_TAG"):
     CC_OUTPUT     = CC_OUTPUT.replace(".xlsx", f"_{_ot}.xlsx")
 
 # ── Machine group map ─────────────────────────────────────────────────────────
+# NOTE: these values are INTERNAL LOGIC KEYS — they are compared against string
+# literals throughout (_S1_MACHINES, _buf_of, _co_cost, _pri, captive-max, the
+# Stage-1 carcass step) AND used as dict keys into bc_config's
+# BUILDING_CO_SAME_SIZE / BUILDING_CO_DIFF_SIZE. Do NOT rename them.
+# For plant-friendly names in the output sheets, edit _MACHINE_GROUP_DISPLAY below.
 _MACHINE_GROUP: dict[str, str] = {}
 for _m in ("6001","6002","6003","6004","7001","7002","7003","7004"):
     _MACHINE_GROUP[_m] = "VMI"
@@ -106,6 +111,24 @@ for _m in ("8201","8301","8302","8501","8502","7301"):
 for _m in ("6801","6802","6803","6909","6911","7601","7701",
            "7801","7802","7803","7804","8001","8002","8003","8101"):
     _MACHINE_GROUP[_m] = "STAGE1"
+
+# Plant-facing display labels — used ONLY for the Machine_Group column in the
+# building Shift Schedule output sheet. Never used in scheduling logic, so these
+# are safe to rename freely.
+_MACHINE_GROUP_DISPLAY: dict[str, str] = {
+    "VMI":      "VMIMAXX GROUP",
+    "BJ":       "BJ GROUP",
+    "UNISTAGE": "UNISTAGE GROUP",
+    "STAGE2":   "TBM STAGE2",
+    "STAGE1":   "TBM STAGE1",
+}
+
+
+def _group_label(machine: str) -> str:
+    """Plant-facing group name for output sheets (falls back to the internal key)."""
+    g = _MACHINE_GROUP.get(str(machine), "")
+    return _MACHINE_GROUP_DISPLAY.get(g, g)
+
 
 _S1_MACHINES = frozenset(m for m, g in _MACHINE_GROUP.items() if g == "STAGE1")
 
@@ -218,6 +241,17 @@ GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
 # mould life (the CO already includes a clean). env MOULD_CLEAN=0 disables → the
 # pre-mould-clean 690,180 baseline reproduces bit-for-bit.
 _MOULD_CLEAN_ENABLED = True
+
+# BUSINESS RULE: spread planned curing COs across shifts A/B/C.
+# Planned COs were hardcoded to Shift A (all 147), so 97% of changeover downtime
+# landed in Shift A and its curing output sat ~6.6k below Shift B — an artifact, not
+# plant physics. Real plants change over across all three shifts, firing a CO as soon
+# as a press finishes its current SKU (subject to the daily cap). With this ON, each
+# planned CO is placed in the shift where its press is projected to exhaust its old
+# SKU — Shift A if it is ALREADY finished, so a free press never waits — falling back
+# to Shift A when the SKU will not finish today (the static scheduler booked that CO
+# for a reason: a preemptive Class-A move). Flip to False to disable (all COs → Shift A).
+_CO_SHIFT_SPREAD_ENABLED = True
 
 # Reversed machine processing order: Stage2 -> Unistage -> BJ -> VMI instead of
 # today's VMI -> BJ -> Unistage -> Stage2. Tests whether scarce/inch-locked
@@ -1648,17 +1682,17 @@ def _write_rolling_building_excel(
     demand_dict: dict,             # {sku: demand_qty} from demand file
     planning_days: int,
     n_curing_cos: int = 0,         # curing press CO count (from co_events)
+    endday_gt_by_date: "dict | None" = None,  # {date_str: end-of-day total GT inventory}
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
 
     Sheets:
-      1. Shift Schedule         — per-shift rows (title at row 1, blank at row 2, header at row 3)
+      1. Shift Schedule         — per-shift rows (production + carcass + CHANGEOVER; title row 1, header row 3)
       2. Changeover Plan        — building machine CO events
       3. SKU Classification     — category summary from Day 0 consumption
-      4. Shift Schedule (Clean) — production-only rows (no CO sentinels)
-      5. Daily GT & Carcass     — daily GT and carcass totals
-      6. Demand Fulfillment (B2C) — per-SKU demand vs planned GT
+      4. Daily GT & Carcass     — daily GT and carcass totals
+      5. Demand Fulfillment (B2C) — per-SKU demand vs planned GT
     """
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1692,7 +1726,9 @@ def _write_rolling_building_excel(
     ws.cell(row=1, column=1, value="BC Building Schedule (Rolling Pipeline)").font = _bold(12)
     # Row 2: blank
     # Row 3: headers
-    bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty",
+    # Qty = units produced (0 on CHANGEOVER rows — a CO makes no tyres).
+    # CO_Mins = changeover duration in minutes (0 on production/carcass rows).
+    bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty", "CO_Mins",
                 "StartTime", "EndTime", "Machine_Group", "CO_Type"]
     _xl_header(ws, 3, bld_cols)
     for ri, row in enumerate(bld_shift_rows, 4):
@@ -1750,18 +1786,13 @@ def _write_rolling_building_excel(
     for ltr in "BCD":
         ws_cat.column_dimensions[ltr].width = 16
 
-    # ── Sheet 4: Shift Schedule (Clean) — production rows only ────────────────
-    ws_clean = wb.create_sheet("Shift Schedule (Clean)")
-    _xl_header(ws_clean, 1, bld_cols)
+    # Production-only rows (CO/clean sentinels excluded) — used by the aggregate
+    # sheets below (Daily GT & Carcass, Demand Fulfillment, Machine Utilization).
+    # The separate "Shift Schedule (Clean)" sheet was removed; the full "Shift
+    # Schedule" sheet (with production + carcass + CHANGEOVER rows) is the one output.
     prod_rows = [r for r in bld_shift_rows if str(r.get("SKUCode","")).upper() not in _SENTINEL]
-    for ri, row in enumerate(prod_rows, 2):
-        for ci, col in enumerate(bld_cols, 1):
-            ws_clean.cell(row=ri, column=ci, value=row.get(col, "")).alignment = _ctr()
-    for col in ws_clean.columns:
-        w = max((len(str(c.value or "")) for c in col), default=8)
-        ws_clean.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 38)
 
-    # ── Sheet 5: Daily GT & Carcass ────────────────────────────────────────────
+    # ── Sheet 4: Daily GT & Carcass ────────────────────────────────────────────
     ws_daily = wb.create_sheet("Daily GT & Carcass")
     daily_agg: dict[str, dict] = defaultdict(lambda: {"GT_Produced": 0, "Carcass_Produced": 0,
                                                        "Total_Units": 0, "Active_SKUs": set()})
@@ -1776,18 +1807,22 @@ def _write_rolling_building_excel(
             daily_agg[d]["GT_Produced"] += qty
         daily_agg[d]["Total_Units"]  += qty
         daily_agg[d]["Active_SKUs"].add(sku)
+    # EndDay_GT_Inventory: total GT held overnight (all SKUs, after curing + writeoff)
+    # — audits the MAX_ENDOFDAY_GT_INVENTORY plant cap directly in the sheet.
+    _eod = endday_gt_by_date or {}
     daily_cols = ["Date", "GT_Produced", "Carcass_Produced", "Total_Units",
-                  "Active_SKUs", "Cumulative_GT"]
+                  "Active_SKUs", "Cumulative_GT", "EndDay_GT_Inventory"]
     _xl_header(ws_daily, 1, daily_cols)
     cum_gt = 0
     for ri, (date, v) in enumerate(sorted(daily_agg.items()), 2):
         cum_gt += v["GT_Produced"]
         vals = [date, v["GT_Produced"], v["Carcass_Produced"],
-                v["Total_Units"], len(v["Active_SKUs"]), cum_gt]
+                v["Total_Units"], len(v["Active_SKUs"]), cum_gt,
+                int(round(_eod.get(date, 0)))]
         for ci, val in enumerate(vals, 1):
             ws_daily.cell(row=ri, column=ci, value=val).alignment = _ctr()
     ws_daily.column_dimensions["A"].width = 14
-    for ltr in "BCDEF":
+    for ltr in "BCDEFG":
         ws_daily.column_dimensions[ltr].width = 16
 
     # ── Sheet 6: Demand Fulfillment (B2C) ─────────────────────────────────────
@@ -2099,8 +2134,11 @@ def _write_rolling_curing_excel(
 
     # ── Sheet 1: Demand Fulfillment ───────────────────────────────────────────
     ws = wb.create_sheet("Demand Fulfillment")
+    # CT_available: the SKU's real curing cycle time if it exists in the curing CT
+    # table (cure_ct_map), else "NA" — meaning no data, so CycleTime_min fell back to
+    # the DEFAULT_CURING_CT (17 min).
     cols = ["SKUCode", "Priority", "Demand", "GT_Inventory", "Planned_Units",
-            "Gap", "Fulfillment_Pct", "Status", "CycleTime_min",
+            "Gap", "Fulfillment_Pct", "Status", "CycleTime_min", "CT_available",
             "Eligible_Machines", "Presses_Needed", "Skip_Reason"]
     _hdr(ws, 1, cols)
     status_fill = {"FULLY MET": _GREEN, "PARTIAL": _AMBER, "UNMET": _RED, "NO DATA": _LGREY}
@@ -2122,6 +2160,7 @@ def _write_rolling_curing_excel(
             "Planned_Units": int(planned), "Gap": int(gap),
             "Fulfillment_Pct": pct, "Status": status,
             "CycleTime_min": round(ct, 2),
+            "CT_available": round(cure_ct_map[sku], 2) if sku in cure_ct_map else "NA",
             "Eligible_Machines": len(curing_allowable.get(sku, [])),
             "Presses_Needed": p_needed, "Skip_Reason": "",
         })
@@ -2187,8 +2226,13 @@ def _write_rolling_curing_excel(
 
     # ── Sheet 3: Shift Schedule ────────────────────────────────────────────────
     ws = wb.create_sheet("Shift Schedule")
+    # Qty = tyres cured. CO_Mins / Mould_Clean_Mins = minutes this press-shift spent
+    # in changeover / mould clean (covers planned full-shift COs, dynamic mid-shift
+    # COs and their overhang) — so every CO is visible here, not only in the
+    # Changeover Plan sheet.
     ss_cols = ["Date", "Shift", "Machine", "SKUCode", "StartTime", "EndTime",
-               "Qty", "CycleTime_min", "GT_Inventory", "Remarks"]
+               "Qty", "CO_Mins", "Mould_Clean_Mins",
+               "CycleTime_min", "GT_Inventory", "Remarks"]
     _hdr(ws, 1, ss_cols)
     s_fill = {"A": _fill(_BLUE), "B": _fill(_LYELL), "C": _fill(_DGREY)}
     for ri, r in enumerate(cure_shift_rows, 2):
@@ -2537,6 +2581,11 @@ def run_rolling_pipeline(
     # minutes of an in-progress clean owed at the start of a press's next shift.
     mould_life:  dict[str, int]   = defaultdict(lambda: MOULD_CLEAN_CYCLES)
     clean_carry: dict[str, float] = defaultdict(float)
+    # Minutes of an in-progress CURING CHANGEOVER owed at the start of a press's
+    # next shift. A dynamic (instant) CO fires mid-shift the moment demand is met,
+    # so its CURING_CO_CHANGEOVER_MINS overhang spills past the shift boundary —
+    # the new SKU therefore starts MID-shift, not at the boundary.
+    co_carry: dict[str, float] = defaultdict(float)
 
     # ── E: Demand ─────────────────────────────────────────────────────────────
     demand_df = pd.read_excel(demand_path)
@@ -2767,6 +2816,27 @@ def run_rolling_pipeline(
         # SKUs that curing presses are switching TO today — building must pre-build for these
         co_target_skus_today: frozenset = frozenset(co_press_map.values())
 
+        # ── Which SHIFT does each planned CO fire in? ──────────────────────────
+        # Plant rule: a press goes to changeover as soon as it FINISHES its current
+        # SKU (cap permitting) — not at a fixed 07:00. So place each CO in the shift
+        # where its old SKU is projected to run out:
+        #   already finished        → Shift A (index 0) — never make a free press wait
+        #   finishes in n shifts    → that shift (clamped to C)
+        #   will not finish today   → Shift A (preemptive Class-A CO — the static
+        #                             scheduler booked it for this day deliberately)
+        # OFF (_CO_SHIFT_SPREAD_ENABLED=False) ⇒ every CO in Shift A (old behaviour).
+        co_shift_idx: dict[str, int] = {}
+        for _p, _old, _new in today_cos:
+            _idx = 0
+            if _CO_SHIFT_SPREAD_ENABLED:
+                _rem = demand_remaining.get(_old, 0.0)
+                if _rem > 0:
+                    _octt  = cure_ct_map.get(_old, DEFAULT_CURING_CT)
+                    _odraw = _cure_qty_per_shift(_octt) * max(1, press_count.get(_old, 1))
+                    _n     = math.ceil(_rem / _odraw) if _odraw > 0 else 99
+                    _idx   = _n if _n <= 2 else 0      # >2 shifts ⇒ won't finish ⇒ preempt in A
+            co_shift_idx[_p] = _idx
+
         # Per-shift simulation: build → cure for each shift independently.
         # Building assignment runs once per shift (not once per day) so each
         # shift's build plan reacts to the actual GT inventory and curing demand
@@ -2799,8 +2869,15 @@ def run_rolling_pipeline(
             shift_cure_demand: dict[str, float] = defaultdict(float)
             for press, st in press_state.items():
                 if press in co_press_map:
-                    # Shift A = CHANGEOVER (idle); Shift B + C = PRODUCTION (no mould clean)
-                    if shift in ("B", "C"):
+                    # Before its CO shift the press still draws its OLD SKU; after it,
+                    # the NEW SKU. On the CO shift itself it is idle (no draw).
+                    _cs = co_shift_idx.get(press, 0)
+                    _si = SHIFTS.index(shift)
+                    if _si < _cs:
+                        _osku = st["sku"]
+                        _oct  = cure_ct_map.get(_osku, DEFAULT_CURING_CT)
+                        shift_cure_demand[_osku] += _cure_qty_per_shift(_oct)
+                    elif _si > _cs:
                         new_sku = co_press_map[press]
                         new_ct  = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
                         shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)
@@ -2822,14 +2899,16 @@ def run_rolling_pipeline(
             # SKU (d=1120).  Building never served SURL0 in Campaign 2.
             # Fix: count actual CO presses per target SKU and inject n_presses × qty,
             # matching how RUNNING presses accumulate their demand signal.
-            if shift == "A":
-                _co_press_counts: dict[str, int] = defaultdict(int)
-                for _cp_sku in co_press_map.values():
+            # Injected on each press's OWN CO shift (not blanket Shift A), so building
+            # still starts the new SKU's GT simultaneously with that press's changeover
+            # — the simultaneity rule — now that COs are spread across A/B/C.
+            _co_press_counts: dict[str, int] = defaultdict(int)
+            for _cp, _cp_sku in co_press_map.items():
+                if SHIFTS.index(shift) == co_shift_idx.get(_cp, 0):
                     _co_press_counts[_cp_sku] += 1
-                for new_sku in co_target_skus_today:
-                    new_ct    = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
-                    n_co      = _co_press_counts.get(new_sku, 1)
-                    shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
+            for new_sku, n_co in _co_press_counts.items():
+                new_ct = cure_ct_map.get(new_sku, DEFAULT_CURING_CT)
+                shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
 
             # ── 2. Building assignment for this shift ──────────────────────
             shift_plan = _assign_building_shift(
@@ -2871,10 +2950,15 @@ def run_rolling_pipeline(
                             "Date":          date_str,
                             "Shift":         shift,
                             "SKUCode":       "CHANGEOVER",
-                            "Qty":           co_mins,
+                            # A changeover produces NO tyres: Qty must be 0 so the
+                            # column means one thing everywhere and stays summable.
+                            # The CO duration lives in its own CO_Mins column (and is
+                            # already implied by StartTime→EndTime).
+                            "Qty":           0,
+                            "CO_Mins":       co_mins,
                             "StartTime":     _fmt_dt(_co_start),
                             "EndTime":       _fmt_dt(_cursor),
-                            "Machine_Group": _MACHINE_GROUP.get(machine, ""),
+                            "Machine_Group": _group_label(machine),
                             "CO_Type":       co_type,
                         })
                         bld_co_events.append({
@@ -2897,9 +2981,10 @@ def run_rolling_pipeline(
                         "Shift":         shift,
                         "SKUCode":       sku,
                         "Qty":           qty,
+                        "CO_Mins":       0,
                         "StartTime":     _fmt_dt(_prod_start),
                         "EndTime":       _fmt_dt(_cursor),
-                        "Machine_Group": _MACHINE_GROUP.get(machine, ""),
+                        "Machine_Group": _group_label(machine),
                         "CO_Type":       "production",
                     })
                     # Stage-1 produces carcass (not GT) → carcass feeds Stage-2,
@@ -2994,9 +3079,10 @@ def run_rolling_pipeline(
                         "Shift":         shift,
                         "SKUCode":       sku,
                         "Qty":           round(alloc),
+                        "CO_Mins":       0,
                         "StartTime":     _fmt_dt(_c_start),
                         "EndTime":       _fmt_dt(_c_end),
-                        "Machine_Group": "STAGE1",
+                        "Machine_Group": _group_label(m),
                         "CO_Type":       "carcass",
                     })
 
@@ -3006,9 +3092,16 @@ def run_rolling_pipeline(
                 sku = st["sku"]
 
                 if press in co_press_map:
-                    if shift == "A":
-                        status = "CHANGEOVER"      # CO shift: full shift idle
-                    else:                           # Shift B + C: production begins (no mould clean)
+                    # Shifts BEFORE the CO → press still runs its OLD SKU.
+                    # The CO shift        → CHANGEOVER (full shift idle).
+                    # Shifts AFTER        → the NEW SKU runs.
+                    _cs = co_shift_idx.get(press, 0)
+                    _si = SHIFTS.index(shift)
+                    if _si < _cs:
+                        status = st["status"]       # old SKU keeps producing until its CO
+                    elif _si == _cs:
+                        status = "CHANGEOVER"       # CO shift: full shift idle
+                    else:
                         sku    = co_press_map[press]
                         status = "RUNNING"
                 elif press in dynamic_co_tracker:
@@ -3028,18 +3121,51 @@ def run_rolling_pipeline(
                 # occupies the front of THIS shift. If it fills the whole shift the
                 # press is in MOULD_CLEAN (no production); otherwise production runs
                 # in the reduced remaining minutes _avail.
-                _avail = float(SHIFT_MINS)
+                _avail    = float(SHIFT_MINS)
+                _busy_in  = 0.0    # CO/clean minutes consumed at the FRONT of this shift
+                # Per-shift CO / mould-clean minutes — surfaced as CO_Mins /
+                # Mould_Clean_Mins columns so every changeover (planned full-shift,
+                # dynamic mid-shift trigger, and its overhang) is VISIBLE in the sheet,
+                # not just in the Changeover Plan.
+                _co_mins_shift    = 0.0
+                _clean_mins_shift = 0.0
+                _dyn_co_tgt       = None
+                # Separate time-portions so production and CO/clean become SEPARATE
+                # rows in the sheet (each with its own real wall-clock window):
+                _seg_co_in    = 0.0   # CO overhang carried into the FRONT of this shift
+                _seg_clean_in = 0.0   # mould-clean overhang carried into the front
+                _seg_co_trig  = 0.0   # CO fired mid-shift AFTER production (this shift's part)
+                _seg_clean_trig = 0.0 # mould clean fired mid-shift after production
+                # (a) Changeover overhang: a dynamic CO that fired mid-shift last shift
+                #     is still running. It blocks the front of this shift, so the new
+                #     SKU's production starts mid-shift.
+                if status == "RUNNING" and co_carry.get(press, 0.0) > 0:
+                    _coin = min(co_carry[press], _avail)
+                    co_carry[press] -= _coin
+                    _avail  -= _coin
+                    _busy_in += _coin
+                    if _avail <= 0:
+                        status = "CHANGEOVER"           # else-branch books SHIFT_MINS co
+                    else:
+                        press_stats[press]["co_mins"] += _coin
+                        _co_mins_shift += _coin
+                        _seg_co_in = _coin
+                # (b) Mould-clean overhang (same pattern).
                 if (_MOULD_CLEAN_ENABLED and status == "RUNNING"
                         and clean_carry.get(press, 0.0) > 0):
-                    _cin = min(clean_carry[press], float(SHIFT_MINS))
+                    _cin = min(clean_carry[press], _avail)
                     clean_carry[press] -= _cin
-                    _avail = SHIFT_MINS - _cin
+                    _avail  -= _cin
+                    _busy_in += _cin
                     if _avail <= 0:
                         status = "MOULD_CLEAN"          # else-branch books SHIFT_MINS clean
                     else:
                         press_stats[press]["clean_mins"] += _cin   # partial carry booked here
+                        _clean_mins_shift += _cin
+                        _seg_clean_in = _cin
 
-                _cleaned = False
+                _cleaned  = False
+                prod_mins = 0.0
                 if status == "RUNNING":
                     # Cap curing at remaining demand — never over-produce.
                     demand_left = max(0.0, demand_remaining.get(sku, 0.0))
@@ -3072,6 +3198,8 @@ def run_rolling_pipeline(
                             clean_here = max(0.0, min(float(MOULD_CLEAN_MINS),
                                                       _avail - prod_mins))
                             press_stats[press]["clean_mins"] += clean_here
+                            _clean_mins_shift += clean_here
+                            _seg_clean_trig = clean_here
                             clean_carry[press] = MOULD_CLEAN_MINS - clean_here
                             mould_life[press]  = MOULD_CLEAN_CYCLES
                             _cleaned = True
@@ -3129,12 +3257,24 @@ def run_rolling_pipeline(
                                         gt_inventory, _horizon_left, _already,
                                     )
                                 if _target is not None:
-                                    # CO starts now (cur_shift_global); next shift = RUNNING
+                                    # CO starts NOW — mid-shift, the moment demand was
+                                    # met. Charge the real CURING_CO_CHANGEOVER_MINS from
+                                    # this point: it eats the rest of THIS shift, and the
+                                    # overhang carries into the next shift (co_carry), so
+                                    # the new SKU begins mid-shift rather than free at the
+                                    # boundary. Without this a dynamic CO cost nothing.
                                     press_count[sku] = max(
                                         0, press_count.get(sku, 0) - 1
                                     )
                                     dynamic_co_tracker[press] = (cur_shift_global, _target)
                                     daily_co_count[day] += 1
+                                    _co_here = max(0.0, min(float(CURING_CO_CHANGEOVER_MINS),
+                                                            _avail - prod_mins))
+                                    press_stats[press]["co_mins"] += _co_here
+                                    _co_mins_shift += _co_here
+                                    _seg_co_trig    = _co_here
+                                    _dyn_co_tgt     = _target      # surfaced in Remarks
+                                    co_carry[press] = float(CURING_CO_CHANGEOVER_MINS) - _co_here
                                     # Rule 2: a curing CO resets mould life (the CO
                                     # shift already includes a clean).
                                     mould_life[press]  = MOULD_CLEAN_CYCLES
@@ -3158,48 +3298,71 @@ def run_rolling_pipeline(
                     cured = 0
                     if status == "CHANGEOVER":
                         press_stats[press]["co_mins"] += SHIFT_MINS
+                        _co_mins_shift = float(SHIFT_MINS)
                     elif status == "MOULD_CLEAN":
                         press_stats[press]["clean_mins"] += SHIFT_MINS
+                        _clean_mins_shift = float(SHIFT_MINS)
 
-                # Transparent Remarks — makes the output sheet self-consistent with
-                # the printed Starvation KPI. A RUNNING press with zero output is only
-                # STARVED if it still has demand left AND no GT; if its demand is
-                # already met it is correctly IDLE, not starved (this is exactly the
-                # KPI's guard — the sheet's STARVED count now equals the KPI number).
-                if status == "CHANGEOVER":
-                    _co_tgt = co_press_map.get(press)
-                    if _co_tgt is None and press in dynamic_co_tracker:
-                        _co_tgt = dynamic_co_tracker[press][1]
-                    remark = f"CO → {_co_tgt}" if _co_tgt else "CHANGEOVER"
-                elif status == "MOULD_CLEAN":
-                    remark = "MOULD_CLEAN"
-                elif status == "RUNNING":
-                    _dleft = demand_remaining.get(sku, 0.0)
-                    if cured > 0:
-                        remark = ""                      # producing normally
-                    elif _dleft <= 0:
-                        remark = "IDLE (demand met)"      # NOT starvation — job done
-                    elif int(round(gt_avail)) == 0:
-                        remark = "STARVED (no GT)"        # genuine starvation
+                # ── Emit ONE ROW PER SEGMENT ──────────────────────────────────
+                # A press-shift is broken into its real time segments so production
+                # and any changeover / mould clean appear as SEPARATE rows, each with
+                # its own wall-clock window. Chronological order within the shift:
+                #   [CO overhang carried in] → [clean overhang in] → [production] →
+                #   [CO fired mid-shift] → [clean fired mid-shift].
+                # A whole-shift CHANGEOVER / MOULD_CLEAN is a single row.
+                # STARVED/IDLE production rows span the rest of the shift (real idle
+                # window) so StartTime ≠ EndTime. The RUNNING segment is emitted exactly
+                # once per press-shift, so the sheet's STARVED count still equals the KPI.
+                _segs = []   # (seg_status, seg_sku, seg_mins, seg_qty, seg_remark)
+                if status in ("CHANGEOVER", "MOULD_CLEAN"):
+                    if status == "CHANGEOVER":
+                        _co_tgt = co_press_map.get(press) or (
+                            dynamic_co_tracker[press][1] if press in dynamic_co_tracker else None)
+                        _r = f"CO → {_co_tgt}" if _co_tgt else "CHANGEOVER"
                     else:
-                        remark = ""                      # has GT + demand but capped (rare)
-                else:
-                    remark = status
+                        _r = "MOULD_CLEAN"
+                    _segs.append((status, sku, float(SHIFT_MINS), 0, _r))
+                else:                                    # RUNNING shift
+                    _dleft = demand_remaining.get(sku, 0.0)
+                    if cured > 0:                    _prod_remark = ""
+                    elif _dleft <= 0:                _prod_remark = "IDLE (demand met)"
+                    elif int(round(gt_avail)) == 0:  _prod_remark = "STARVED (no GT)"
+                    else:                            _prod_remark = ""
+                    if _seg_co_in > 0:
+                        _segs.append(("CHANGEOVER", sku, _seg_co_in, 0, f"CO → {sku}"))
+                    if _seg_clean_in > 0:
+                        _segs.append(("MOULD_CLEAN", sku, _seg_clean_in, 0, "MOULD_CLEAN"))
+                    _prod_dur = prod_mins
+                    if cured == 0 and _seg_co_trig == 0 and _seg_clean_trig == 0:
+                        _prod_dur = max(0.0, SHIFT_MINS - _seg_co_in - _seg_clean_in)  # idle rest of shift
+                    _segs.append(("RUNNING", sku, _prod_dur, cured, _prod_remark))
+                    if _seg_co_trig > 0:
+                        _segs.append(("CHANGEOVER", sku, _seg_co_trig, 0, f"CO → {_dyn_co_tgt}"))
+                    if _seg_clean_trig > 0:
+                        _segs.append(("MOULD_CLEAN", sku, _seg_clean_trig, 0, "MOULD_CLEAN"))
 
-                cure_shift_rows.append({
-                    "Date":          date_str,
-                    "Shift":         shift,
-                    "Machine":       press,
-                    "SKUCode":       sku,
-                    "StartTime":     SHIFT_STARTS.get(shift, ""),
-                    "EndTime":       SHIFT_ENDS.get(shift, ""),
-                    "Qty":           cured,
-                    "CycleTime_min": round(ct, 1),
-                    "GT_Inventory":  int(round(gt_avail)),
-                    "Remarks":       remark,
-                    "_status":       status,
-                    "_demand_left":  demand_remaining.get(sku, 0.0) if status == "RUNNING" else None,
-                })
+                _s_start = _shift_start_dt(date_str, shift)
+                _cursor  = 0.0
+                for _sstat, _ssku, _smins, _sqty, _srem in _segs:
+                    _st = _s_start + timedelta(minutes=_cursor)
+                    _en = _st + timedelta(minutes=_smins)
+                    _cursor += _smins
+                    cure_shift_rows.append({
+                        "Date":          date_str,
+                        "Shift":         shift,
+                        "Machine":       press,
+                        "SKUCode":       _ssku,
+                        "StartTime":     _fmt_dt(_st),
+                        "EndTime":       _fmt_dt(_en),
+                        "Qty":           _sqty,
+                        "CO_Mins":          int(round(_smins)) if _sstat == "CHANGEOVER" else 0,
+                        "Mould_Clean_Mins": int(round(_smins)) if _sstat == "MOULD_CLEAN" else 0,
+                        "CycleTime_min": round(ct, 1),
+                        "GT_Inventory":  int(round(gt_avail)),
+                        "Remarks":       _srem,
+                        "_status":       _sstat,
+                        "_demand_left":  demand_remaining.get(_ssku, 0.0) if _sstat == "RUNNING" else None,
+                    })
 
         # ── 5. Pool replacement: swap out any finished SKUs ─────────────────
         # If a pool SKU's demand_remaining hit 0 this day, remove it and add
@@ -3252,13 +3415,15 @@ def run_rolling_pipeline(
             # Rule 2: a curing CO resets mould life (CO includes a clean).
             mould_life[press]  = MOULD_CLEAN_CYCLES
             clean_carry[press] = 0.0
-            # Planned COs execute the CHANGEOVER in Shift A of this day (co_press_map).
-            # Record here (once per day) so both static-schedule and rolling-horizon
-            # planned COs appear in the curing Changeover Plan output sheet.
+            # Planned COs execute the CHANGEOVER in the shift chosen by co_shift_idx
+            # (the shift the press finishes its old SKU — Shift A when it is already
+            # free or when the CO is preemptive). Record here (once per day) so both
+            # static-schedule and rolling-horizon planned COs appear in the curing
+            # Changeover Plan output sheet.
             cure_co_events.append({
                 "Date":       date_str,
                 "Day":        day,
-                "Shift":      "A",
+                "Shift":      SHIFTS[co_shift_idx.get(press, 0)],
                 "Press":      press,
                 "From_SKU":   old_sku,
                 "Target_SKU": new_sku,
@@ -3301,6 +3466,13 @@ def run_rolling_pipeline(
         and r.get("Qty", 0) == 0 and (r.get("_demand_left") or 0) > 0
     )
 
+    # Curing CO breakdown (planned schedule + reactive dynamic) and mould cleans.
+    _n_co_planned = sum(1 for e in cure_co_events if e.get("CO_Type") == "Planned")
+    _n_co_dynamic = sum(1 for e in cure_co_events if e.get("CO_Type") in ("Dynamic", "Early-CO"))
+    _n_co_total   = _n_co_planned + _n_co_dynamic
+    _n_mould_cleans = int(round(sum(s.get("clean_mins", 0.0)
+                                    for s in press_stats.values()) / MOULD_CLEAN_MINS))
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Results")
     print("=" * 70)
@@ -3308,6 +3480,11 @@ def run_rolling_pipeline(
     print(f"  Total cured          : {total_cured:>10,.0f}")
     print(f"  GT written off       : {writeoff_total:>10,.0f}")
     print(f"  Starvation events    : {starvation_n:>10,}")
+    print(f"  Curing COs (total)   : {_n_co_total:>10,}"
+          f"  (planned {_n_co_planned:,} + dynamic {_n_co_dynamic:,})")
+    print(f"  Mould cleans taken   : {_n_mould_cleans:>10,}  "
+          f"(clean {'ON' if _MOULD_CLEAN_ENABLED else 'OFF'}, "
+          f"CO-spread {'ON' if _CO_SHIFT_SPREAD_ENABLED else 'OFF'})")
     print(f"  Demand coverage      : {final_cov:>9.1f}%  ({dem_met:,.0f} / {total_demand:,.0f})")
     _eod_inv = [r["EndDay_GT_Inventory"] for r in daily_summary if "EndDay_GT_Inventory" in r]
     if _eod_inv:
@@ -3331,6 +3508,7 @@ def run_rolling_pipeline(
         demand_dict    = demand_dict,
         planning_days  = planning_days,
         n_curing_cos   = len(co_events),
+        endday_gt_by_date = {r["Date"]: r["EndDay_GT_Inventory"] for r in daily_summary},
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,
@@ -3362,7 +3540,10 @@ def run_rolling_pipeline(
         "gt_inventory":      dict(gt_inventory),
         "daily_summary":     daily_summary,
         "co_events":         co_events,
-        "n_co":              len(co_events),
+        "n_co":              _n_co_total,      # planned + dynamic (was planned-only)
+        "n_co_planned":      _n_co_planned,
+        "n_co_dynamic":      _n_co_dynamic,
+        "n_mould_cleans":    _n_mould_cleans,
         "build_output":      build_output,
         "curing_output":     curing_output,
     }
@@ -3468,7 +3649,9 @@ if __name__ == "__main__":
         print("\n" + "█" * 70)
         print("  ROLLING PIPELINE COMPLETE")
         print("█" * 70)
-        print(f"  Curing COs scheduled  : {result['n_co']}")
+        print(f"  Curing COs (total)    : {result['n_co']:>10,}"
+              f"  (planned {result.get('n_co_planned', 0):,} + dynamic {result.get('n_co_dynamic', 0):,})")
+        print(f"  Mould cleans taken    : {result.get('n_mould_cleans', 0):>10,}")
         print(f"  GT built (month)      : {result['total_built']:>10,.0f}")
         print(f"  GT cured (month)      : {result['total_cured']:>10,.0f}")
         print(f"  GT written off        : {result['gt_writeoff']:>10,.0f}")

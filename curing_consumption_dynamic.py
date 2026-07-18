@@ -22,7 +22,7 @@ Approach: two-pass pre-computation (fully independent of the building scheduler)
     - NRI SKUs before their CO fires: Running_Press_Count=0, Total_GT=0, production_days=blank
 
 Outputs
-  data/output/curing_consumption_31day.xlsx
+  data/output/curing_consumption_<days>day_<plan_start>.xlsx  (bc_config.DYNAMIC_CC_OUTPUT)
     - Sheets Day_01 … Day_31  : per-day consumption table
     - Sheet  CO_Schedule       : full changeover plan (press, day, old_sku → new_sku)
     - Sheet  Day0_Summary      : same as existing curing_consumption_table.xlsx (for reference)
@@ -71,6 +71,10 @@ IN_DIR  = cbc_env.INPUT_DIR
 OUT_DIR = cbc_env.OUTPUT_DIR
 
 
+# Now, this is the inpput and output sheet, i have production data and receipe master and i wants final output in the output. We have to take each unique value from the recipeID and then count how many times occuring in the production data sheet, and then search this recipeID in the receipe master "id" column, and then extract SKUCode from this. Then, i wants this SKUCode and Requirement as the total count. You can refer from the 2 output samples as well. I wants the python script as well as the complete output sheet within the excel file
+
+# Demand file- June (production data- SKUCOde , requirement, prioirty score)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,6 +86,7 @@ from bc_config import (
     MAX_CHANGEOVERS_PER_DAY as MAX_CO_PER_DAY,
     SHIFTS_PER_DAY,
     CO_CLASS_B_THRESHOLD,
+    DYNAMIC_CC_OUTPUT,
 )
 
 # Curing-side ratio alignment: replaces Priority_Score in _urgency_sort_key with
@@ -1400,7 +1405,7 @@ def run_dynamic_consumption(
                 raise FileNotFoundError(f"No demand file found in {IN_DIR}")
 
     if output_path is None:
-        output_path = os.path.join(OUT_DIR, "curing_consumption_31day.xlsx")
+        output_path = DYNAMIC_CC_OUTPUT
 
     print("\n" + "=" * 70)
     print("  B2C Phase 0 Extended — 31-Day Dynamic Curing Consumption (May)")
@@ -1616,5 +1621,5 @@ if __name__ == "__main__":
 
     run_dynamic_consumption(
         demand_path=demand_path,
-        output_path=os.path.join(OUT_DIR, "curing_consumption_31day.xlsx"),
+        output_path=DYNAMIC_CC_OUTPUT,
     )

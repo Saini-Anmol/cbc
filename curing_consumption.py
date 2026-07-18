@@ -42,6 +42,7 @@ if (os.path.exists(_VENV_PY)
     os.execv(_VENV_PY, [_VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
 
 import cbc_env
+from bc_config import RUNNING_MOULDS_TABLE
 
 HERE     = os.path.dirname(os.path.abspath(__file__))
 IN_DIR   = cbc_env.INPUT_DIR
@@ -187,7 +188,7 @@ class ConsumptionETL:
         wc_master = self._sql(f"SELECT * FROM {self.db}.Master_WC_Master")
         wc_master = wc_master[["wcID", "WCNAME"]]
 
-        df = self._sql(f"SELECT * FROM {self.db}.testing_Daily_Running_Moulds")
+        df = self._sql(f"SELECT * FROM {self.db}.{RUNNING_MOULDS_TABLE}")
         if "updatedAt" in df.columns:
             df = df.drop(columns=["updatedAt"])
 
@@ -280,18 +281,18 @@ class ConsumptionETL:
             return set()
 
     def load_curing_history_skus(self) -> set:
-        """SKUs seen in testing_Daily_Running_Moulds (current/historical curing press state)."""
+        """SKUs seen in RUNNING_MOULDS_TABLE (current/historical curing press state)."""
         _sentinels = {"CHANGEOVER", "MOULD_CLEAN", "MOULDCLEAN", "CO", "CLEAN", "NAN", ""}
         try:
             df = self._sql(
                 f"SELECT DISTINCT Sapcode AS SKUCode "
-                f"FROM {self.db}.testing_Daily_Running_Moulds "
+                f"FROM {self.db}.{RUNNING_MOULDS_TABLE} "
                 f"WHERE Sapcode IS NOT NULL AND Sapcode != ''"
             )
             raw = set(df["SKUCode"].astype(str).str.strip())
             return {s for s in raw if s.upper() not in _sentinels}
         except Exception as exc:
-            print(f"  ⚠  Curing history (testing_Daily_Running_Moulds) unavailable: {exc}")
+            print(f"  ⚠  Curing history ({RUNNING_MOULDS_TABLE}) unavailable: {exc}")
             return set()
 
 

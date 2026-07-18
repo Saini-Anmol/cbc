@@ -29,7 +29,7 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -40,6 +40,18 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
+
+# ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
+# SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
+# Every consumer (curing_consumption.py Phase 0, curing_b2c.py press state +
+# mould tracker) imports this — never hardcode the table name anywhere else.
+# Change ONLY this line each planning cycle:
+#   july plan  → "june_Daily_Running_Moulds"      (26-Jun snapshot, 169 presses)
+#   june plan  → "testing_Daily_Running_Moulds"   (27-May snapshot, 165 presses)
+#   (live/rolling)                → "Daily_Running_Moulds"
+# The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
+# must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
+RUNNING_MOULDS_TABLE = "june_Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -250,10 +262,12 @@ _OUT      = cbc_env.OUTPUT_DIR
 _MAIN_OUT = os.path.join(_OUT, "main_output")
 os.makedirs(_MAIN_OUT, exist_ok=True)
 
-CONSUMPTION_OUTPUT = os.path.join(_OUT,      "curing_consumption_table.xlsx")
-DYNAMIC_CC_OUTPUT  = os.path.join(_OUT,      "curing_consumption_31day.xlsx")
+# All per-run outputs are stamped with PLAN_START (and the horizon length) so a
+# new planning cycle never silently overwrites the previous month's results.
+CONSUMPTION_OUTPUT = os.path.join(_OUT,      f"curing_consumption_table_{PLAN_START.date()}.xlsx")
+DYNAMIC_CC_OUTPUT  = os.path.join(_OUT,      f"curing_consumption_{PLANNING_DAYS}day_{PLAN_START.date()}.xlsx")
 BUILDING_OUTPUT    = os.path.join(_MAIN_OUT, f"bc_building_schedule_{PLAN_START.date()}.xlsx")
-CURING_OUTPUT      = os.path.join(_MAIN_OUT, "bc_curing_schedule.xlsx")
-CURING_B2C_OUTPUT  = os.path.join(_MAIN_OUT, "bc_curing_b2c.xlsx")
+CURING_OUTPUT      = os.path.join(_MAIN_OUT, f"bc_curing_schedule_{PLAN_START.date()}.xlsx")
+CURING_B2C_OUTPUT  = os.path.join(_MAIN_OUT, f"bc_curing_b2c_{PLAN_START.date()}.xlsx")
 ANALYSIS_OUTPUT    = os.path.join(_MAIN_OUT, "bc_analysis.xlsx")
 ROLLING_OUTPUT     = os.path.join(_MAIN_OUT, "bc_rolling_schedule.xlsx")

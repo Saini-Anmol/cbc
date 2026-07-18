@@ -13,7 +13,7 @@ Algorithm (GT-balance simulation):
         Shift A of CO day → CHANGEOVER (press occupied, no production)
         Shift B of CO day → RUNNING on new SKU (mould clean removed from model)
         Shift C of CO day → RUNNING on new SKU
-  • Press state initialised from testing_Daily_Running_Moulds.
+  • Press state initialised from bc_config.RUNNING_MOULDS_TABLE.
 
 Output Excel (6 sheets — same column format as curing_lp.py):
   1. Demand Fulfillment
@@ -67,6 +67,7 @@ from bc_config import (
     CAVITIES_PER_PRESS as CAVITIES,
     DEFAULT_CURING_CT  as DEFAULT_CT,
     GT_MACHINES,
+    RUNNING_MOULDS_TABLE,
 )
 
 DB = cbc_env.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
@@ -223,7 +224,7 @@ def _load_press_state(engine) -> pd.DataFrame:
     matches CO event press IDs and silently breaks all CO transitions.
     """
     try:
-        rm = _sql(engine, f"SELECT * FROM {DB}.testing_Daily_Running_Moulds")
+        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE}")
         if "updatedAt" in rm.columns:
             rm = rm.drop(columns=["updatedAt"])
 
@@ -248,7 +249,7 @@ def _load_press_state(engine) -> pd.DataFrame:
 
 def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
-        rm  = _sql(engine, f"SELECT * FROM {DB}.testing_Daily_Running_Moulds")
+        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE}")
         mms = _sql(engine,
             f"SELECT MouldNo, `Matl.Code` AS sku, `Active Flag` AS flag "
             f"FROM {DB}.Master_Mapping_Mould_SKU")

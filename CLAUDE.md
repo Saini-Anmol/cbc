@@ -16,9 +16,26 @@ FROM building output by `curing_b2c.py`, so it can never exceed available GT).
 Building machines are constrained by a strict per-SKU demand
 cap: total build across the horizon ≤ 100% of customer demand. There are
 39 building machines (15 Stage-1 carcass, 6 Stage-2 GT, 18 Unistage GT), 167
-active curing presses (as of May 2026 — from `testing_Daily_Running_Moulds`).
+active curing presses (from the running-moulds snapshot named by
+`RUNNING_MOULDS_TABLE` in `bc_config.py` — currently `Daily_Running_Moulds`, 167 presses).
 The planning horizon is 31 days × 3 shifts
 (A 07:00 / B 15:00 / C 23:00) × 480 min/shift.
+
+---
+
+## Running a new month (edit only these in `bc_config.py`)
+
+```
+PLAN_START           = datetime(2026, M, 1, 7, 0, 0)   # first shift
+PLANNING_DAYS        = 30 or 31                          # days in the month
+DEMAND_FILE          = ".../<month>_demand.xlsx"
+RUNNING_MOULDS_TABLE = "<snapshot>_Daily_Running_Moulds" # Day-0 curing press state
+```
+
+Everything else derives automatically: **all 5 output paths are stamped** with `PLAN_START`
+(+ horizon) — `bc_building_schedule_<date>.xlsx`, `bc_curing_b2c_<date>.xlsx`,
+`curing_consumption_<days>day_<date>.xlsx` — so a new run never overwrites the previous month.
+`RUNNING_MOULDS_TABLE` feeds all 4 curing SQL sites from one line. Run `python b2c_pipeline.py`.
 
 ---
 
@@ -63,35 +80,53 @@ GT built for SKU A cannot be cured as SKU B even if both are 16".
 
 ## Curing press physical facts & changeover timing rule
 
-### Mould setup (physical — not a scheduling constraint)
+### Mould setup + mould clean (NOW MODELLED — LIVE)
 
-Each curing press holds **2 moulds simultaneously**, each with **2 cavities** →
-4 tyre slots per press per cycle. Mould clean is triggered after **3,000 cycles
-= 6,000 tyres** produced. **This does NOT need to be modelled as a scheduling
-event** — mould clean is absorbed into the CO window at the plant level.
+Each curing press holds **2 moulds**; the model uses `CURING_CAVITIES = 2` → **1 cycle
+= 2 tyres**. Mould clean triggers after **3,000 cycles = 6,000 tyres**.
+
+**Mould clean IS modelled as of this cycle** (previously it was absorbed into the CO
+window — that text is superseded). Toggle `_MOULD_CLEAN_ENABLED` (default ON). Each press
+carries `remaining_mould_life` (cycles, starts at `MOULD_CLEAN_CYCLES = 3000`, counts
+down). At 0, an **8h clean = `MOULD_CLEAN_MINS = 480` = 1 shift** fires **immediately**
+(mid-shift allowed): production caps at the 3,000th cycle, the clean fills the rest of that
+shift, the overhang carries into the next shift, then life resets to 3,000. **A curing CO
+also resets mould life** (the CO includes a clean — no separate clean on a CO shift).
+Impact is tiny (~4 presses trigger, ≤−250 tyres) because v1 starts every press **fresh at
+3,000**. **v2:** real opening mould life lives in the running-moulds DB tables
+(`Mould life` / `Target life` columns, mean ~2,000 remaining) — loading it would make ~110
+of 167 presses need a clean; deferred. Output columns in curing Machine Utilization:
+`total_cycle` (renamed from `Total_Cycles`), `Mould_Clean_Mins`, `Mould_Clean_Utilization_%`,
+`Remaining_Mould_Life`; identity `Available = Used + CO + MouldClean + Idle`.
 
 **LH / RH press labelling:** Each physical curing press appears as two rows in
-`testing_Daily_Running_Moulds` — one with suffix `LH` and one with `RH`.
+`RUNNING_MOULDS_TABLE` — one with suffix `LH` and one with `RH`.
 `load_running_moulds()` strips the suffix and groups both rows into a single
 press record keyed by the numeric press label (e.g. `"75206"`). CO events and
 press_state always use this clean numeric key.
 
-### Changeover timing — building MUST start simultaneously with curing CO
+### Changeover timing — building starts simultaneously with the curing CO
 
-When a curing press starts a CO to a new target SKU on Day D Shift A, the
-building machine(s) for that target SKU must ALSO start producing GT in **Shift A of Day D**.
+Every curing CO costs `CURING_CO_CHANGEOVER_MINS = 480` (1 shift). Building for the new SKU
+starts in the **same shift** as that press's CO (the simultaneity rule). Two CO kinds:
 
-```
-Day D  Shift A:  Curing press  → CHANGEOVER (490 min, OCCUPIED — full shift)
-                 Building mach → START producing GT for new SKU   ← simultaneous
-Day D  Shift B:  Curing press  → PRODUCTION begins (new SKU)      ← no mould-clean idle
-                 Building mach → CONTINUE producing GT
-Day D  Shift C:  Curing press  → PRODUCTION continues
-```
+- **Planned** (static schedule): now **spread across A/B/C** (`_CO_SHIFT_SPREAD_ENABLED`, env
+  hardcoded `True`) — placed in the shift the press finishes its old SKU (already
+  finished → A so a free press never waits; won't finish today → A preemptively). Was
+  hardcoded to Shift A (97% of CO downtime in A, artificial ~6.6k shift-A dip); now 90/30/27.
+  Before its CO shift the press runs the OLD sku; on the CO shift = CHANGEOVER; after = NEW sku.
+- **Dynamic** (reactive, fires the instant demand hits 0): **now charged** the full 480 min
+  (previously FREE — the 78 dynamic COs cost nothing, slightly inflating KPI). It fires
+  **mid-shift**, eats the rest of that shift, overhang carries into the next shift, so the
+  **new SKU starts mid-shift** (e.g. 02:00), not at the boundary.
 
-**Mould-clean is NOT modelled.** `bc_config.py`: `CURING_CO_DURATION_SHIFTS = 1`, `CURING_CO_CHANGEOVER_MINS = 490`.
+**Pre-build injection:** on each press's OWN CO shift (not blanket Shift A),
+`shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)` per CO-target press so building
+starts the new SKU's GT simultaneously. Total CO time charged = (planned + dynamic) × 480.
 
-**Implementation:** In **Shift A only**, `shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct)` is injected for every CO target SKU. Do not inject in Shift B — double injection creates 2× demand signal.
+**Curing Shift Schedule now carries real wall-clock `StartTime`/`EndTime`** ("YYYY-MM-DD HH:MM",
+mid-shift capable) plus `CO_Mins` / `Mould_Clean_Mins` columns so every CO (planned full-shift,
+dynamic mid-shift, and overhang) is visible in the sheet — not only in the Changeover Plan.
 
 ---
 
@@ -287,7 +322,10 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. |
 | `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap per calendar day (12 this cycle for the surplus-release test; plant hard limit is 18). Single source of truth in `bc_config.py`. Sweep with forward-buffer live (8→14): all 98.9–99.9%; 14→692,988/99.89%, 12→690,180/99.49% (lowest starvation). Total curing COs scale 174→250. |
-| `MAX_ENDOFDAY_GT_INVENTORY` | **10000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 10,000. Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` (verified max ~4,900). |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 8,000 (was 10,000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` written to building "Daily GT & Carcass" sheet (verified max ~4,978). |
+| `MOULD_CLEAN_CYCLES` / `MOULD_CLEAN_MINS` | **3000 / 480** | Mould clean: 3,000 cycles (=6,000 tyres) → 8h (480 min = 1 shift) clean, then reset. Toggle `_MOULD_CLEAN_ENABLED` (default ON). See "Mould setup + mould clean". |
+| `RUNNING_MOULDS_TABLE` | **"Daily\_Running\_Moulds"** | Single source of truth for the Day-0 running-moulds ETL table (curing press state). All 4 SQL sites import it — change ONE line per cycle. Options: `june_Daily_Running_Moulds` (July plan, 26-Jun, 169 presses), `testing_Daily_Running_Moulds` (June plan, 27-May, 165), `Daily_Running_Moulds` (live, 167). |
+| `_CO_SHIFT_SPREAD_ENABLED` | **True** | Spread planned curing COs across A/B/C by when each press finishes its old SKU (hardcoded ON; flip to `False` → old shift-A-only). |
 | `_FORWARD_BUFFER_ENABLED` / `_FWD_RISK_SHIFTS` | **ON / 1.0** | Forward-buffer (Phase C) + starvation-risk gate. `b2c_pipeline.py:197/206`. Idle machines pre-build about-to-starve SKUs up to `GT_SHELF_LIFE_SHIFTS = 9` ahead, capped at 10k. The +16k win (674k→690k). OFF (`FWD_BUF=0`) = 674,422 baseline. |
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
 | `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: shifts of GT to pre-build as buffer. VMI uses 2; BJ/UNI/STAGE use 1. |
@@ -295,7 +333,7 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `MIN_SHIFT_UTILISATION` | **0.80** | Target: each building machine should hit ≥80% production time per shift (384 of 480 min). **Defined in `bc_config.py` but not currently imported/referenced by `b2c_pipeline.py`, `building_b2c.py`, or `building.py`** — grep confirms no other file reads this constant. Treat it as an aspirational target documented in `bc.md` §19, not an enforced guard, until it is wired into the rolling-pipeline code. |
 | `CURING_CO_DURATION_SHIFTS` | **1** | Shifts a curing press is idle during CO: Shift A only. Mould-clean removed from model. |
 | `CURING_CO_CHANGEOVER_MINS` | **490** | Shift A duration for curing CO (full shift occupied). |
-| `PRE_START_SHIFTS` | **2** | Building pre-starts N shifts before plan_start. |
+| `PRE_START_SHIFTS` | **2** | **LEGACY LP path only** (`building_b2c.py`). The **rolling pipeline does NOT pre-start** — building and curing both begin Day 1 Shift A 07:00 simultaneously (building runs before curing within each shift, so Day-1 GT is built and cured same shift; opening GT covers the rest). Day-1 starvation is negligible (~11 events). Do not assume pre-build in the rolling path. |
 | `GT_SHELF_LIFE_DAYS` | 3 | GT cannot sit >3 days before curing. Must equal `TOPUP_LOOKAHEAD_DAYS_GT`. |
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | Stage-1 carcass shelf life: 1 day. |
 | `Stage-2 CO time multiplier` | **2.0×** | Stage-2 `co_time_map` uses `diff × 2.0` (88 → 176 min) to discourage LP from overloading Stage-2. |
@@ -327,7 +365,12 @@ current SKU's press shouldn't starve while the machine is away. Applies to all m
 
 ---
 
-## Forward-buffer + 10k GT cap + starvation-risk gate (NEWEST — LIVE, the +16k win)
+## Forward-buffer + GT cap + starvation-risk gate (LIVE, the +16k win)
+
+> **The cap value is now `MAX_ENDOFDAY_GT_INVENTORY = 8000`** (user lowered it from 10,000). The
+> numbers below (mean inv, the +16k decomposition) were measured at **10k** and remain the correct
+> illustration of the *mechanism*; the tighter 8k cap is non-binding on the current plan (max end-day
+> inv ~4,978), so it does not change the story — just read "10k" as "the end-of-day GT cap".
 
 The residual gap was NOT curing-press/15"-tooling limited as previously believed — it was **mostly
 building-side starvation**: late-month building machines sit 51–56% utilised (~15k idle machine-min/day)
@@ -463,7 +506,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | [b2c_pipeline.py](b2c_pipeline.py) | **CORRECT ENTRY POINT** — `python b2c_pipeline.py`. Runs curing_consumption_dynamic → building_b2c → curing_b2c. |
 | [building_b2c.py](building_b2c.py) | B2C building scheduler — Phase 1a/1b/2a/2b/3. |
 | [curing_b2c.py](curing_b2c.py) | B2C curing simulation (Phase 4) — GT-balance shift-by-shift. Press IDs = `WCNAME_clean`. |
-| [curing_consumption.py](curing_consumption.py) | Phase 0 — Day 0 snapshot. Reads from `testing_Daily_Running_Moulds`. |
+| [curing_consumption.py](curing_consumption.py) | Phase 0 — Day 0 snapshot. Reads from `bc_config.RUNNING_MOULDS_TABLE`. |
 | [curing_consumption_dynamic.py](curing_consumption_dynamic.py) | Phase 0 Extended — 31-day CO schedule. Class A + demand-done Class B, cap = `MAX_CHANGEOVERS_PER_DAY`. |
 | [building.py](building.py) | Base building machinery (LP engine + DemandHeuristicAssigner). |
 | [approach/bc.md](approach/bc.md) | Full B2C architecture spec (authoritative). |
@@ -511,21 +554,27 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed Jul 14 2026 — forward-buffer live, `python b2c_pipeline.py`)
+## Current KPIs (confirmed Jul 16 2026 — mould-clean + CO-charging + CO-spread live, `python b2c_pipeline.py`)
 
 The rolling pipeline is **fully deterministic** (bit-for-bit reproducible run-to-run). Committed
-default = forward-buffer risk=1.0 + 10k cap ON, surplus-release ON, `MAX_CHANGEOVERS_PER_DAY = 12`.
-`result_checker`-audited (Jul 14): every physical/demand invariant holds; result is trustworthy, not inflated.
+default = forward-buffer risk=1.0 + **8k cap** ON, surplus-release ON, mould-clean ON, CO-shift-spread
+ON, `MAX_CHANGEOVERS_PER_DAY = 12`, `RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"` (167 presses).
+`result_checker`-audited (Jul 16): every physical/demand invariant holds; result is trustworthy, not inflated.
 
 | KPI | Value | Confirmed how |
 |-----|-------|----------------|
 | Total demand (demand_may.xlsx) | 693,748 | 85 SKUs, `Requirement` column |
-| GT built | **684,028** | Console "Total GT built" |
-| GT cured (total units) | **690,180** | Console "Total cured" |
-| Demand coverage | **99.5%** | 690,180 / 693,748 |
-| GT written off | **803** | Console "GT written off" (up from 612 — forward buffer pre-builds further ahead) |
-| Starvation events | **911** | Console "Starvation events" (down from 1,508) |
-| End-day GT inventory | **max ~4,900** | New `EndDay_GT_Inventory` column; 10k cap held, 0 days over |
+| GT built | **684,165** | Console "Total GT built" |
+| GT cured (total units) | **690,319** | Console "Total cured" |
+| Demand coverage | **99.5%** | 690,319 / 693,748 |
+| GT written off | **727** | Console "GT written off" |
+| Starvation events | **897** | Console "Starvation events" |
+| Curing COs | **225** | 147 planned + 78 dynamic (all charged 480 min) |
+| Mould cleans | **4** | each 480 min; v1 starts presses fresh at 3,000 cycles |
+| End-day GT inventory | **max 4,978** | `EndDay_GT_Inventory` column; **8k** cap held, 0 days over |
+
+**Note:** the earlier 690,180 baseline moved to 690,319 from (a) the 8k cap (was 10k), (b) mould clean
+(−~250), (c) charging dynamic COs (was free), and (d) CO shift-spread — all net ~flat, physically honest.
 
 **Live scheduling toggles producing this baseline** (all in `b2c_pipeline.py` unless noted):
 - `_FORWARD_BUFFER_ENABLED = True` / `_FWD_RISK_SHIFTS = 1.0` / `_ENDOFDAY_GT_CAP_ENABLED = True` — the +16k win (see "Forward-buffer + 10k GT cap" section). OFF (`GT_CAP=0 FWD_BUF=0`) = 674,422 / 97.2% bit-for-bit.
