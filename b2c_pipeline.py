@@ -2656,19 +2656,22 @@ def run_rolling_pipeline(
         ri_skus  = frozenset(df_day0.loc[df_day0["Category"] == "Runner-In",     "SKUCode"])
         nri_skus = frozenset(df_day0.loc[df_day0["Category"] == "Non-Runner-In", "SKUCode"])
 
-    # Priority score for dynamic CO target selection (higher = serve first)
-    _prio_col = next(
-        (c for c in demand_df.columns if "Priority" in str(c) or "Score" in str(c)), None
-    )
+    # Priority score for dynamic CO target selection (higher = serve first).
+    # ConsolidatedPriorityScore (v1) — min-max normalise the per-SKU requirement,
+    # computed from demand_dict (already summed per SKU) so it matches
+    # curing_consumption.load_demand exactly and is identical whether the demand
+    # came from a local Excel or the cloud DB `jkt_demand` table (no priority
+    # column). v1 uses REQUIREMENT ONLY; any priority column in the file is ignored.
+    #   score = (q - q_min) / (q_max - q_min)   (1.0 for all if q_max == q_min)
     priority_score_map: dict[str, float] = {}
-    if _prio_col:
-        # max per SKU across duplicate rows (matches curing_consumption.py
-        # Priority=max); a plain dict would keep only the last duplicate.
-        _pq = demand_df[[sku_col, _prio_col]].copy()
-        _pq[sku_col] = _pq[sku_col].astype(str).str.strip()
-        _pq[_prio_col] = pd.to_numeric(_pq[_prio_col], errors="coerce")
-        _pq = _pq.dropna(subset=[_prio_col])
-        priority_score_map = _pq.groupby(sku_col)[_prio_col].max().to_dict()
+    if demand_dict:
+        _qs = list(demand_dict.values())
+        _qmin, _qmax = min(_qs), max(_qs)
+        _span = _qmax - _qmin
+        priority_score_map = {
+            _s: ((_q - _qmin) / _span if _span > 0 else 1.0)
+            for _s, _q in demand_dict.items()
+        }
 
     # ── F: Machine current SKU ────────────────────────────────────────────────
     machine_current_sku: dict[str, str] = {}

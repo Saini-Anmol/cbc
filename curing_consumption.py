@@ -98,11 +98,13 @@ class ConsumptionETL:
     def load_demand(self, path: str) -> pd.DataFrame:
         """Load demand file. Returns [SKUCode, Quantity, Priority].
 
-        Handles multiple input formats:
-          - Normalised: SKUCode / Quantity / Priority
-          - JKT raw CSV: skuCode / requirement (no priority col)
-          - JKT normalised XLSX: SKUCode / Requirement / ConsolidatedPriorityScore
-          - Legacy: SKUCode / Updated_Requirement / ConsolidatedPriorityScore
+        Only SKUCode + a quantity column are required. Priority
+        (ConsolidatedPriorityScore) is COMPUTED from the quantity via min-max
+        normalisation (v1: requirement only) — any priority column already in
+        the source is ignored, so Excel and DB inputs behave identically.
+
+        Accepted quantity columns (first match): Quantity / Updated_Requirement /
+        Requirement. SKU column: SKUCode / skuCode / sku_code / Sapcode.
         """
         if str(path).lower().endswith(".csv"):
             df = pd.read_csv(path)
@@ -141,19 +143,22 @@ class ConsumptionETL:
                 f"Columns found: {df.columns.tolist()}"
             )
 
-        # Resolve priority column; default 1.0 if absent
-        if "Priority" in df.columns:
-            pri_col = "Priority"
-        elif "ConsolidatedPriorityScore" in df.columns:
-            pri_col = "ConsolidatedPriorityScore"
-        else:
-            df["_priority"] = 1.0
-            pri_col = "_priority"
-
+        # Aggregate demand per SKU (a SKU may span several demand line-items).
         df = (df.groupby("SKUCode")
-                .agg(Quantity=(qty_col, "sum"), Priority=(pri_col, "max"))
+                .agg(Quantity=(qty_col, "sum"))
                 .reset_index())
-        return df[df["Quantity"] > 0].copy()
+        df = df[df["Quantity"] > 0].copy()
+
+        # ConsolidatedPriorityScore (v1) — computed HERE, the single source, so
+        # local Excel and cloud DB (`jkt_demand`, which has no priority column)
+        # behave identically. v1 uses REQUIREMENT ONLY: min-max normalise the
+        # per-SKU quantity over the whole demand.
+        #   score = (q - q_min) / (q_max - q_min)   (1.0 for all if q_max == q_min)
+        # Any priority column already present in the file is intentionally ignored.
+        q = df["Quantity"].astype(float)
+        q_min, q_max = q.min(), q.max()
+        df["Priority"] = ((q - q_min) / (q_max - q_min)) if q_max > q_min else 1.0
+        return df
 
     # -- adapted from curing_lp.ETL.load_cycle_times (lines 332-343) ----------
     def load_cycle_times(self) -> pd.DataFrame:
