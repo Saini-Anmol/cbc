@@ -19,6 +19,53 @@ import shutil
 import tempfile
 import traceback
 
+# ══════════════════════════════════════════════════════════════════════════
+# CLOUD CONFIG PIN — production values frozen for the cloud path.
+#
+# These are written onto bc_config BEFORE the engine imports them, so editing
+# bc_config.py locally (e.g. for a local_main.py experiment) does NOT change a
+# cloud run. To change a CLOUD value, edit it HERE — this dict is the cloud
+# source of truth for these knobs.
+#
+# NOT pinned here (they come per-run from the DB via read_db / _apply_run_cfg):
+#   PLAN_START, PLANNING_DAYS  ← planStartDate / planEndDate
+#   MAX_CHANGEOVERS_PER_DAY    ← noOfChangeOver
+#   PRESS_EFFICIENCY           ← efficiency
+#   DEMAND_FILE                ← jkt_demand
+# ══════════════════════════════════════════════════════════════════════════
+import bc_config as _bc
+
+CLOUD_CONFIG: dict = {
+    # ── Day-0 curing press state — MUST stay the live snapshot on cloud ──
+    "RUNNING_MOULDS_TABLE":                   "Daily_Running_Moulds",
+    # ── GT storage / shelf life ─────────────────────────────────────────
+    "MAX_ENDOFDAY_GT_INVENTORY":              8000,
+    "GT_SHELF_LIFE_DAYS":                     3,
+    "TOPUP_LOOKAHEAD_DAYS_GT":                3,
+    "CARCASS_SHELF_LIFE_DAYS":                1,
+    "GT_BUFFER_SHIFTS":                       2,
+    # ── Mould clean (curing press) ──────────────────────────────────────
+    "MOULD_CLEAN_CYCLES":                     3000,
+    "MOULD_CLEAN_MINS":                       480,
+    # ── Building campaign / CO controls ─────────────────────────────────
+    "MIN_CAMPAIGN_MINS":                      60,
+    "MIN_CAMPAIGN_UNITS":                     40,
+    "MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT": 2,
+    "OVERBUILD_BUFFER_FRAC":                  0.2,
+    "POOL_SIZE":                              3,
+    "STARVATION_BUFFER_MINS":                 30,
+    "STAGE2_CO_TIME_MULTIPLIER":              2.0,
+    # ── Curing CO controls ──────────────────────────────────────────────
+    "CO_CLASS_B_THRESHOLD":                   0.8,
+    "CURING_CO_CHANGEOVER_MINS":              480,
+    "CURING_CO_DURATION_SHIFTS":              1,
+}
+
+for _k, _v in CLOUD_CONFIG.items():
+    setattr(_bc, _k, _v)
+
+# Import the engine ONLY AFTER the pin above, so every `from bc_config import X`
+# inside the engine binds to the pinned cloud value (not whatever is in the file).
 import b2c_pipeline
 import curing_consumption
 from b2c_pipeline import run_rolling_pipeline
@@ -45,6 +92,8 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
     print(f"[main] plan_id={plan_id}  SKUs={len(demand_df)}  "
           f"start={run_cfg['plan_start'].date()}  days={run_cfg['planning_days']}  "
           f"max_co={run_cfg['max_co_per_day']}  eff={run_cfg['press_efficiency']}")
+    print(f"[main] cloud config pinned ({len(CLOUD_CONFIG)}): "
+          + ", ".join(f"{k}={v}" for k, v in CLOUD_CONFIG.items()))
 
     # ── stage demand to a temp workbook (engine reads Excel) ──────────────
     workdir = tempfile.mkdtemp(prefix=f"plan_{plan_id}_")
