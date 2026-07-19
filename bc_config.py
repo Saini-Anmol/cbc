@@ -39,7 +39,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
@@ -51,7 +51,7 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "june_Daily_Running_Moulds"
+RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
