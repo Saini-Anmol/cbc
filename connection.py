@@ -302,7 +302,12 @@ def write_db(engine, plan_id: str, result: dict,
     # jkt_plan_kpis and jkt_plan_capacityUtilisation can never disagree.
     u_curing = _occ(cu, ["Used_Mins", "CO_Mins", "Mould_Clean_Mins"])
     u_build  = _occ(bu, _bld_busy)          # ALL 39 machines (incl. Stage-1)
-    u_s2     = _group_occ("STAGE2")
+    # building_s2_capacityUtilisation = ALL GT-making machines (VMI + BJ +
+    # UNI_NARROW + Stage-2 = 24), NOT Stage-2 alone. Stage-1 (carcass) is
+    # excluded. Column name kept for API/DB compatibility (per user decision).
+    _gt_machines = (_GROUP_MACHINES["VMI"] | _GROUP_MACHINES["BJ"]
+                    | _GROUP_MACHINES["UNI_NARROW"] | _GROUP_MACHINES["STAGE2"])
+    u_s2     = _occ(bu[_mach.isin(_gt_machines)], _bld_busy)   # all GT machines
     u_s1     = _group_occ("STAGE1")
     u_vmi    = _group_occ("VMI")
     u_bj     = _group_occ("BJ")

@@ -134,7 +134,7 @@ All filtered by `plan_id`. Timestamps (`createdAt`) are **IST**.
 | `vmi_capacityUtilisation` | VMI (8) | 80.16 |
 | `bj_capacityUtilisation` | BJ (7) | 84.90 |
 | `uniNarrow_capacityUtilisation` | US / UNI_NARROW, 7501-7503 (3) | 65.41 |
-| `building_s2_capacityUtilisation` | Stage-2 (6) | 71.88 |
+| `building_s2_capacityUtilisation` | **all GT-making machines** (VMI+BJ+UNI_NARROW+Stage-2 = 24) | 77.63 |
 | `stage1_capacityUtilisation` | Stage-1 (15) | 46.54 |
 
 These values are computed once and written to **both** this table and
@@ -151,7 +151,7 @@ These values are computed once and written to **both** this table and
 | `vmi_capacityUtilisation` | VMI group (8 machines) | 80.16 |
 | `bj_capacityUtilisation` | BJ group (7 machines) | 84.90 |
 | `uniNarrow_capacityUtilisation` | UNI_NARROW / "US" machines (7501-7503) | 65.41 |
-| `building_s2_capacityUtilisation` | Stage-2 (6 machines) | 71.88 |
+| `building_s2_capacityUtilisation` | **all GT machines** (VMI+BJ+UNI_NARROW+Stage-2, 24) | 77.63 |
 | `stage1_capacityUtilisation` | Stage-1 (15 machines) | 46.54 |
 | `curingChangeovers` | curing COs, **total** = planned + dynamic | 200 |
 | `buildingChangeovers_sameSize` | building same-size CO count (cheap, ~20 min) | 2048 |
@@ -161,6 +161,10 @@ These values are computed once and written to **both** this table and
 > **Occupancy %** = (production + changeover + mould-clean) / available time —
 > how *busy* the machines were, not how *productive*. Don't confuse it with
 > `demandFulfillment`. Mould-clean applies to curing only.
+>
+> **Note on `building_s2_capacityUtilisation`:** despite the `s2` in the name, it is the
+> occupancy of **all GT-making machines** (VMI + BJ + UNI_NARROW + Stage-2 = 24) — NOT
+> Stage-2 alone. Stage-1 (carcass) is excluded; use `stage1_capacityUtilisation` for that.
 >
 > `building_capacityUtilisation` covers **all 39** building machines; the five
 > group columns break that total down. **Stage-1 sitting ~46% is expected, by

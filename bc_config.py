@@ -29,7 +29,7 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════

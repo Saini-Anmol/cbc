@@ -2010,9 +2010,11 @@ def _write_rolling_building_excel(
         "Machine", "Machine_Group", "Available_Mins",
         "GT_Built", "Carcass_Built",
         "Prod_Mins", "CO_Mins", "Idle_Mins",
-        "Util_Pct", "CO_Pct", "Idle_Pct",
+        "Util_Pct", "CO_Pct", "Idle_Pct", "Occupancy_Pct",
         "SKUs_Served", "COs_Done",
     ]
+    # Util_Pct = production only. Occupancy_Pct = (prod + CO)/available — this is
+    # the metric stored in jkt_plan_kpis / jkt_plan_capacityUtilisation.
     _xl_header(ws_util, 2, util_cols)
 
     for ri, m in enumerate(all_machines, 3):
@@ -2036,7 +2038,7 @@ def _write_rolling_building_excel(
             m, grp, avail_per_mach,
             mach_gt.get(m, 0), mach_carcass.get(m, 0),
             round(prod), round(co), round(idle),
-            util_pct, co_pct, idle_pct,
+            util_pct, co_pct, idle_pct, util_pct + co_pct,
             len(mach_skus[m]), mach_co_count[m],
         ]
         for ci, val in enumerate(vals, 1):
@@ -2044,7 +2046,7 @@ def _write_rolling_building_excel(
             cell.fill = _fill(_GREEN_U if grp != "Stage-1" and util_pct >= 0.80 else
                               _AMBER_U if util_pct >= 0.40 or grp == "Stage-1" else _RED_U)
             cell.alignment = _ctr()
-            if ci in (9, 10, 11):  # percent columns
+            if ci in (9, 10, 11, 12):  # percent columns
                 cell.number_format = "0.0%"
 
     # Totals row
@@ -2062,7 +2064,7 @@ def _write_rolling_building_excel(
     cell = ws_util.cell(row=tot_row, column=9, value=avg_pct)
     cell.font = Font(bold=True); cell.number_format = "0.0%"
 
-    for ltr_idx, w in enumerate([14,16,16,12,14,12,10,10,10,10,10,12,10], 1):
+    for ltr_idx, w in enumerate([14,16,16,12,14,12,10,10,10,10,10,12,12,10], 1):
         ws_util.column_dimensions[get_column_letter(ltr_idx)].width = w
     ws_util.freeze_panes = "A3"
 
@@ -2196,9 +2198,11 @@ def _write_rolling_curing_excel(
                        f"Presses: {len(all_presses)}  |  Total CO_Mins: {int(total_co):,}")
                 ).font = _bold(10)
     _ml = mould_life or {}
+    # Utilization_Pct = production only. Occupancy_Pct = (used + CO + mould-clean)/
+    # available — the metric stored in jkt_plan_kpis / jkt_plan_capacityUtilisation.
     u_cols = ["Machine", "Available_Mins", "Used_Mins", "CO_Mins", "Mould_Clean_Mins",
               "Idle_Mins", "Utilization_Pct", "CO_Pct", "Mould_Clean_Utilization_%",
-              "Idle_Pct", "SKUs_Count", "total_cycle", "Total_Units",
+              "Idle_Pct", "Occupancy_Pct", "SKUs_Count", "total_cycle", "Total_Units",
               "Remaining_Mould_Life"]
     _hdr(ws, 2, u_cols)
     for ri, press in enumerate(all_presses, 3):
@@ -2213,13 +2217,13 @@ def _write_rolling_curing_excel(
         idle_pct  = idle  / avail_mins if avail_mins else 0.0
         color = _GREEN if pct >= 0.90 else (_AMBER if pct >= 0.60 else _RED)
         vals  = [press, avail_mins, round(used), round(co), round(clean), round(idle),
-                 pct, co_pct, clean_pct, idle_pct,
+                 pct, co_pct, clean_pct, idle_pct, pct + co_pct + clean_pct,
                  len(s["skus"]), s["cycles"], s["units"],
                  _ml.get(press, MOULD_CLEAN_CYCLES)]
         for ci, v in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=v)
             cell.fill = _fill(color); cell.alignment = _ctr()
-            if ci in (7, 8, 9, 10): cell.number_format = "0.0%"
+            if ci in (7, 8, 9, 10, 11): cell.number_format = "0.0%"
     for ci in range(1, len(u_cols) + 1):
         ws.column_dimensions[ws.cell(row=2, column=ci).column_letter].width = 18
     ws.freeze_panes = "A3"
@@ -3332,7 +3336,11 @@ def run_rolling_pipeline(
                     elif int(round(gt_avail)) == 0:  _prod_remark = "STARVED (no GT)"
                     else:                            _prod_remark = ""
                     if _seg_co_in > 0:
-                        _segs.append(("CHANGEOVER", sku, _seg_co_in, 0, f"CO → {sku}"))
+                        # Overhang of a mid-shift dynamic CO into the NEXT shift —
+                        # a continuation of an already-counted changeover, NOT a new
+                        # event. Labelled distinctly so counting "CO → " rows in this
+                        # sheet gives the true event count (= curingChangeovers).
+                        _segs.append(("CHANGEOVER", sku, _seg_co_in, 0, f"CO (cont.) → {sku}"))
                     if _seg_clean_in > 0:
                         _segs.append(("MOULD_CLEAN", sku, _seg_clean_in, 0, "MOULD_CLEAN"))
                     _prod_dur = prod_mins
