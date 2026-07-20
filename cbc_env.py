@@ -44,10 +44,18 @@ def _load_env_file(path: str = ENV_PATH) -> dict:
                 continue
             k, v = line.split("=", 1)
             vals[k.strip()] = v.strip().strip('"').strip("'")
-    # process-env overrides file, file overrides fallback
-    for k in list(vals):
-        if os.environ.get(k):
-            vals[k] = os.environ[k]
+    # Process env overrides the file; the file overrides the defaults.
+    #
+    # IMPORTANT: we must also pick up keys that exist ONLY in the environment.
+    # In Docker there is no .env inside the image (secrets are injected with
+    # -e / --env-file), so iterating just the already-known keys would silently
+    # drop JKT_DB_HOST/USER/PASSWORD and the app would fail to boot with
+    # "Missing required config".
+    env_keys = {k for k in os.environ if k.startswith("JKT_") or k == "MES_API_KEY"}
+    for k in set(vals) | set(_REQUIRED) | env_keys:
+        v = os.environ.get(k)
+        if v:
+            vals[k] = v
     return vals
 
 

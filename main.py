@@ -68,8 +68,16 @@ for _k, _v in CLOUD_CONFIG.items():
 # inside the engine binds to the pinned cloud value (not whatever is in the file).
 import b2c_pipeline
 import curing_consumption
+import cbc_env
 from b2c_pipeline import run_rolling_pipeline
 import connection as conn
+
+# Where the per-run building/curing workbooks are written and KEPT so a user can
+# download them. Identical format to the local run (same Excel writers).
+# In Docker set PLAN_OUTPUT_DIR=/app/output and mount a volume there.
+PLAN_OUTPUT_DIR = os.environ.get(
+    "PLAN_OUTPUT_DIR", os.path.join(cbc_env.OUTPUT_DIR, "main_output")
+)
 
 
 def _apply_run_cfg(run_cfg: dict) -> None:
@@ -129,9 +137,12 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
     workdir = tempfile.mkdtemp(prefix=f"plan_{plan_id}_")
     demand_path = os.path.join(workdir, "demand.xlsx")
     demand_df.to_excel(demand_path, index=False)
+
+    # ── output workbooks are KEPT (downloadable), stamped with plan_id ────
     ds = run_cfg["plan_start"].date()
-    build_out = os.path.join(workdir, f"bc_building_schedule_{ds}.xlsx")
-    curing_out = os.path.join(workdir, f"bc_curing_b2c_{ds}.xlsx")
+    os.makedirs(PLAN_OUTPUT_DIR, exist_ok=True)
+    build_out = os.path.join(PLAN_OUTPUT_DIR, f"bc_building_schedule_{plan_id}_{ds}.xlsx")
+    curing_out = os.path.join(PLAN_OUTPUT_DIR, f"bc_curing_b2c_{plan_id}_{ds}.xlsx")
 
     # ── inject per-run config + run the engine ────────────────────────────
     _apply_run_cfg(run_cfg)
@@ -153,6 +164,7 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         created_by=created_by,
     )
 
+    # only the demand-staging temp dir is discarded; the workbooks are kept
     if not keep_files:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -160,6 +172,10 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         "plan_id": plan_id,
         "status": "done",
         "rows_written": counts,
+        "outputs": {
+            "building": result["build_output"],
+            "curing":   result["curing_output"],
+        },
         "kpi": {
             "gt_built":     round(result["total_built"]),
             "gt_cured":     round(result["total_cured"]),

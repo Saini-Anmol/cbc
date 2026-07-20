@@ -1,0 +1,30 @@
+# Secrets — NEVER bake into the image (injected at runtime via --env-file / -e)
+.env
+.env.*
+
+# Virtualenv / caches
+myenv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# VCS & editor
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# Data: inputs/outputs are mounted or come from the DB, not baked
+data/output/
+data/plant_data/
+sap_prod_output/
+*.xlsx
+*.xls
+*.csv
+
+# Docs / scratch
+approach/*.pdf
+scratch_*.py
+*.log

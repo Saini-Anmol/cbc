@@ -23,7 +23,7 @@ The planning horizon is 31 days × 3 shifts
 
 ---
 
-## Running a new month (edit only these in `bc_config.py`)
+## Running a new month — LOCAL run (edit only these 4 in `bc_config.py`)
 
 ```
 PLAN_START           = datetime(2026, M, 1, 7, 0, 0)   # first shift
@@ -32,10 +32,26 @@ DEMAND_FILE          = ".../<month>_demand.xlsx"
 RUNNING_MOULDS_TABLE = "<snapshot>_Daily_Running_Moulds" # Day-0 curing press state
 ```
 
+**All 4 must be consistent for the same month** — a mixed config (e.g. July `PLAN_START`
+with May `DEMAND_FILE`) runs without error but produces a meaningless plan.
+
+Verified month/snapshot pairs:
+
+| Month | DEMAND_FILE | PLANNING_DAYS | RUNNING_MOULDS_TABLE |
+|-------|-------------|---------------|----------------------|
+| May   | `demand_may.xlsx`                     | 31 | `Daily_Running_Moulds` |
+| June  | `demand_tomerji_june_normalized.xlsx` | 30 | `testing_Daily_Running_Moulds` |
+| July  | `july_demand_tomerJi1.xlsx`           | 31 | `june_Daily_Running_Moulds` |
+
 Everything else derives automatically: **all 5 output paths are stamped** with `PLAN_START`
 (+ horizon) — `bc_building_schedule_<date>.xlsx`, `bc_curing_b2c_<date>.xlsx`,
 `curing_consumption_<days>day_<date>.xlsx` — so a new run never overwrites the previous month.
-`RUNNING_MOULDS_TABLE` feeds all 4 curing SQL sites from one line. Run `python b2c_pipeline.py`.
+`RUNNING_MOULDS_TABLE` feeds all 4 curing SQL sites from one line.
+Run `python local_main.py` (or `python b2c_pipeline.py` — equivalent for the rolling path).
+
+> **These 4 lines affect the LOCAL run ONLY.** The cloud path (`main.py` / `app.py`) reads
+> plan dates, horizon, demand, CO cap and efficiency from the DB per run — see
+> **Deployment** below.
 
 ---
 
@@ -495,6 +511,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | BJ 20k gap (`1D25212812086FXPC0` etc.) | Believed curing-press limited | **CORRECTED Jul 14 2026 — it was building-side starvation, not curing presses.** The forward-buffer (feed idle machines' GT to starving presses 3 days ahead) closed most of this gap → overall coverage 99.5%. The old "fix = curing CO to add presses" diagnosis was wrong for this class of gap. |
 | ~59k unmet demand (7 SKUs) | No allowable building machine in master data | **Resolved as of Jul 10 2026** — confirmed via `bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C) sheet): 0 of 97 SKUs have `Eligible_Machines == 0`. Table renamed `Master_Building_Allowable_Machines_source` → `Master_Building_Allowable_Machines`. Remaining unmet demand (8 UNMET SKUs, 3,687 units total) all have eligible building machines — the gap is now production-days/curing-throughput limited, not a missing-data problem. |
 | Curing press IDs short by 30 | `_load_press_state` used `wcID` instead of `WCNAME_clean` | **Fixed:** curing_b2c.py uses WCNAME_clean (e.g. "75206") |
+| **Phase-0 CO budget used the WRONG horizon** (30-day months) | `run_dynamic_consumption` received `planning_days` but never forwarded it to `COScheduler.schedule()`, which fell back to its **import-time default** `planning_days = PLANNING_DAYS` (the `bc_config` constant). `simulate()` read the module global the same way. | **Fixed (commit `2b11cda`)** — both now take/forward `planning_days`. Symptom: June (30d) on the cloud path got `12 × 31 = 372` CO slots instead of `12 × 30 = 360` → 189 COs instead of 163 → **−8,508 cured** (91.91% vs 93.06%). Hidden because `bc_config.PLANNING_DAYS = 31` and May/July are both 31-day months, so the stale value coincidentally matched. **Local runs were never wrong in practice** (the constant is edited to match the month); it only bit when a caller passed a horizon differing from the constant — i.e. the cloud path. |
 
 ---
 
@@ -511,6 +528,43 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | [building.py](building.py) | Base building machinery (LP engine + DemandHeuristicAssigner). |
 | [approach/bc.md](approach/bc.md) | Full B2C architecture spec (authoritative). |
 
+### Deployment layer (cloud)
+
+| File | Role |
+|------|------|
+| [local_main.py](local_main.py) | **LOCAL entry point** — Excel in/out, reads `bc_config`. Parity anchor. |
+| [main.py](main.py) | **CLOUD orchestrator** — `run_plan(plan_id)`: `read_db` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (18 pinned params). |
+| [connection.py](connection.py) | DB adapter — `read_db()` (3 input tables) / `write_db()` (4 output tables) + `now_ist()`. |
+| [app.py](app.py) | **Flask API** — `POST /app/v1/jkt/planning-scheduling/plan/generate-plan {plan_id}`, `GET /health`. Synchronous. |
+| [approach/deployment.md](approach/deployment.md) | Deployment spec — DB contract, config mapping, phases, parity-gate results. |
+| [requirements.txt](requirements.txt) | Pinned runtime deps (Flask, SQLAlchemy, PyMySQL, pandas, numpy, scipy, openpyxl). |
+
+---
+
+## Deployment — local vs cloud (what drives what)
+
+One engine, two I/O paths. **Only these cross the boundary: demand, per-run params, outputs.**
+Masters + running-moulds are read from the DB by the engine's own ETL on both paths.
+
+| Value | LOCAL source | CLOUD source | Editing `bc_config` affects cloud? |
+|-------|--------------|--------------|-----------------------------------|
+| `PLAN_START` / `PLANNING_DAYS` | `bc_config` | `jkt_plan_params.planStartDate/planEndDate` | **No** |
+| `DEMAND_FILE` | `bc_config` | `jkt_demand` (staged to a temp xlsx) | **No** |
+| `MAX_CHANGEOVERS_PER_DAY` | `bc_config` | `jkt_plan_params.noOfChangeOver` | **No** |
+| `PRESS_EFFICIENCY` | `ConsumptionConfig` | `jkt_plan_params.efficiency` (stored as %, ÷100) | **No** |
+| The 18 tuning knobs (GT cap, mould clean, campaign mins, `RUNNING_MOULDS_TABLE`, …) | `bc_config` | **`main.CLOUD_CONFIG`** (pinned, applied before the engine imports) | **No — pinned** |
+
+To change a **cloud** tuning value edit `main.CLOUD_CONFIG`; to change a cloud per-run value
+edit the **DB row**. `bc_config` drives the local run only.
+
+**Priority score** is computed in code (min-max of requirement) in
+`curing_consumption.load_demand` + `b2c_pipeline` — so `jkt_demand` needs only
+`skuCode` + `requirement`, no priority column. Any priority column in a local
+Excel is ignored.
+
+**API:** synchronous (returns `elapsed_seconds` when the run finishes, ~1–4 min);
+planning mode only; re-run **overwrites** that `plan_id`; 409 = a run already in progress.
+
 ---
 
 ## Known Calculation Pitfalls
@@ -524,6 +578,22 @@ Only correct when `total_demand` and `demand_remaining` cover the **same SKU uni
 Excluded SKUs in `total_demand` but absent from `demand_remaining` silently inflate "fulfilled".
 
 **Rule:** `set(SKUs in numerator) == set(SKUs in denominator)` before writing any KPI.
+
+### ConsolidatedPriorityScore is COMPUTED in code (v1), not read from the file
+
+```
+score(sku) = (req − req_min) / (req_max − req_min)     # min-max over the whole demand
+```
+Computed in `curing_consumption.load_demand` and `b2c_pipeline` (`priority_score_map`), from the
+**per-SKU summed** requirement. **Any priority column in the demand file/DB is deliberately
+ignored** — so `jkt_demand` needs only `skuCode` + `requirement`, and local Excel and cloud DB
+score identically. Guard: `req_max == req_min` → uniform 1.0.
+
+**Consequence:** `demand_may.xlsx` / the June file ship a *weighted* score (market + target-date,
+via the `MarketScore` / `ReqRatio` columns) that v1 throws away. Do NOT assume swapping the
+scoring back is KPI-neutral — on May it is worth **+3,291 cured (+0.5pp)**. The
+`jkt_plan_params` weightage columns (`marketWeightage`, `quantityWeightage`,
+`targetdateWeightage`, per-market ints) exist for a v2 weighted score and are dormant today.
 
 ### Press ID format — WCNAME_clean, not wcID
 
@@ -554,27 +624,31 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed Jul 16 2026 — mould-clean + CO-charging + CO-spread live, `python b2c_pipeline.py`)
+## Current KPIs (confirmed Jul 20 2026 — priority-score v1 + planning_days fix live)
 
-The rolling pipeline is **fully deterministic** (bit-for-bit reproducible run-to-run). Committed
-default = forward-buffer risk=1.0 + **8k cap** ON, surplus-release ON, mould-clean ON, CO-shift-spread
-ON, `MAX_CHANGEOVERS_PER_DAY = 12`, `RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"` (167 presses).
-`result_checker`-audited (Jul 16): every physical/demand invariant holds; result is trustworthy, not inflated.
+The rolling pipeline is **deterministic** (verified: 4 identical runs, fixed and random
+`PYTHONHASHSEED`). Committed default = forward-buffer risk=1.0 + **8k cap** ON, surplus-release ON,
+mould-clean ON, CO-shift-spread ON, `MAX_CHANGEOVERS_PER_DAY = 12`.
 
-| KPI | Value | Confirmed how |
-|-----|-------|----------------|
-| Total demand (demand_may.xlsx) | 693,748 | 85 SKUs, `Requirement` column |
-| GT built | **684,165** | Console "Total GT built" |
-| GT cured (total units) | **690,319** | Console "Total cured" |
-| Demand coverage | **99.5%** | 690,319 / 693,748 |
-| GT written off | **727** | Console "GT written off" |
-| Starvation events | **897** | Console "Starvation events" |
-| Curing COs | **225** | 147 planned + 78 dynamic (all charged 480 min) |
-| Mould cleans | **4** | each 480 min; v1 starts presses fresh at 3,000 cycles |
-| End-day GT inventory | **max 4,978** | `EndDay_GT_Inventory` column; **8k** cap held, 0 days over |
+**Verified on all 3 months, LOCAL and CLOUD byte-identical** (the parity gate — see
+`approach/deployment.md`). Each month uses its own Day-0 snapshot:
 
-**Note:** the earlier 690,180 baseline moved to 690,319 from (a) the 8k cap (was 10k), (b) mould clean
-(−~250), (c) charging dynamic COs (was free), and (d) CO shift-spread — all net ~flat, physically honest.
+| Month | Demand | Running moulds | GT built | GT cured | Coverage | Curing COs | Cleans | Writeoff | Starvation |
+|-------|--------|----------------|----------|----------|----------|-----------|--------|----------|------------|
+| May  | 693,748 (85 SKUs)  | `Daily_Running_Moulds`         | 681,029 | **687,028** | **99.03%** | 200 | 4 | 796   | 1,340 |
+| June | 742,094 (120 SKUs) | `testing_Daily_Running_Moulds` | 687,371 | **690,556** | **93.06%** | 177 | 1 | 3,297 | 700 |
+| July | 779,000 (105 SKUs) | `june_Daily_Running_Moulds`    | 700,255 | **703,365** | **90.29%** | 182 | 3 | 2,942 | 981 |
+
+> **May moved 690,319 → 687,028 (99.5% → 99.03%) — this is the priority-score v1 change, not a
+> regression.** `demand_may.xlsx` and the June file carry a **weighted** `ConsolidatedPriorityScore`
+> (market + target-date), which v1 **deliberately discards** in favour of pure min-max of
+> `Requirement` (see "Known Calculation Pitfalls"). Measured cost on May: **−3,291 cured (−0.5pp)**.
+> July is unaffected because its file's score already equals min-max(requirement) exactly.
+> If coverage matters more than scoring simplicity, restoring the weighted score (or implementing
+> the `jkt_plan_params` weightages) is the lever — it is currently dormant by choice.
+
+**Earlier history:** 690,180 → 690,319 came from (a) the 8k cap (was 10k), (b) mould clean (−~250),
+(c) charging dynamic COs (was free), (d) CO shift-spread — all net ~flat, physically honest.
 
 **Live scheduling toggles producing this baseline** (all in `b2c_pipeline.py` unless noted):
 - `_FORWARD_BUFFER_ENABLED = True` / `_FWD_RISK_SHIFTS = 1.0` / `_ENDOFDAY_GT_CAP_ENABLED = True` — the +16k win (see "Forward-buffer + 10k GT cap" section). OFF (`GT_CAP=0 FWD_BUF=0`) = 674,422 / 97.2% bit-for-bit.
