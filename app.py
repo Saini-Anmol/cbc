@@ -21,15 +21,16 @@ concurrent run in progress.
 """
 from __future__ import annotations
 
+import glob
 import os
 import threading
 import time
 import traceback
 
-from flask import Blueprint, Flask, jsonify, request
+from flask import Blueprint, Flask, jsonify, request, send_file
 
 import connection as conn
-from main import run_plan
+from main import PLAN_OUTPUT_DIR, run_plan
 
 MODE = "planning"
 PREFIX = "/app/v1/jkt/planning-scheduling"
@@ -57,6 +58,35 @@ def _err(stage: str, plan_id, message: str, code: int):
 @bp.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": MODE}), 200
+
+
+@bp.route("/plan/download/<plan_id>/<kind>", methods=["GET"])
+def download_plan(plan_id: str, kind: str):
+    """Download a generated workbook: kind = 'building' | 'curing'.
+
+    Files are written by run_plan() into PLAN_OUTPUT_DIR as
+    bc_building_schedule_<plan_id>_<date>.xlsx / bc_curing_b2c_<plan_id>_<date>.xlsx
+    — the plan start date is not known to the caller, so we glob on plan_id.
+    """
+    prefixes = {"building": "bc_building_schedule", "curing": "bc_curing_b2c"}
+    if kind not in prefixes:
+        return _err("validate", plan_id,
+                    "kind must be 'building' or 'curing'", 400)
+    plan_id = (plan_id or "").strip()
+    # plan_id lands in a filesystem glob — reject anything path-like.
+    if not plan_id or "/" in plan_id or "\\" in plan_id or ".." in plan_id:
+        return _err("validate", plan_id, "invalid plan_id", 400)
+
+    pattern = os.path.join(PLAN_OUTPUT_DIR, f"{prefixes[kind]}_{plan_id}_*.xlsx")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        return _err("read", plan_id,
+                    f"no {kind} workbook found for plan_id {plan_id} "
+                    f"(has the plan been generated?)", 404)
+
+    path = matches[-1]      # newest if a plan was re-run
+    return send_file(path, as_attachment=True,
+                     download_name=os.path.basename(path))
 
 
 @bp.route("/plan/generate-plan", methods=["POST"])

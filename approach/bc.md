@@ -649,15 +649,18 @@ forward buffer `risk=1.0` ON, **8k cap** ON, `MAX_CHANGEOVERS_PER_DAY = 12`, mou
 CO-shift-spread ON, every curing CO charged. Fully deterministic (every sort/min/max ends in an
 explicit tiebreak; bit-for-bit reproducible). `result_checker`-audited — all invariants hold.
 
-| KPI | Value |
-|-----|-------|
-| Total demand (`demand_may.xlsx`) | **693,748** |
-| GT built | **684,165** |
-| GT cured (total units) | **690,319** |
-| Demand coverage | **99.5%** (690,319 / 693,748) |
-| Starvation events | **897** |
-| GT written off | **727** |
-| End-of-day GT inventory (max) | **~4,978** (8k cap held; 0 days over) |
+Verified end-to-end through the deployed container API, all months using
+`Daily_Running_Moulds` (the live Day-0 snapshot — the historical `testing_` /
+`june_` tables are retired):
+
+| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Building COs |
+|-------|-------------|--------|----------|----------|----------|-----------|--------------|
+| May  | `demand_may.xlsx`           | 693,748 | 681,029 | **687,028** | **99.03%** | 200 | 2,256 |
+| June | `june_production_data.xlsx` | 656,608 | 643,259 | **648,031** | **98.69%** | 225 | 2,359 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 | 700,298 | **705,399** | **90.55%** | 179 | 2,494 |
+
+Per-SKU demand cap verified on all 3 months: **0 SKUs cured above demand**.
+End-of-day GT inventory stays under the 8k cap (0 days over).
 | Curing COs (total) | **225** = 147 planned + 78 dynamic (all charged 480 min) |
 | Mould cleans taken | **4** |
 | Overbuild | ≤ 162 units / 0.02% (rounding only) |
@@ -673,12 +676,15 @@ re-run to confirm).
 (692,988 / 99.89%); **cap=12 lowest starvation** (911). Total curing COs scale 174→250 across the
 sweep.
 
-**KPI progression (context).** Before the forward buffer, the deterministic baseline at CO=18 was
-~670,744 cured / 96.7% (round-trip + building-ratio + curing-ratio + overbuild fix + inch-flex,
-brute-forced machine set). Adding the forward buffer + 10k cap + risk gate at CO=12 lifts this to
-**690,180 / 99.5%**. Plant benchmark (`Plant_vs_Scheduler_Report.pdf`): the AI plan (99.5% cured,
-~0 overbuild) beats the plant's demand-capped effective fulfilment (95.9%, with ~61k wasted
-overbuild). Re-run `python b2c_pipeline.py` for the exact current figure.
+**KPI progression (historical context).** Before the forward buffer, the deterministic baseline at
+CO=18 was ~670,744 cured / 96.7% (round-trip + building-ratio + curing-ratio + overbuild fix +
+inch-flex, brute-forced machine set). Adding the forward buffer + end-of-day GT cap + risk gate at
+CO=12 lifted May to ~690k / 99.5%. Two later corrections moved the figure to the **687,028 / 99.03%**
+recorded above: the **priority-score v1 change** (min-max of requirement, discarding the weighted
+score in `demand_may.xlsx` — costs ~3,291 cured on May) and the **`planning_days` fix**.
+Plant benchmark (`Plant_vs_Scheduler_Report.pdf`): the AI plan (~99% cured, ~0 overbuild) beats the
+plant's demand-capped effective fulfilment (95.9%, with ~61k wasted overbuild).
+Re-run `python local_main.py` for the exact current figure.
 
 ### 16.1 KEY CORRECTION — the "structural ceiling" was mostly building-side
 Earlier docs claimed the residual ~3% gap was **curing-press / 15"-tooling limited** and could
@@ -700,7 +706,7 @@ building plan less even. Producing a flat, plant-like daily curve needs a **sepa
 ### 17.1 DB tables (MySQL `jkplanningV1`)
 | Table | Purpose |
 |-------|---------|
-| `testing_Daily_Running_Moulds` | Which SKU each press runs today; mould life; press state (LH/RH → `WCNAME_clean`) |
+| `Daily_Running_Moulds` | Which SKU each press runs today; mould life; press state (LH/RH → `WCNAME_clean`). **Always this table** — `testing_` / `june_` variants are retired. |
 | `gt_inventory_manual` | Opening GT inventory per SKU (`sizeCode`, `gtInventory`) |
 | `Master_Curing_Design_CycleTime` | Raw cure time per SKU; missing → default 17.0 |
 | `Master_Curing_Allowable_Machines_source` | SKU ↔ allowable curing press |
@@ -791,3 +797,65 @@ When answering "should we / what if / what's wrong":
    buffer's front-loading is one (throughput up, evenness down).
 6. **Building vs curing bottleneck?** Since §16.1, do not assume a residual gap is
    curing-limited — check whether idle building machines are simply not feeding running presses.
+
+---
+
+## 19. Deployment (cloud) — added after the engine was frozen
+
+The engine is unchanged by deployment; only its I/O is wrapped. **Three things
+cross the local↔cloud boundary — demand, run params, outputs.** Masters and the
+running-moulds snapshot are read from the DB by the engine's own ETL on both paths.
+
+### 19.1 Modules
+
+| File | Role |
+|------|------|
+| `local_main.py` | LOCAL entry — Excel in/out, reads `bc_config`. Parity anchor. |
+| `main.py` | CLOUD orchestrator — `run_plan(plan_id)`: `read_db` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (18 pinned tuning params). |
+| `connection.py` | DB adapter — `read_db()` (3 input tables) / `write_db()` (5 output tables), `now_ist()`. |
+| `app.py` | Flask API (synchronous). |
+| `Dockerfile` | `python:3.14-slim` + tzdata; gunicorn 1 worker / 4 threads / 1800 s. |
+
+### 19.2 What drives what
+
+| Value | LOCAL source | CLOUD source |
+|---|---|---|
+| `PLAN_START` / `PLANNING_DAYS` | `bc_config` | `jkt_plan_params.planStartDate` / `planEndDate` |
+| demand | `DEMAND_FILE` xlsx | `jkt_demand` (staged to a temp xlsx) |
+| `MAX_CHANGEOVERS_PER_DAY` | `bc_config` | `jkt_plan_params.noOfChangeOver` |
+| `PRESS_EFFICIENCY` | `ConsumptionConfig` | `jkt_plan_params.efficiency` (stored as %, ÷100) |
+| the 18 tuning knobs incl. `RUNNING_MOULDS_TABLE` | `bc_config` | **`main.CLOUD_CONFIG`** (pinned before the engine imports) |
+
+Editing `bc_config` therefore affects the **local run only**. To change a cloud
+tuning value edit `main.CLOUD_CONFIG`; for a per-run value edit the DB row.
+
+### 19.3 API (contract matches the existing JKT planning page)
+
+Prefix `/app/v1/jkt/planning-scheduling`:
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/health` | liveness |
+| `POST` | `/plan/generate-plan` | body `{"plan_id"}` (≤100 chars); **synchronous, 1–4 min**; 200 → `{status, mode, plan_id, elapsed_seconds}` |
+| `GET` | `/plan/download/<plan_id>/building` | the building workbook (.xlsx) |
+| `GET` | `/plan/download/<plan_id>/curing` | the curing workbook (.xlsx) |
+
+Errors: `{status, stage, mode, plan_id, message}` + 400 / 404 / 409 (a run is
+already in progress) / 422 / 500. One run at a time (`_RUN_LOCK`); re-running a
+`plan_id` **overwrites** its rows. Full frontend guide: `API.md`.
+
+### 19.4 Output tables (all stamped `plan_id`, timestamps IST)
+
+`jkt_plan_building` · `jkt_plan_curing` · `jkt_plan_Infeasibility` ·
+`jkt_plan_kpis` (PK) · `jkt_plan_capacityUtilisation` (PK, **one overall/monthly
+row**, not per-day).
+
+* **Priority score** is computed in code (min-max of requirement) — `jkt_demand`
+  needs only `skuCode` + `requirement`, no priority column.
+* **`curingChangeovers`** = planned + dynamic (total).
+* **`jkt_plan_Infeasibility`** stores UNMET + missing-master + **zero-production**
+  SKUs. The last case matters: the engine labels a SKU UNMET only when
+  `built + openingGT == 0`, so a SKU that built nothing but holds a few units of
+  opening GT is labelled PARTIAL and would otherwise escape the report.
+* Both workbooks are written to `PLAN_OUTPUT_DIR` (`/app/output` in Docker) and
+  **kept** for download — mount a volume there or they vanish on image upgrade.

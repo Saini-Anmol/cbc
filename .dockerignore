@@ -1,3 +1,7 @@
+# NOTE: .dockerignore patterns are matched from the context ROOT.
+# A bare "*.xlsx" does NOT match "data/input/foo.xlsx" — use "**/*.xlsx".
+# Getting this wrong baked 1.3 GB of demand workbooks into the image.
+
 # Secrets — NEVER bake into the image (injected at runtime via --env-file / -e)
 .env
 .env.*
@@ -5,7 +9,7 @@
 # Virtualenv / caches
 myenv/
 **/__pycache__/
-*.pyc
+**/*.pyc
 .pytest_cache/
 
 # VCS & editor
@@ -14,17 +18,22 @@ myenv/
 .claude/
 .vscode/
 .idea/
-.DS_Store
+**/.DS_Store
 
-# Data: inputs/outputs are mounted or come from the DB, not baked
-data/output/
-data/plant_data/
+# Data: the cloud path reads demand + masters from the DB and writes results to
+# /app/output (created in the Dockerfile). No local data belongs in the image.
+data/
+docker_output/
 sap_prod_output/
-*.xlsx
-*.xls
-*.csv
+not_used/
 
-# Docs / scratch
+# Any stray spreadsheets / dumps anywhere in the tree
+**/*.xlsx
+**/*.xls
+**/*.csv
+**/*.db
+
+# Docs / scratch / logs
 approach/*.pdf
 scratch_*.py
-*.log
+**/*.log

@@ -237,17 +237,26 @@ def write_db(engine, plan_id: str, result: dict,
     df = df[df["Status"].notna()].copy()
     elig = pd.to_numeric(df["Eligible_Machines"], errors="coerce")
     status = df["Status"].astype(str).str.upper()
+    planned = pd.to_numeric(df["Planned_Units"], errors="coerce").fillna(0)
     # missing-master = explicitly 0 eligible machines (NaN = not a real 0).
     missing_master = elig.notna() & (elig == 0)
-    mask = (status == "UNMET") | missing_master
+    # Zero production is infeasible regardless of the sheet's label. The engine
+    # calls a SKU UNMET only when (built + opening GT) == 0, so a SKU that built
+    # NOTHING but happens to hold a few units of opening GT is labelled PARTIAL
+    # and would silently escape this report (seen: demand 4,473, opening GT 62,
+    # built 0, cured 0 -> "PARTIAL" at 1.4%).
+    zero_production = planned <= 0
+    mask = (status == "UNMET") | missing_master | zero_production
     sub = df[mask].copy()
     skip = sub["Skip_Reason"] if "Skip_Reason" in sub.columns else pd.Series([None] * len(sub))
     # Always give a reason: missing master data > the sheet's own reason >
     # "UNMET_CAPACITY" (has machines, but the horizon/throughput could not cover it).
     skip_reason = [
         "NO_ELIGIBLE_MACHINE" if m
-        else (str(s) if pd.notna(s) and str(s).strip() else "UNMET_CAPACITY")
-        for m, s in zip(missing_master[mask].tolist(), skip.tolist())
+        else (str(s) if pd.notna(s) and str(s).strip()
+              else ("ZERO_PRODUCTION" if z else "UNMET_CAPACITY"))
+        for m, z, s in zip(missing_master[mask].tolist(),
+                           zero_production[mask].tolist(), skip.tolist())
     ]
     infeas = pd.DataFrame({
         "plan_id":        plan_id,

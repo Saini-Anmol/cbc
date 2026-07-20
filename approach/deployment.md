@@ -100,7 +100,8 @@ later if you want every shortfall surfaced.
 
 **Goal:** one source-agnostic engine; two orchestrators sharing it —
 `local_main.py` (Excel I/O, today's behaviour) and `main.py` (DB I/O, cloud) —
-behind an async API a deploy dev runs from an env file and a frontend dev calls.
+behind a **synchronous Flask API** a deploy dev runs from an env file and a
+frontend dev calls.
 
 **Guiding principle — the seam is thin.** The engine (`b2c_pipeline.py` +
 `building_b2c.py` + `curing_b2c.py`) **already reads masters + running-moulds
@@ -157,9 +158,9 @@ row lists **and** write Excel in one step. Split that:
 ### 1.4 Parity gate (the checkpoint)
 
 `local_main.py` runs the engine through `local_io` and prints KPIs. Freeze those
-numbers (current committed baseline: built 684,165 / cured 690,319 / 99.5% /
-COs 225 / cleans 4). Phase 2's DB path must reproduce them **exactly** on the
-same demand. If they differ, the seam leaked — stop and fix before Phase 3.
+numbers, then require the DB path to reproduce them **exactly** on the same
+demand. If they differ, the seam leaked — stop and fix before Phase 3.
+(Verified baseline, May: built 681,029 / cured 687,028 / 99.03% / COs 200.)
 
 **Phase 1 done when:** `local_main.py` reproduces today's Excel output bit-for-bit
 via the new seam, and `connection.py` exists as a stub implementing the contract.
@@ -303,17 +304,25 @@ synchronous, contract-compliant.
 
 ## Parity gate — ✅ PASSED (3 months, local vs cloud)
 
-Local (`bc_config` + Excel) vs cloud (`main.py` + DB) on identical inputs, each
-month with its own Day-0 snapshot:
+Local (`bc_config` + Excel) vs cloud (`main.py` + DB) on identical inputs.
+**`Daily_Running_Moulds` is the Day-0 snapshot for every month** (the historical
+`testing_` / `june_` tables are retired and must not be used).
 
-| Month | Demand file | Running moulds | Built | Cured | Coverage | COs | Parity |
+Parity was proven month-by-month (all 7 KPIs byte-identical on both paths).
+Final end-to-end results through the **deployed container API**:
+
+| Month | Demand file | Demand | Built | Cured | Coverage | Curing COs | Building COs |
 |---|---|---|---|---|---|---|---|
-| May  | demand_may.xlsx | Daily_Running_Moulds | 681,029 | 687,028 | 99.03% | 200 | ✅ |
-| June | demand_tomerji_june_normalized.xlsx | testing_Daily_Running_Moulds | 687,371 | 690,556 | 93.06% | 177 | ✅ |
-| July | july_demand_tomerJi1.xlsx | june_Daily_Running_Moulds | 700,255 | 703,365 | 90.29% | 182 | ✅ |
+| May  | `demand_may.xlsx`           | 693,748 | 681,029 | 687,028 | 99.03% | 200 | 2,256 |
+| June | `june_production_data.xlsx` | 656,608 | 643,259 | 648,031 | 98.69% | 225 | 2,359 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 | 700,298 | 705,399 | 90.55% | 179 | 2,494 |
 
-All 7 KPIs (built / cured / coverage / COs / mould-cleans / writeoff /
-starvation) byte-identical on both paths for all 3 months.
+> ⚠️ **June must use `june_production_data.xlsx` (656,608).** The file
+> `demand_tomerji_june_normalized.xlsx` totals 742,094 — a DB export of plan
+> `BTP_June_Plan_R2_941998` plus 3 stray rows with a NaN `plan_id` — and inflates
+> June demand by ~85k. Always check the demand total before trusting a run.
+
+**Per-SKU demand cap verified on all 3 months: 0 SKUs cured above demand.**
 
 ### Bug found and fixed by this gate (pre-existing ENGINE bug, not deployment)
 

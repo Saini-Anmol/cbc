@@ -18,6 +18,8 @@ Base prefix: `/app/v1/jkt/planning-scheduling`
 |--------|------|---------|
 | `GET`  | `/health` | liveness check |
 | `POST` | `/plan/generate-plan` | run the scheduler for one `plan_id` |
+| `GET`  | `/plan/download/<plan_id>/building` | download the building schedule .xlsx |
+| `GET`  | `/plan/download/<plan_id>/curing` | download the curing schedule .xlsx |
 
 ### `GET /health`
 ```json
@@ -186,10 +188,30 @@ Curing sheets: `Demand Fulfillment`, `Machine Utilization`, `Shift Schedule`,
 `Changeover Plan`, `Mould Tracker`, `Machine Schedule`, `Daily Cured tyres`,
 `GT Gap Diagnostic`.
 
-> **Open item:** these files are on a volume, **not served over HTTP**, and the
-> API response does not return their paths (the response shape is fixed by the
-> existing contract). To let users download them, either serve that directory
-> from the web server, or add a download endpoint.
+### Downloading them — `GET /plan/download/<plan_id>/<kind>`
+
+`kind` = `building` or `curing`.
+
+```
+GET /app/v1/jkt/planning-scheduling/plan/download/BTP_June_Plan_R2_941998/building
+GET /app/v1/jkt/planning-scheduling/plan/download/BTP_June_Plan_R2_941998/curing
+```
+
+- **200** → the `.xlsx` file as an attachment
+  (`Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
+  filename `bc_building_schedule_<plan_id>_<date>.xlsx`).
+- **404** → no workbook for that `plan_id` (plan not generated yet, or the
+  container was recreated **without** a volume mounted at `/app/output`).
+- **400** → `kind` is not `building` / `curing`.
+
+Frontend usage: after `POST /plan/generate-plan` returns **200**, enable two
+download links pointing at these URLs. No request body, no auth headers — a
+plain link or `window.open` is enough. The date in the filename is resolved
+server-side, so you never need to know the plan start date.
+
+> **Ops requirement:** the container must run with a volume at `/app/output`
+> (`-v "${PWD}\output:/app/output"`). Without it the workbooks live only inside
+> the container and disappear on restart, and downloads start returning 404.
 
 ---
 

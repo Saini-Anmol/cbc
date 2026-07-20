@@ -39,9 +39,14 @@ Verified month/snapshot pairs:
 
 | Month | DEMAND_FILE | PLANNING_DAYS | RUNNING_MOULDS_TABLE |
 |-------|-------------|---------------|----------------------|
-| May   | `demand_may.xlsx`                     | 31 | `Daily_Running_Moulds` |
-| June  | `demand_tomerji_june_normalized.xlsx` | 30 | `testing_Daily_Running_Moulds` |
-| July  | `july_demand_tomerJi1.xlsx`           | 31 | `june_Daily_Running_Moulds` |
+| May   | `demand_may.xlsx`           | 31 | `Daily_Running_Moulds` |
+| June  | `june_production_data.xlsx` | 30 | `Daily_Running_Moulds` |
+| July  | `july_demand_tomerJi1.xlsx` | 31 | `Daily_Running_Moulds` |
+
+> **`RUNNING_MOULDS_TABLE` is ALWAYS `Daily_Running_Moulds`** — the live Day-0 press
+> snapshot, for every month, local and cloud. The historical variants
+> (`testing_Daily_Running_Moulds`, `june_Daily_Running_Moulds`) are **not used**;
+> do not switch to them.
 
 Everything else derives automatically: **all 5 output paths are stamped** with `PLAN_START`
 (+ horizon) — `bc_building_schedule_<date>.xlsx`, `bc_curing_b2c_<date>.xlsx`,
@@ -340,9 +345,9 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap per calendar day (12 this cycle for the surplus-release test; plant hard limit is 18). Single source of truth in `bc_config.py`. Sweep with forward-buffer live (8→14): all 98.9–99.9%; 14→692,988/99.89%, 12→690,180/99.49% (lowest starvation). Total curing COs scale 174→250. |
 | `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 8,000 (was 10,000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` written to building "Daily GT & Carcass" sheet (verified max ~4,978). |
 | `MOULD_CLEAN_CYCLES` / `MOULD_CLEAN_MINS` | **3000 / 480** | Mould clean: 3,000 cycles (=6,000 tyres) → 8h (480 min = 1 shift) clean, then reset. Toggle `_MOULD_CLEAN_ENABLED` (default ON). See "Mould setup + mould clean". |
-| `RUNNING_MOULDS_TABLE` | **"Daily\_Running\_Moulds"** | Single source of truth for the Day-0 running-moulds ETL table (curing press state). All 4 SQL sites import it — change ONE line per cycle. Options: `june_Daily_Running_Moulds` (July plan, 26-Jun, 169 presses), `testing_Daily_Running_Moulds` (June plan, 27-May, 165), `Daily_Running_Moulds` (live, 167). |
+| `RUNNING_MOULDS_TABLE` | **"Daily\_Running\_Moulds"** | Single source of truth for the Day-0 running-moulds ETL table (curing press state). All 4 SQL sites import it. **ALWAYS `Daily_Running_Moulds` (the live snapshot) — every month, local and cloud. Do NOT switch to the historical `testing_` / `june_` variants; they are retired.** Pinned for cloud in `main.CLOUD_CONFIG`. |
 | `_CO_SHIFT_SPREAD_ENABLED` | **True** | Spread planned curing COs across A/B/C by when each press finishes its old SKU (hardcoded ON; flip to `False` → old shift-A-only). |
-| `_FORWARD_BUFFER_ENABLED` / `_FWD_RISK_SHIFTS` | **ON / 1.0** | Forward-buffer (Phase C) + starvation-risk gate. `b2c_pipeline.py:197/206`. Idle machines pre-build about-to-starve SKUs up to `GT_SHELF_LIFE_SHIFTS = 9` ahead, capped at 10k. The +16k win (674k→690k). OFF (`FWD_BUF=0`) = 674,422 baseline. |
+| `_FORWARD_BUFFER_ENABLED` / `_FWD_RISK_SHIFTS` | **ON / 1.0** | Forward-buffer (Phase C) + starvation-risk gate. `b2c_pipeline.py:197/206`. Idle machines pre-build about-to-starve SKUs up to `GT_SHELF_LIFE_SHIFTS = 9` ahead, bounded by `MAX_ENDOFDAY_GT_INVENTORY` (**8k**). Historically the +16k win (674k→690k on the pre-priority-score baseline). |
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
 | `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: shifts of GT to pre-build as buffer. VMI uses 2; BJ/UNI/STAGE use 1. |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | **2** | Cap on changeovers a single building machine may perform in one shift (rolling pipeline only). Plant averages 0.57 CO/shift/machine; upper bound of 2 lets one machine serve up to 3 SKU campaigns/shift. Must be `same_size_CO` to hold the 80% utilisation floor — 2× `diff_size_CO` (240 min VMI) would blow past it and is blocked. |
@@ -511,7 +516,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | BJ 20k gap (`1D25212812086FXPC0` etc.) | Believed curing-press limited | **CORRECTED Jul 14 2026 — it was building-side starvation, not curing presses.** The forward-buffer (feed idle machines' GT to starving presses 3 days ahead) closed most of this gap → overall coverage 99.5%. The old "fix = curing CO to add presses" diagnosis was wrong for this class of gap. |
 | ~59k unmet demand (7 SKUs) | No allowable building machine in master data | **Resolved as of Jul 10 2026** — confirmed via `bc_building_schedule_2026-05-01.xlsx` (Demand Fulfillment (B2C) sheet): 0 of 97 SKUs have `Eligible_Machines == 0`. Table renamed `Master_Building_Allowable_Machines_source` → `Master_Building_Allowable_Machines`. Remaining unmet demand (8 UNMET SKUs, 3,687 units total) all have eligible building machines — the gap is now production-days/curing-throughput limited, not a missing-data problem. |
 | Curing press IDs short by 30 | `_load_press_state` used `wcID` instead of `WCNAME_clean` | **Fixed:** curing_b2c.py uses WCNAME_clean (e.g. "75206") |
-| **Phase-0 CO budget used the WRONG horizon** (30-day months) | `run_dynamic_consumption` received `planning_days` but never forwarded it to `COScheduler.schedule()`, which fell back to its **import-time default** `planning_days = PLANNING_DAYS` (the `bc_config` constant). `simulate()` read the module global the same way. | **Fixed (commit `2b11cda`)** — both now take/forward `planning_days`. Symptom: June (30d) on the cloud path got `12 × 31 = 372` CO slots instead of `12 × 30 = 360` → 189 COs instead of 163 → **−8,508 cured** (91.91% vs 93.06%). Hidden because `bc_config.PLANNING_DAYS = 31` and May/July are both 31-day months, so the stale value coincidentally matched. **Local runs were never wrong in practice** (the constant is edited to match the month); it only bit when a caller passed a horizon differing from the constant — i.e. the cloud path. |
+| **Phase-0 CO budget used the WRONG horizon** (30-day months) | `run_dynamic_consumption` received `planning_days` but never forwarded it to `COScheduler.schedule()`, which fell back to its **import-time default** `planning_days = PLANNING_DAYS` (the `bc_config` constant). `simulate()` read the module global the same way. | **Fixed (commit `2b11cda`)** — both now take/forward `planning_days`. Symptom: June (30d) on the cloud path got `12 × 31 = 372` CO slots instead of `12 × 30 = 360` → 189 COs instead of 163 → a materially different plan. (The −8,508 figure quoted when this was found was measured on `demand_tomerji_june_normalized.xlsx`, later identified as the WRONG June input — the defect and its mechanism are real regardless.) Hidden because `bc_config.PLANNING_DAYS = 31` and May/July are both 31-day months, so the stale value coincidentally matched. **Local runs were never wrong in practice** (the constant is edited to match the month); it only bit when a caller passed a horizon differing from the constant — i.e. the cloud path. |
 
 ---
 
@@ -633,17 +638,41 @@ mould-clean ON, CO-shift-spread ON, `MAX_CHANGEOVERS_PER_DAY = 12`.
 **Verified on all 3 months, LOCAL and CLOUD byte-identical** (the parity gate — see
 `approach/deployment.md`). Each month uses its own Day-0 snapshot:
 
-| Month | Demand | Running moulds | GT built | GT cured | Coverage | Curing COs | Cleans | Writeoff | Starvation |
-|-------|--------|----------------|----------|----------|----------|-----------|--------|----------|------------|
-| May  | 693,748 (85 SKUs)  | `Daily_Running_Moulds`         | 681,029 | **687,028** | **99.03%** | 200 | 4 | 796   | 1,340 |
-| June | 742,094 (120 SKUs) | `testing_Daily_Running_Moulds` | 687,371 | **690,556** | **93.06%** | 177 | 1 | 3,297 | 700 |
-| July | 779,000 (105 SKUs) | `june_Daily_Running_Moulds`    | 700,255 | **703,365** | **90.29%** | 182 | 3 | 2,942 | 981 |
+End-to-end through the **deployed container API**, all with `Daily_Running_Moulds`:
+
+| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Building COs | Infeasible SKUs |
+|-------|-------------|--------|----------|----------|----------|-----------|--------------|-----------------|
+| May  | `demand_may.xlsx`           | 693,748 (85 SKUs)  | 681,029 | **687,028** | **99.03%** | 200 | 2,256 | 4 |
+| June | `june_production_data.xlsx` | 656,608 (92 SKUs)  | 643,259 | **648,031** | **98.69%** | 225 | 2,359 | 0 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 (105 SKUs) | 700,298 | **705,399** | **90.55%** | 179 | 2,494 | 8 |
+
+Machine-group occupancy % (production + CO / available):
+
+| Month | Curing | Building (39) | VMI | BJ | UNI_NARROW | Stage-2 | Stage-1 |
+|-------|--------|---------------|-----|----|------------|---------|---------|
+| May  | 87.76 | 65.67 | 80.16 | 84.90 | 65.41 | 71.88 | 46.54 |
+| June | 86.29 | 67.57 | 81.00 | 81.03 | 55.03 | 81.52 | 51.05 |
+| July | 91.52 | 70.40 | 79.25 | 94.67 | 82.86 | 81.07 | 47.60 |
+
+**Per-SKU demand cap verified on all 3 months: 0 SKUs cured above demand.**
+Runs take ~75-79 s each through the container.
+
+> ⚠️ **Use `june_production_data.xlsx` for June — NOT `demand_tomerji_june_normalized.xlsx`.**
+> The latter totals 742,094 and is a DB export of plan `BTP_June_Plan_R2_941998` (147 rows,
+> 732,781) with **3 stray rows carrying a NaN `plan_id`** appended (9,313 units: TTMX0/TUHL0/
+> VURL0 — the manually inserted test SKUs). Loading it inflates June demand by ~85k and produces
+> a meaningless 690k "cured". The correct file is clean: 92 rows, 92 SKUs, 656,608.
+> **Always sanity-check the demand total against the expected month total before trusting a run.**
+>
+> **Per-SKU demand cap verified on June:** 0 of 92 SKUs cured above their demand, and no SKU
+> cured without a demand row — the cap holds exactly (not even the ~162-unit min-campaign
+> rounding overbuild noted elsewhere).
 
 > **May moved 690,319 → 687,028 (99.5% → 99.03%) — this is the priority-score v1 change, not a
-> regression.** `demand_may.xlsx` and the June file carry a **weighted** `ConsolidatedPriorityScore`
+> regression.** `demand_may.xlsx` carries a **weighted** `ConsolidatedPriorityScore`
 > (market + target-date), which v1 **deliberately discards** in favour of pure min-max of
 > `Requirement` (see "Known Calculation Pitfalls"). Measured cost on May: **−3,291 cured (−0.5pp)**.
-> July is unaffected because its file's score already equals min-max(requirement) exactly.
+> June and July are unaffected — their files' scores already equal min-max(requirement).
 > If coverage matters more than scoring simplicity, restoring the weighted score (or implementing
 > the `jkt_plan_params` weightages) is the lever — it is currently dormant by choice.
 
