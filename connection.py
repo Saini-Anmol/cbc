@@ -47,14 +47,27 @@ def now_ist() -> datetime:
 # bc_config.RUNNING_MOULDS_TABLE — keep that = "Daily_Running_Moulds" on cloud).
 RUNNING_MOULDS_CLOUD = "Daily_Running_Moulds"
 
-# Stage-2 building machines — for the building_s2 occupancy KPI.
-_STAGE2_MACHINES = {"8201", "8301", "8302", "8501", "8502", "7301"}
+# Building machine groups — used for the per-group occupancy KPIs.
+# Classified by machine ID (stable) rather than the sheet's Machine_Group label,
+# which is display text and has bitten us before (the label is "Stage-2", so a
+# substring test for "STAGE2" silently never matched).
+# NOTE on terminology: "US machines" = UNI_NARROW (7501-7503) only.
+# "Unistage" colloquially means VMI + BJ + UNI_NARROW — not this group.
+_GROUP_MACHINES = {
+    "VMI":        {"6001", "6002", "6003", "6004", "7001", "7002", "7003", "7004"},
+    "BJ":         {"7101", "7102", "7103", "7104", "7105", "7106", "7201"},
+    "UNI_NARROW": {"7501", "7502", "7503"},
+    "STAGE2":     {"8201", "8301", "8302", "8501", "8502", "7301"},
+    "STAGE1":     {"6801", "6802", "6803", "6909", "6911", "7601", "7701",
+                   "7801", "7802", "7803", "7804", "8001", "8002", "8003", "8101"},
+}
 
 _OUTPUT_TABLES = [
     "jkt_plan_building",
     "jkt_plan_curing",
     "jkt_plan_Infeasibility",
     "jkt_plan_kpis",
+    "jkt_plan_capacityUtilisation",
 ]
 
 
@@ -89,7 +102,22 @@ def read_db(engine, plan_id: str):
     demand_df = (dem.groupby("skuCode", as_index=False)["requirement"].sum()
                     .rename(columns={"skuCode": "SKUCode",
                                      "requirement": "Requirement"}))
-    sku_desc = dict(zip(dem["skuCode"], dem["skuDescription"]))
+    # Description lookup. Seed from the FULL master first, then let jkt_demand
+    # override. It must not be scoped to the demand SKUs: the curing schedule
+    # also contains Runner-Out SKUs (already mounted on a press but with zero
+    # demand), which never appear in jkt_demand and would otherwise be NULL.
+    sku_desc: dict = {}
+    try:
+        master = pd.read_sql(
+            text("SELECT SkuCode, Description FROM jkt_sku_description"), engine)
+        sku_desc = {str(k).strip(): v
+                    for k, v in zip(master["SkuCode"], master["Description"])
+                    if v is not None and str(v).strip()}
+    except Exception as exc:  # master missing/renamed — not fatal
+        print(f"  [conn] sku description master unavailable: {exc}")
+    for k, v in zip(dem["skuCode"], dem["skuDescription"]):
+        if v is not None and str(v).strip() and str(v).lower() != "nan":
+            sku_desc[k] = v
 
     prm = pd.read_sql(
         text("SELECT * FROM jkt_plan_params WHERE plan_id = :p"),
@@ -138,7 +166,21 @@ def read_db(engine, plan_id: str):
 # WRITE — engine's fresh workbooks → 4 output tables
 # ══════════════════════════════════════════════════════════════════════════
 def _desc(series: pd.Series, sku_desc: dict) -> pd.Series:
-    return series.astype(str).map(lambda s: sku_desc.get(s))
+    """SKU description, with sentinel rows labelled instead of left NULL.
+
+    Building CHANGEOVER (and curing MOULD_CLEAN) rows carry a sentinel in the
+    SKUCode column rather than a real SKU, so there is no description to look
+    up — label them with the sentinel itself so the column is never NULL.
+    """
+    _SENTINELS = {"CHANGEOVER", "MOULD_CLEAN"}
+
+    def _one(s: str):
+        d = sku_desc.get(s)
+        if d is not None and str(d).strip():
+            return d
+        return s if s in _SENTINELS else None
+
+    return series.astype(str).map(_one)
 
 
 def write_db(engine, plan_id: str, result: dict,
@@ -200,8 +242,11 @@ def write_db(engine, plan_id: str, result: dict,
     mask = (status == "UNMET") | missing_master
     sub = df[mask].copy()
     skip = sub["Skip_Reason"] if "Skip_Reason" in sub.columns else pd.Series([None] * len(sub))
+    # Always give a reason: missing master data > the sheet's own reason >
+    # "UNMET_CAPACITY" (has machines, but the horizon/throughput could not cover it).
     skip_reason = [
-        "NO_ELIGIBLE_MACHINE" if m else (str(s) if pd.notna(s) and str(s).strip() else None)
+        "NO_ELIGIBLE_MACHINE" if m
+        else (str(s) if pd.notna(s) and str(s).strip() else "UNMET_CAPACITY")
         for m, s in zip(missing_master[mask].tolist(), skip.tolist())
     ]
     infeas = pd.DataFrame({
@@ -228,20 +273,65 @@ def write_db(engine, plan_id: str, result: dict,
         busy = sum(pd.to_numeric(frame[c], errors="coerce").fillna(0).sum() for c in busy_cols)
         return round(100.0 * busy / avail, 2) if avail else 0.0
 
-    is_s2 = (bu["Machine"].astype(str).isin(_STAGE2_MACHINES)
-             | bu["Machine_Group"].astype(str).str.contains("STAGE2", case=False, na=False))
+    # Per-group building occupancy = (production + CO) / available, by machine ID.
+    _bld_busy = ["Prod_Mins", "CO_Mins"]     # building has no mould clean
+    _mach = bu["Machine"].astype(str)
+
+    def _group_occ(group: str) -> float:
+        return _occ(bu[_mach.isin(_GROUP_MACHINES[group])], _bld_busy)
+
+    # Building changeover EVENT counts from the shift schedule (carcass and
+    # production rows are not changeovers). Cross-checks against COs_Done.
+    _co_type = bs["CO_Type"].astype(str)
+    n_co_same = int((_co_type == "same_size_CO").sum())
+    n_co_diff = int((_co_type == "diff_size_CO").sum())
+
     demand_sku = int(len(df))
     plan_sku = int((pd.to_numeric(df["Planned_Units"], errors="coerce").fillna(0) > 0).sum())
+
+    # Compute each utilisation ONCE and reuse for both output tables, so
+    # jkt_plan_kpis and jkt_plan_capacityUtilisation can never disagree.
+    u_curing = _occ(cu, ["Used_Mins", "CO_Mins", "Mould_Clean_Mins"])
+    u_build  = _occ(bu, _bld_busy)          # ALL 39 machines (incl. Stage-1)
+    u_s2     = _group_occ("STAGE2")
+    u_s1     = _group_occ("STAGE1")
+    u_vmi    = _group_occ("VMI")
+    u_bj     = _group_occ("BJ")
+    u_uni    = _group_occ("UNI_NARROW")     # "US machines"
 
     kpis = pd.DataFrame([{
         "plan_id":                          plan_id,
         "demandFulfillment":                round(float(result.get("demand_coverage", 0.0)), 2),
         "demandSKU":                        demand_sku,
         "planSKU":                          plan_sku,
-        "capacityUtilisation":              _occ(cu, ["Used_Mins", "CO_Mins", "Mould_Clean_Mins"]),
-        "building_capacityUtilisation":     _occ(bu, ["Prod_Mins", "CO_Mins"]),
-        "building_s2_capacityUtilisation":  _occ(bu[is_s2], ["Prod_Mins", "CO_Mins"]),
-        "curingChangeovers":                int(result.get("n_co", 0)),   # rule 4: planned + dynamic
+        "capacityUtilisation":              u_curing,
+        "building_capacityUtilisation":     u_build,
+        "building_s2_capacityUtilisation":  u_s2,
+        "stage1_capacityUtilisation":       u_s1,
+        "vmi_capacityUtilisation":          u_vmi,
+        "bj_capacityUtilisation":           u_bj,
+        "uniNarrow_capacityUtilisation":    u_uni,
+        "curingChangeovers":                int(result.get("n_co", 0)),  # rule 4: planned + dynamic
+        "buildingChangeovers_sameSize":     n_co_same,
+        "buildingChangeovers_diffSize":     n_co_diff,
+        "buildingChangeovers":              n_co_same + n_co_diff,
+        "createdAt":                        now,
+        "createdBy":                        created_by,
+    }])
+
+    # ── capacity utilisation — MONTHLY / overall: ONE row per plan ────────
+    # (not per-day; plan_id is the PRIMARY KEY). `date` carries the plan start
+    # date so the row is self-describing. Column names match jkt_plan_kpis.
+    cap = pd.DataFrame([{
+        "plan_id":                          plan_id,
+        "date":                             pd.to_datetime(bs["Date"]).min().date(),
+        "capacityUtilisation":              u_curing,
+        "building_capacityUtilisation":     u_build,
+        "building_s2_capacityUtilisation":  u_s2,
+        "stage1_capacityUtilisation":       u_s1,
+        "vmi_capacityUtilisation":          u_vmi,
+        "bj_capacityUtilisation":           u_bj,
+        "uniNarrow_capacityUtilisation":    u_uni,
         "createdAt":                        now,
         "createdBy":                        created_by,
     }])
@@ -257,10 +347,12 @@ def write_db(engine, plan_id: str, result: dict,
     if len(infeas):
         infeas.to_sql("jkt_plan_Infeasibility", engine, if_exists="append", index=False)
     kpis.to_sql("jkt_plan_kpis", engine, if_exists="append", index=False)
+    cap.to_sql("jkt_plan_capacityUtilisation", engine, if_exists="append", index=False)
 
     return {
-        "jkt_plan_building":      len(bld),
-        "jkt_plan_curing":        len(cur),
-        "jkt_plan_Infeasibility": len(infeas),
-        "jkt_plan_kpis":          len(kpis),
+        "jkt_plan_building":            len(bld),
+        "jkt_plan_curing":              len(cur),
+        "jkt_plan_Infeasibility":       len(infeas),
+        "jkt_plan_kpis":                len(kpis),
+        "jkt_plan_capacityUtilisation": len(cap),
     }

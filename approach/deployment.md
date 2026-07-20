@@ -258,11 +258,11 @@ pass the parity gate; a `plan_id` round-trips DB→engine→DB.
 it the same way):**
 - Prefix `/app/v1/jkt/planning-scheduling`.
 - `POST /plan/generate-plan` body `{"plan_id":"<id>"}` — validate: JSON object,
-  non-empty string, ≤ 50 chars.
+  non-empty string, ≤ 100 chars.
 - `GET /health`.
 - Success 200: `{status:"success", mode:"planning", plan_id, elapsed_seconds}`.
 - Error: `{status:"error", stage, mode, plan_id, message}` + HTTP
-  400 (bad body / empty) · 422 (>50 chars) · 404 (no input rows) ·
+  400 (bad body / empty) · 422 (>100 chars) · 404 (no input rows) ·
   409 (a run already in progress) · 500 (engine/write failure).
 
 **v1 decisions:** planning mode only (no simulation / no `jkt_sim_*`);
@@ -285,7 +285,7 @@ API_PORT=8000 python app.py             # dev server; API_HOST/API_PORT from env
 **`.env`** (already present): DB creds `JKT_DB_*` (read via `cbc_env`). Add
 `API_HOST` / `API_PORT` for the server. Nothing hardcoded.
 
-**Frontend contract (hand off):** frontend mints a unique `plan_id` (≤50 chars),
+**Frontend contract (hand off):** frontend mints a unique `plan_id` (≤100 chars),
 writes the `jkt_demand` + `jkt_plan_params` rows, then `POST /plan/generate-plan
 {plan_id}` and **waits** (synchronous, ~1-4 min) for the 200 + `elapsed_seconds`;
 on success reads the 4 output tables (`jkt_plan_building`, `jkt_plan_curing`,

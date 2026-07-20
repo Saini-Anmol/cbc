@@ -33,7 +33,7 @@ from main import run_plan
 
 MODE = "planning"
 PREFIX = "/app/v1/jkt/planning-scheduling"
-MAX_PLAN_ID_LEN = 50
+MAX_PLAN_ID_LEN = 100      # matches plan_id VARCHAR(100) in every DB table
 
 _RUN_LOCK = threading.Lock()
 

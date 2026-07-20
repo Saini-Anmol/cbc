@@ -6,7 +6,7 @@ from datetime import datetime
 
 MONTHS = {
     "may":  ("demand_may.xlsx",                      (2026, 5, 1), 31, "Daily_Running_Moulds"),
-    "june": ("demand_tomerji_june_normalized.xlsx",  (2026, 6, 1), 30, "testing_Daily_Running_Moulds"),
+    "june": ("june_production_data.xlsx",  (2026, 6, 1), 30, "testing_Daily_Running_Moulds"),
     "july": ("july_demand_tomerJi1.xlsx",            (2026, 7, 1), 31, "june_Daily_Running_Moulds"),
 }
 mode, month = sys.argv[1], sys.argv[2]
