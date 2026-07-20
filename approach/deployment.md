@@ -301,6 +301,44 @@ synchronous, contract-compliant.
 
 ---
 
+## Parity gate — ✅ PASSED (3 months, local vs cloud)
+
+Local (`bc_config` + Excel) vs cloud (`main.py` + DB) on identical inputs, each
+month with its own Day-0 snapshot:
+
+| Month | Demand file | Running moulds | Built | Cured | Coverage | COs | Parity |
+|---|---|---|---|---|---|---|---|
+| May  | demand_may.xlsx | Daily_Running_Moulds | 681,029 | 687,028 | 99.03% | 200 | ✅ |
+| June | demand_tomerji_june_normalized.xlsx | testing_Daily_Running_Moulds | 687,371 | 690,556 | 93.06% | 177 | ✅ |
+| July | july_demand_tomerJi1.xlsx | june_Daily_Running_Moulds | 700,255 | 703,365 | 90.29% | 182 | ✅ |
+
+All 7 KPIs (built / cured / coverage / COs / mould-cleans / writeoff /
+starvation) byte-identical on both paths for all 3 months.
+
+### Bug found and fixed by this gate (pre-existing ENGINE bug, not deployment)
+
+`curing_consumption_dynamic.run_dynamic_consumption` received `planning_days`
+but **never forwarded it** to `COScheduler.schedule()`, which then fell back to
+its import-time default `planning_days = PLANNING_DAYS` (the `bc_config`
+constant). Whenever a caller's horizon differed from the config constant, the
+Phase-0 CO budget used the WRONG horizon.
+
+* Symptom: June (30 days) on cloud got `12 × 31 = 372` CO slots instead of
+  `12 × 30 = 360` → 189 COs instead of 163 → **−8,508 tyres cured** (91.91% vs 93.06%).
+* Hidden until now because `bc_config.PLANNING_DAYS = 31` and May/July are both
+  31-day months — the stale value coincidentally matched.
+* Local runs were unaffected in practice (the config constant is edited to match
+  the month), so no past local plan was wrong. The rolling per-day CO call
+  (`b2c_pipeline.py:1019`) already passed `planning_days` correctly.
+* **Fixes:** (1) forward `planning_days` to `schedule()`; (2) give `simulate()`
+  a `planning_days` parameter instead of reading the module global.
+
+**Lesson for this codebase:** per-run values must be *threaded as arguments*;
+any `def f(x=SOME_BC_CONFIG_CONST)` default is bound at import and silently wins
+when a caller passes a different horizon. Worth grepping for other instances.
+
+---
+
 ### Critical-path order & the one gate that matters
 
 `Phase 1 (seam) → Phase 2 (DB adapter) → Phase 3 (orchestrators) → Phase 4 (API)`.

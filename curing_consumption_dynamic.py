@@ -706,8 +706,14 @@ class DaySimulator:
         df_allowable: pd.DataFrame,
         ct_map: dict[str, float],
         co_events: list[dict],
+        planning_days: int = PLANNING_DAYS,
     ) -> list[pd.DataFrame]:
-        """Returns list of 31 DataFrames, one per day (index 0 = Day 1)."""
+        """Returns one DataFrame per planning day (index 0 = Day 1).
+
+        planning_days: horizon for THIS call (defaults to the module constant).
+        Must be honoured — reading the module global here silently used the
+        bc_config horizon whenever a caller passed a different one.
+        """
 
         demand_map   = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Quantity"]))
         priority_map = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Priority"]))
@@ -742,8 +748,8 @@ class DaySimulator:
 
         daily_sheets: list[pd.DataFrame] = []
 
-        for day in range(1, PLANNING_DAYS + 1):
-            horizon_left = PLANNING_DAYS - day + 1
+        for day in range(1, planning_days + 1):
+            horizon_left = planning_days - day + 1
 
             # Apply COs for this day (press count update effective from Shift C same day)
             for ev in co_by_day.get(day, []):
@@ -1533,6 +1539,7 @@ def run_dynamic_consumption(
     scheduler = COScheduler()
     co_events = scheduler.schedule(
         df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day,
+        planning_days=planning_days,
         buildable_rate=buildable_rate,
     )
 
@@ -1540,7 +1547,8 @@ def run_dynamic_consumption(
     print(f"\n  [Pass 2] Simulating {planning_days} days …")
     simulator = DaySimulator()
     daily_sheets = simulator.simulate(
-        df_day0, df_demand, df_allowable, ct_map, co_events
+        df_day0, df_demand, df_allowable, ct_map, co_events,
+        planning_days=planning_days,
     )
 
     # Print day-by-day summary

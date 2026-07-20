@@ -82,10 +82,40 @@ def _apply_run_cfg(run_cfg: dict) -> None:
     curing_consumption.ConsumptionConfig.PRESS_EFFICIENCY = float(run_cfg["press_efficiency"])
 
 
+def _set_running_moulds_table(name: str) -> None:
+    """Point the Day-0 running-moulds table for this run.
+
+    RUNNING_MOULDS_TABLE is imported by value into several engine modules, so it
+    must be set on each. Production leaves this at the pinned Daily_Running_Moulds;
+    the override exists for month-specific snapshots (e.g. parity testing).
+    """
+    setattr(_bc, "RUNNING_MOULDS_TABLE", name)
+    for _m in (b2c_pipeline, curing_consumption):
+        if hasattr(_m, "RUNNING_MOULDS_TABLE"):
+            setattr(_m, "RUNNING_MOULDS_TABLE", name)
+    try:
+        import curing_b2c as _cb2c
+        setattr(_cb2c, "RUNNING_MOULDS_TABLE", name)
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        import curing_consumption_dynamic as _ccd
+        if hasattr(_ccd, "RUNNING_MOULDS_TABLE"):
+            setattr(_ccd, "RUNNING_MOULDS_TABLE", name)
+    except Exception:  # pragma: no cover
+        pass
+
+
 def run_plan(plan_id: str, created_by: str = "scheduler",
-             keep_files: bool = False) -> dict:
-    """Execute one scheduler run for plan_id and populate the output tables."""
+             keep_files: bool = False,
+             running_moulds_table: str | None = None) -> dict:
+    """Execute one scheduler run for plan_id and populate the output tables.
+
+    running_moulds_table overrides the Day-0 snapshot for this run (default =
+    the pinned cloud table). Used for month-specific parity testing.
+    """
     engine = conn.get_engine()
+    _set_running_moulds_table(running_moulds_table or _bc.RUNNING_MOULDS_TABLE)
 
     # ── read inputs from the 3 input tables ───────────────────────────────
     demand_df, run_cfg, sku_desc = conn.read_db(engine, plan_id)
@@ -131,10 +161,13 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         "status": "done",
         "rows_written": counts,
         "kpi": {
-            "gt_built":   round(result["total_built"]),
-            "gt_cured":   round(result["total_cured"]),
-            "coverage":   round(result["demand_coverage"], 1),
-            "curing_cos": result["n_co"],
+            "gt_built":     round(result["total_built"]),
+            "gt_cured":     round(result["total_cured"]),
+            "coverage":     round(result["demand_coverage"], 2),
+            "curing_cos":   result["n_co"],
+            "mould_cleans": result["n_mould_cleans"],
+            "gt_writeoff":  round(result["gt_writeoff"]),
+            "starvation":   result["starvation_events"],
         },
     }
     return summary
