@@ -29,8 +29,8 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 6, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 30                                # number of days in plan horizon
+PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. INPUT FILES
@@ -39,7 +39,7 @@ PLANNING_DAYS = 30                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "june_production_data.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
@@ -51,7 +51,7 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "june_production_data.xlsx")
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "testing_Daily_Running_Moulds"
+RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py

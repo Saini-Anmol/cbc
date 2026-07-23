@@ -251,7 +251,7 @@ _MOULD_CLEAN_ENABLED = True
 # per-press 3,000 for v1 (real per-mould life is v2).
 # Default ON — this makes the plan physically real (a moderate KPI drop is the new
 # baseline). MOULD_GATE=0 reproduces the current mould-blind engine bit-for-bit.
-_MOULD_GATE_ENABLED = os.environ.get("MOULD_GATE", "1") != "0"
+_MOULD_GATE_ENABLED = True
 
 # Phase 2 mould optimisation (raise the Phase-1 contention baseline). Only meaningful
 # when the gate is ON. Two levers, both toggle-gated by MOULD_OPT:
@@ -262,7 +262,7 @@ _MOULD_GATE_ENABLED = os.environ.get("MOULD_GATE", "1") != "0"
 #       its (usually demand-done) old SKU; it retargets to the most-needy eligible SKU
 #       that still HAS 2 free moulds, recovering the wasted CO slot.
 # MOULD_OPT=0 → pure Phase-1 gate (scheduling identical to the locked mould baseline).
-_MOULD_OPT_ENABLED = os.environ.get("MOULD_OPT", "1") != "0"
+_MOULD_OPT_ENABLED = True
 
 # Phase 3 — Unified CO scorer. Replaces the three ad-hoc changeover paths (static
 # planned COs, per-press retarget-on-block, mid-shift dynamic CO) with ONE scoring
@@ -271,7 +271,7 @@ _MOULD_OPT_ENABLED = os.environ.get("MOULD_OPT", "1") != "0"
 # resources (mould pool + a quantitative building-feed estimate + daily CO cap).
 # Default ON — measured ≥ Phase-2 on all 3 months (May +3,780, June +2,261, July +2,987;
 # all exact-mould-audit PASS, deterministic, demand cap holds). CO_SCORER=0 → Phase-2 path.
-_CO_SCORER_ENABLED = os.environ.get("CO_SCORER", "1") != "0"
+_CO_SCORER_ENABLED = True
 # Sub-flag (measured rollout): False = ADDITIVE (planned COs always kept; scorer only
 # fills idle presses + pulls forward tomorrow's planned COs) — the shipped mode.
 # True = FULL RE-OPT (planned COs may be cancelled/replaced) — MEASURED WORSE (utility
@@ -2286,6 +2286,7 @@ def _write_rolling_curing_excel(
     plan_start: datetime,
     df_day0: "pd.DataFrame | None" = None,  # Day 0 consumption (has Priority_Score, Category)
     mould_life: "dict | None" = None,       # {press: remaining mould life (cycles) at horizon end}
+    mould_info: "dict | None" = None,       # end-of-plan mould state for the Mould Tracker sheet
 ) -> None:
     """
     Write curing Excel matching the legacy bc_curing_b2c output.
@@ -2478,14 +2479,98 @@ def _write_rolling_curing_excel(
     ws.column_dimensions["E"].width = 32; ws.column_dimensions["F"].width = 32
     ws.freeze_panes = "A2"
 
-    # ── Sheet 4: Mould Tracker (placeholder) ─────────────────────────────────
+    # ── Sheet 4: Mould Tracker ────────────────────────────────────────────────
+    # End-of-plan mould state per curing press: which 2 moulds are mounted, whether
+    # they are eligible for the SKU the press ends on (feasibility proof), and how
+    # over-subscribed that SKU's mould pool is (contention — explains unmet demand).
     ws = wb.create_sheet("Mould Tracker")
-    mt_cols = ["MouldNo", "Compatible_SKUs", "Life_Remaining", "Assigned_Machine"]
-    _hdr(ws, 1, mt_cols)
-    ws.cell(row=2, column=1,
-            value="Mould tracking not available in rolling pipeline — check curing_b2c output"
-            ).font = Font(italic=True, color="888888")
-    ws.column_dimensions["A"].width = 20; ws.column_dimensions["B"].width = 44
+    if not mould_info:
+        _hdr(ws, 1, ["MouldNo", "Compatible_SKUs", "Life_Remaining", "Assigned_Machine"])
+        ws.cell(row=2, column=1,
+                value="Mould gate OFF — no mould state to report (run with MOULD_GATE=1)"
+                ).font = Font(italic=True, color="888888")
+        ws.column_dimensions["A"].width = 20; ws.column_dimensions["B"].width = 44
+    else:
+        _pm  = mould_info.get("press_moulds", {})
+        _fs  = mould_info.get("final_sku", {})
+        _msk = mould_info.get("mould_skus", {})
+        _sm  = mould_info.get("sku_moulds", {})
+        _pc  = mould_info.get("press_count", {})
+        _sc  = mould_info.get("scorer") or {}
+        _ev  = mould_info.get("events", []) or []
+        _asg = mould_info.get("assignments", []) or []
+        # swaps per press (for the header "never swapped" count)
+        _swaps: dict = defaultdict(int)
+        for _e in _ev:
+            _swaps[_e["press"]] += 1
+        # summary header — CO provenance + contention + movement totals for the client
+        _n_moulds = sum(len(v) for v in _pm.values())
+        _n_shared = sum(1 for m, s in _msk.items() if len(s) > 1)
+        _n_fixed  = sum(1 for _p in _pm if _swaps.get(_p, 0) == 0)
+        ws.cell(row=1, column=1, value=(
+            f"Moulds mounted: {_n_moulds}  |  Shared moulds (serve >1 SKU): {_n_shared}  |  "
+            f"Total mould swaps this month: {len(_ev)}  |  "
+            f"Presses that never swapped: {_n_fixed}/{len(_pm)}  |  "
+            f"Day-0 2nd-mould top-ups: {mould_info.get('day0_topups', 0)}  |  "
+            f"Mould-blocked COs: {mould_info.get('blocked', 0)}  |  "
+            f"Retargeted: {mould_info.get('retargeted', 0)}"
+            + (f"  |  Pulled-forward: {_sc.get('pullfwd', 0)}  |  "
+               f"Idle-fill/dynamic: {_sc.get('dynamic', 0)}" if _sc else "")
+        )).font = _bold(10)
+        # EXPANDED: one row per (press, mould) building a SKU — Day-0 opening plus
+        # every changeover mount. So a press that runs one SKU all month = 2 rows
+        # (its 2 moulds); a press that swaps N times = 2 × (N+1) rows. Total >> 167.
+        mt_cols = ["Press", "Mould", "SKU_Built", "Day_Mounted", "Mould_Eligible_For_SKU",
+                   "Shared_Mould", "SKU_Eligible_Mould_Pool", "Presses_On_SKU",
+                   "SKU_Tooling_Pressure"]
+        _hdr(ws, 2, mt_cols)
+        _rows = []
+        for _a in _asg:
+            _p   = _a["press"]; _sku = _a["sku"]; _day = _a["day"]
+            _pool = len(_sm.get(_sku, set()))
+            _npr  = int(_pc.get(_sku, 0))
+            _tp   = round((_npr * 2) / _pool, 2) if _pool else ""
+            for _m in _a.get("moulds", []):
+                _elig   = "Yes" if _sku in _msk.get(_m, set()) else "No"
+                _shared = "Yes" if len(_msk.get(_m, set())) > 1 else "No"
+                _rows.append([_p, _m, _sku, _day, _elig, _shared, _pool, _npr, _tp])
+        _rows.sort(key=lambda r: (str(r[0]), int(r[3]), str(r[1])))   # press, day, mould
+        for _ri, _r in enumerate(_rows, 3):
+            for _ci, _v in enumerate(_r, 1):
+                _cell = ws.cell(row=_ri, column=_ci, value=_v)
+                _cell.alignment = _ctr()
+                if _ci == 5 and _v == "No":       # mould not eligible for the SKU — flag red
+                    _cell.font = _bold(10, "CC0000")
+        ws.cell(row=1, column=1).value = ws.cell(row=1, column=1).value + \
+            f"  |  Rows (press×mould×SKU-run): {len(_rows)}"
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 40
+        ws.column_dimensions["C"].width = 30
+        for _ltr in ("D", "E", "F", "G", "H", "I"):
+            ws.column_dimensions[_ltr].width = 16
+        ws.freeze_panes = "A3"
+
+        # ── Sheet 4b: Mould Movement (one row per swap — the actual "tracker") ────
+        ws2 = wb.create_sheet("Mould Movement")
+        ws2.cell(row=1, column=1, value=(
+            f"Every mould change during the month ({len(_ev)} swaps). A press keeps its "
+            f"moulds until it changes over to an SKU those moulds cannot cure, then swaps."
+        )).font = _bold(10)
+        mv_cols = ["Day", "Press", "New_SKU", "Moulds_Mounted", "Moulds_Removed"]
+        _hdr(ws2, 2, mv_cols)
+        for _ri, _e in enumerate(
+                sorted(_ev, key=lambda e: (e["day"], str(e["press"]))), 3):
+            for _ci, _v in enumerate([
+                    _e["day"], _e["press"], _e["sku"],
+                    ", ".join(_e.get("added", [])),
+                    ", ".join(_e.get("removed", []))], 1):
+                ws2.cell(row=_ri, column=_ci, value=_v).alignment = _ctr()
+        ws2.column_dimensions["A"].width = 8
+        ws2.column_dimensions["B"].width = 12
+        ws2.column_dimensions["C"].width = 30
+        ws2.column_dimensions["D"].width = 40
+        ws2.column_dimensions["E"].width = 40
+        ws2.freeze_panes = "A3"
 
     # ── Sheet 5: Machine Schedule ─────────────────────────────────────────────
     ws = wb.create_sheet("Machine Schedule")
@@ -2779,6 +2864,10 @@ def run_rolling_pipeline(
     _mould_owner: dict[str, str] = {}
     _press_moulds: dict[str, set] = {}
     mould_blocked_cos = 0
+    mould_day0_topups = 0                        # Day-0 single-mould presses given a 2nd mould
+    # Full (press, SKU, 2-moulds) timeline — Day-0 opening + every changeover mount.
+    # Expanded in the Mould Tracker sheet to one row per (press, mould) building a SKU.
+    mould_assignments: list = []
     _mould_selfcheck = [0]                      # debug: count RUNNING-without-2-moulds
     _mould_gate = _MOULD_GATE_ENABLED          # local (may disable on load failure)
     _mould_opt  = _MOULD_OPT_ENABLED           # Phase-2 optimisation (needs the gate)
@@ -2826,9 +2915,19 @@ def run_rolling_pipeline(
                 _mould_owner[_m] = _p
                 _press_moulds.setdefault(_p, set()).add(_m)
                 _topped += 1
+        mould_day0_topups = _topped
         if _topped:
             print(f"  [Rolling] Day-0 second-mould top-up: {_topped} moulds "
                   f"assigned to single-mould presses")
+
+        # Record each press's Day-0 opening (press, SKU, 2 moulds) so the expanded
+        # tracker timeline starts from the floor state before any changeover.
+        for _, r in df_moulds.iterrows():
+            _p = str(r["Machine"]); _sku0 = str(r["SKUCode"])
+            mould_assignments.append({
+                "day": 1, "press": _p, "sku": _sku0,
+                "moulds": sorted(_press_moulds.get(_p, set())),
+            })
 
     # Old moulds whose release is deferred to end-of-day: a planned CO placed in
     # shift B/C keeps running its OLD sku (needs its old moulds) until the CO fires,
@@ -2836,6 +2935,13 @@ def run_rolling_pipeline(
     # freeing them at day-start let another press grab them and made the OLD sku's
     # pre-CO production physically mould-less. {press: set(old moulds to free)}.
     _deferred_free: dict[str, set] = {}
+
+    # Mould-movement log: every time a press mounts a DIFFERENT mould (a genuine swap
+    # on a changeover), record it so the output can show moulds moving over the month
+    # (the tracker sheet's end-state snapshot alone hides this). {day, press, sku,
+    # added, removed}. _cur_day is set at the top of each day loop iteration.
+    mould_events: list = []
+    _cur_day = [0]
 
     def _try_mount(press: str, new_sku: str, defer_free: bool = False) -> bool:
         """Allocate 2 eligible moulds for `new_sku` on `press`, or return False.
@@ -2871,6 +2977,20 @@ def run_rolling_pipeline(
             _press_moulds[press] = set(chosen)
         for m in chosen:
             _mould_owner[m] = press
+        # Full assignment: this press now builds `new_sku` on these 2 moulds.
+        mould_assignments.append({
+            "day": _cur_day[0], "press": press, "sku": new_sku,
+            "moulds": list(chosen),
+        })
+        _added = [m for m in chosen if m not in own]
+        if _added:                                  # a genuine mould swap (not pure reuse)
+            mould_events.append({
+                "day":     _cur_day[0],
+                "press":   press,
+                "sku":     new_sku,
+                "added":   _added,
+                "removed": list(old_extra),
+            })
         return True
 
     def _n_free_for(new_sku: str, press: str) -> int:
@@ -3387,6 +3507,7 @@ def run_rolling_pipeline(
     print("=" * 70)
 
     for day in range(1, planning_days + 1):
+        _cur_day[0] = day                          # for the mould-movement log in _try_mount
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
         if _ROLLING_HORIZON_CO_ENABLED:
@@ -4313,6 +4434,19 @@ def run_rolling_pipeline(
         plan_start        = plan_start,
         df_day0           = df_day0,
         mould_life        = dict(mould_life),
+        mould_info        = ({
+            "press_moulds":  {p: sorted(ms) for p, ms in _press_moulds.items()},
+            "final_sku":     {p: st["sku"] for p, st in press_state.items()},
+            "mould_skus":    {m: set(s) for m, s in _mould_skus.items()},
+            "sku_moulds":    {s: set(m) for s, m in _sku_moulds.items()},
+            "press_count":   dict(press_count),
+            "blocked":       mould_blocked_cos,
+            "retargeted":    mould_retargeted_cos,
+            "day0_topups":   mould_day0_topups,
+            "scorer":        (co_scorer_stats if _CO_SCORER_ENABLED else None),
+            "events":        mould_events,          # per-swap movement log (day, press, sku, added, removed)
+            "assignments":   mould_assignments,     # full (press, sku, 2-moulds) timeline incl Day-0
+        } if _mould_gate else None),
     )
 
     return {
