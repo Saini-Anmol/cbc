@@ -233,6 +233,32 @@ class ConsumptionETL:
         return (grouped[["Machine", "SKUCode", "MouldNos", "MouldLife_remaining", "Num_Moulds"]]
                 .sort_values("Machine").reset_index(drop=True))
 
+    def load_mould_eligibility(self) -> dict:
+        """Mould→SKU mapping from Master_Mapping_Mould_SKU.
+
+        Returns {"sku_moulds": {SKUCode: set(mould_id)},
+                 "mould_skus": {mould_id: set(SKUCode)}}.
+        A press needs 2 eligible moulds to run an SKU; a mould can serve several
+        SKUs (sharing). NOTE the real column is `Mould` (not `MouldNo`) and the
+        active flag is 1 (not "X") — the old curing_b2c._load_mould_tracker used
+        both wrong names and silently returned nothing.
+        """
+        df = self._sql(
+            f"SELECT `Mould` AS mould, `Matl.Code` AS sku "
+            f"FROM {self.db}.Master_Mapping_Mould_SKU "
+            f"WHERE `Active Flag` = 1"
+        )
+        df["mould"] = df["mould"].astype(str).str.strip()
+        df["sku"]   = df["sku"].astype(str).str.strip()
+        sku_moulds: dict[str, set] = {}
+        mould_skus: dict[str, set] = {}
+        for m, s in zip(df["mould"], df["sku"]):
+            if not m or not s or m.lower() == "nan" or s.lower() == "nan":
+                continue
+            sku_moulds.setdefault(s, set()).add(m)
+            mould_skus.setdefault(m, set()).add(s)
+        return {"sku_moulds": sku_moulds, "mould_skus": mould_skus}
+
     def load_curing_allowable(self) -> pd.DataFrame:
         """Load SKU → eligible curing presses. Returns [SKUCode, Machines (list of str)]."""
         df = self._sql(

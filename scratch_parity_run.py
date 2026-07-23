@@ -5,9 +5,11 @@ import sys, json, os, tempfile
 from datetime import datetime
 
 MONTHS = {
-    "may":  ("demand_may.xlsx",                      (2026, 5, 1), 31, "Daily_Running_Moulds"),
-    "june": ("june_production_data.xlsx",  (2026, 6, 1), 30, "testing_Daily_Running_Moulds"),
-    "july": ("july_demand_tomerJi1.xlsx",            (2026, 7, 1), 31, "june_Daily_Running_Moulds"),
+    # RUNNING MOULDS IS ALWAYS Daily_Running_Moulds (the live Day-0 snapshot) for
+    # every month — the historical testing_/june_ variants are retired.
+    "may":  ("demand_may.xlsx",           (2026, 5, 1), 31, "Daily_Running_Moulds"),
+    "june": ("june_production_data.xlsx", (2026, 6, 1), 30, "Daily_Running_Moulds"),
+    "july": ("july_demand_tomerJi1.xlsx", (2026, 7, 1), 31, "Daily_Running_Moulds"),
 }
 mode, month = sys.argv[1], sys.argv[2]
 fname, (Y, M, D), days, rmt = MONTHS[month]
@@ -36,9 +38,11 @@ if mode == "local":
     import b2c_pipeline
     from b2c_pipeline import run_rolling_pipeline
     wd = tempfile.mkdtemp()
+    _cout = os.environ.get("CURE_OUT", os.path.join(wd, "c.xlsx"))
+    _bout = os.environ.get("BLD_OUT", os.path.join(wd, "b.xlsx"))
     res = run_rolling_pipeline(
         demand_path=bc.DEMAND_FILE, plan_start=bc.PLAN_START, planning_days=days,
-        build_output=os.path.join(wd, "b.xlsx"), curing_output=os.path.join(wd, "c.xlsx"),
+        build_output=_bout, curing_output=_cout,
     )
     emit(res)
 

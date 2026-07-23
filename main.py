@@ -39,7 +39,7 @@ CLOUD_CONFIG: dict = {
     # ── Day-0 curing press state — MUST stay the live snapshot on cloud ──
     "RUNNING_MOULDS_TABLE":                   "Daily_Running_Moulds",
     # ── GT storage / shelf life ─────────────────────────────────────────
-    "MAX_ENDOFDAY_GT_INVENTORY":              8000,
+    "MAX_ENDOFDAY_GT_INVENTORY":              7000,
     "GT_SHELF_LIFE_DAYS":                     3,
     "TOPUP_LOOKAHEAD_DAYS_GT":                3,
     "CARCASS_SHELF_LIFE_DAYS":                1,

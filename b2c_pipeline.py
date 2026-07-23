@@ -65,6 +65,7 @@ from bc_config import (
     CURING_CO_CHANGEOVER_MINS,
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
+    MIN_CAMPAIGN_UNITS,
     BUILD_LEAD_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
     GT_BUFFER_SHIFTS,
@@ -242,6 +243,27 @@ GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
 # pre-mould-clean 690,180 baseline reproduces bit-for-bit.
 _MOULD_CLEAN_ENABLED = True
 
+# ── MOULD→SKU AVAILABILITY GATE (client hard rule) ────────────────────────────
+# A press can only run/CO to an SKU if it physically has 2 eligible moulds mounted
+# (Master_Mapping_Mould_SKU). Inventory = 1,284 physical moulds, one copy each; a
+# mould serves one press at a time (contention). Mounting a spare is free; mould
+# movement rides the existing 480-min press CO (no extra time). Mould life stays
+# per-press 3,000 for v1 (real per-mould life is v2).
+# Default ON — this makes the plan physically real (a moderate KPI drop is the new
+# baseline). MOULD_GATE=0 reproduces the current mould-blind engine bit-for-bit.
+_MOULD_GATE_ENABLED = os.environ.get("MOULD_GATE", "1") != "0"
+
+# Phase 2 mould optimisation (raise the Phase-1 contention baseline). Only meaningful
+# when the gate is ON. Two levers, both toggle-gated by MOULD_OPT:
+#   (a) scarce-first ordering — when several presses CO the same day, allocate moulds
+#       to the SCARCEST new-SKU first (fewest eligible moulds), so a 2-mould SKU is
+#       not blocked by a 6-mould SKU grabbing a shared mould first.
+#   (b) retarget-on-block — a planned CO whose mould claim fails does NOT just idle on
+#       its (usually demand-done) old SKU; it retargets to the most-needy eligible SKU
+#       that still HAS 2 free moulds, recovering the wasted CO slot.
+# MOULD_OPT=0 → pure Phase-1 gate (scheduling identical to the locked mould baseline).
+_MOULD_OPT_ENABLED = os.environ.get("MOULD_OPT", "1") != "0"
+
 # BUSINESS RULE: spread planned curing COs across shifts A/B/C.
 # Planned COs were hardcoded to Shift A (all 147), so 97% of changeover downtime
 # landed in Shift A and its curing output sat ~6.6k below Shift B — an artifact, not
@@ -400,6 +422,44 @@ _INCH_FLEX_INCLUDE_UNI_NARROW = False   # add 7501-7503 (trust DB allowable)
 # the expensive diff-inch CO). Tested both ways — see plan verification.
 _INCH_FLEX_OFFINCH_ORDER      = "starving_first"
 _INCH_FLEX_EXTRA_COS          = 2   # extra building-CO budget for flex machines (off-inch excursions)
+
+# ── CLIENT INCH RULES (hard plant rules on building inch movement) ────────────
+# Rule 1 — one-way inch movement. A machine may take a diff_size_CO only when the
+#          demand it can still serve at its CURRENT inch is finished, and it may
+#          NEVER return to an inch it has already left (14->15->14 illegal;
+#          14->15->13 legal, 13 was never used).
+# Rule 2 — +/-2 band. The machine's inch must stay within anchor +/- 2 for the
+#          whole month (anchor 14" => 12".."16"; 14"->17" illegal).
+#
+# Anchor = the inch of the machine's FIRST assignment. There is no Day-0 building
+# state to anchor on (machine_current_sku starts empty; TBMStage1/2_ProductionEventData
+# are both empty), so the first SKU the scheduler assigns fixes the band.
+#
+# These are RESTRICTIONS: they cut expensive diff-size COs (freeing production
+# minutes) but remove flexibility (some SKUs become unreachable). Net KPI effect
+# is measured, not assumed. OFF reproduces the previous behaviour bit-for-bit.
+# DEFAULT OFF — the inch rules are a SEPARATE, parked, not-yet-approved plan. They
+# must not be live for the mould baseline (they dropped July ~90%→79%). Turn on
+# explicitly with INCH_RULES=1 only when working the inch plan.
+_INCH_RULES_ENABLED      = os.environ.get("INCH_RULES", "0") != "0"
+_INCH_BAND_WIDTH         = int(os.environ.get("INCH_BAND", "2"))   # Rule 2: anchor +/- N
+# Variant A (True): the +/-2 band REPLACES the _HARD dominant-inch locks.
+# Variant B (False): keep _HARD as well, so the machine is bound by the
+# intersection (most restrictive). Chosen by measurement — see plan.
+_INCH_BAND_REPLACES_HARD = os.environ.get("INCH_BAND_REPLACES_HARD", "1") != "0"
+# Keep the opportunistic forward buffer (Phase C) on the machine's CURRENT inch:
+# under one-way movement an inch change is irreversible, so it should be spent on
+# real demand (Phase B), not on speculative pre-building.
+_INCH_RULES_PHASE_C_SAME_INCH = os.environ.get("INCH_PHASEC_SAME", "1") != "0"
+# Rule 1a (never re-use an inch the machine has left) as its own sub-toggle, so
+# the cost of the one-way rule can be measured separately from the +/-2 band.
+_INCH_NO_REVISIT = os.environ.get("INCH_NO_REVISIT", "1") != "0"
+# Treat a sub-campaign leftover deficit as "inch finished" so the machine may
+# leave. DEFAULT OFF — measured on all 3 months and it made every one WORSE
+# (May -13,197 / June -8,550 / July -28,304). Under one-way movement an easier
+# exit burns the machine's limited inches sooner. Kept as a toggle to document
+# the experiment; do not enable without re-measuring.
+_INCH_GATE_CAMPAIGN_THRESHOLD = os.environ.get("INCH_GATE_THRESH", "0") != "0"
 
 # Machine groups for the flex brute-force (plant multi-inch ranking: VMI 4.6 >
 # BJ 2.4 ~ UNI 2.3 > IRM 1.5 inches/machine).
@@ -596,6 +656,76 @@ def _co_cost(machine: str, from_inch: str, to_inch: str) -> int:
     if from_inch == to_inch:
         return BUILDING_CO_SAME_SIZE.get(mg, 60)
     return BUILDING_CO_DIFF_SIZE.get(mg, 120)
+
+
+def _inch_num(inch: str):
+    """Inch string -> int, or None when it isn't a usable number."""
+    try:
+        return int(str(inch).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _inch_ok(to_inch: str, cur_inch: str, anchor: str, used: set) -> bool:
+    """Client inch rules — Rule 2 (+/-2 band) and Rule 1a (never revisit an inch).
+
+    anchor == "" means the machine has not been assigned yet, so its first
+    assignment is unconstrained (that assignment sets the anchor).
+    Staying on the current inch is always allowed.
+    """
+    if not _INCH_RULES_ENABLED:
+        return True
+    if to_inch == cur_inch:
+        return True
+
+    # Rule 2 — must stay within anchor +/- _INCH_BAND_WIDTH.
+    a, t = _inch_num(anchor), _inch_num(to_inch)
+    if a is not None and t is not None and abs(t - a) > _INCH_BAND_WIDTH:
+        return False
+
+    # Rule 1a — an inch the machine has already left can never be re-used.
+    if _INCH_NO_REVISIT and to_inch in (used or ()):
+        return False
+    return True
+
+
+def _inch_demand_done(machine: str, cur_inch: str, machine_skus: dict,
+                      sku_inch: dict, deficit_fn, buf, rate: float = 0.0) -> bool:
+    """Rule 1b — may this machine leave `cur_inch` for a different inch?
+
+    True when no SKU at the machine's current inch still has a deficit it could
+    usefully serve. (Per the client clarification this is "no unmet demand it can
+    serve now", NOT "all demand at that inch globally exhausted".)
+
+    IMPORTANT — the deficit must be big enough to form a LEGAL campaign. A
+    machine needs >= MIN_CAMPAIGN_MINS of work to build anything, so a tiny
+    residual deficit (say 10 units) would otherwise pin the machine forever:
+    too small to build, too big to leave. That trap was the single largest
+    source of idle time under the one-way rule, so a sub-campaign remainder
+    counts as "inch finished".
+    """
+    if not _INCH_RULES_ENABLED or not cur_inch:
+        return True
+    # Threshold below which a leftover deficit is treated as "inch finished".
+    # MEASURED RESULT: raising this to a full campaign made every month WORSE
+    # (May -13,197 / June -8,550 / July -28,304). Under one-way movement leaving
+    # is PERMANENT, so an easier exit just burns the machine's inches sooner and
+    # it runs out of legal work. Reluctance to leave is protective here — keep
+    # the strict "any deficit blocks departure" default (threshold = 0).
+    min_units = 0.0
+    if _INCH_GATE_CAMPAIGN_THRESHOLD:
+        min_units = (max(MIN_CAMPAIGN_UNITS, MIN_CAMPAIGN_MINS * rate)
+                     if rate > 0 else MIN_CAMPAIGN_UNITS)
+    for s in machine_skus.get(machine, ()) or ():
+        if sku_inch.get(s, "") != cur_inch:
+            continue
+        try:
+            d = deficit_fn(s, buf)
+        except TypeError:          # deficit closures that take only the SKU
+            d = deficit_fn(s)
+        if d > min_units:
+            return False
+    return True
 
 
 def _select_dynamic_co_target(
@@ -1050,6 +1180,8 @@ def _assign_building_shift(
     days_left:              int = 31,
     demand_dict:            dict | None = None,
     machine_total_demand:   dict | None = None,
+    machine_anchor_inch:    dict | None = None,
+    machine_used_inches:    dict | None = None,
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -1065,6 +1197,16 @@ def _assign_building_shift(
     Returns: {machine: [(sku, qty_int, co_type_str)]}
       co_type: "start" | "same_size_CO" | "diff_size_CO"
     """
+    # Client inch-rule state (persisted across shifts by run_rolling_pipeline).
+    machine_anchor_inch = machine_anchor_inch if machine_anchor_inch is not None else {}
+    machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
+
+    def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
+        """Rules 1a + 2 for a candidate (machine, to_inch)."""
+        return _inch_ok(to_inch, cur_inch,
+                        machine_anchor_inch.get(m, ""),
+                        machine_used_inches.get(m, set()))
+
     def _max_cos(mach: str) -> int:
         # Flex machines get extra CO budget so they can take an off-inch
         # excursion AFTER exhausting same-inch work (which uses the normal 2).
@@ -1193,8 +1335,18 @@ def _assign_building_shift(
                     if d <= 0:
                         continue
                     to_inch = sku_inch.get(sku, "")
+                    # ── Client inch rules (Rule 1a no-revisit + Rule 2 band) ──
+                    if not _inch_gate(m, to_inch, cur_inch):
+                        continue
+                    # ── Rule 1b: leave the current inch only when nothing at that
+                    #    inch still needs this machine right now ──
+                    if (_INCH_RULES_ENABLED and to_inch != cur_inch
+                            and not _inch_demand_done(m, cur_inch, machine_skus,
+                                                      sku_inch, _defc, buf, rate)):
+                        continue
                     if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
-                            and to_inch != dom and not s["primary_done"]):
+                            and to_inch != dom and not s["primary_done"]
+                            and not _INCH_RULES_ENABLED):
                         continue
                     cost = _co_cost(m, cur_inch, to_inch)
                     if s["remaining"] - cost < MIN_CAMPAIGN_MINS:
@@ -1203,6 +1355,11 @@ def _assign_building_shift(
                                  and demand_remaining.get(sku, 0.0) > 0)
                     _flex_off_ok = (m in _INCH_FLEX_MACHINES and to_inch != dom
                                     and s["primary_done"])
+                    # With the client inch rules a diff-inch move has already passed
+                    # the Rule-1b gate (nothing left to serve at the current inch), so
+                    # the 30% cost guard must not block it — the machine would idle.
+                    if _INCH_RULES_ENABLED and to_inch != cur_inch:
+                        _flex_off_ok = True
                     if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok:
                         continue
                     avail = s["remaining"] - cost
@@ -1211,7 +1368,11 @@ def _assign_building_shift(
                     if mins < MIN_CAMPAIGN_MINS or qty <= 0:
                         continue
                     tier, primary = _tierg(sku, m, d)
-                    inch_penalty = 0 if to_inch == dom else 1
+                    # Prefer staying on the CURRENT inch (cheap same-size CO) once the
+                    # inch rules are live — "dominant inch" is superseded by the anchor
+                    # band, so the old dominant-inch preference no longer applies.
+                    inch_penalty = ((0 if to_inch == cur_inch else 1) if _INCH_RULES_ENABLED
+                                    else (0 if to_inch == dom else 1))
                     pairs.append((m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty))
                     flex_m[m] = flex_m.get(m, 0) + 1
                     flex_s[sku] = flex_s.get(sku, 0) + 1
@@ -1276,9 +1437,25 @@ def _assign_building_shift(
                         if need_co and s["co_count"] >= s["max_cos"]:
                             continue
                         to_inch = sku_inch.get(sku, "")
+                        # ── Client inch rules (same gates as Phase B) ──
+                        # Under one-way inch movement every inch change is a
+                        # ONE-TIME door. The forward buffer is opportunistic
+                        # pre-building, so letting it spend that door permanently
+                        # closes an inch the machine may need for real demand
+                        # later. Restrict Phase C to the machine's current inch.
+                        if (_INCH_RULES_ENABLED and _INCH_RULES_PHASE_C_SAME_INCH
+                                and to_inch != cur_inch):
+                            continue
+                        if not _inch_gate(m, to_inch, cur_inch):
+                            continue
+                        if (_INCH_RULES_ENABLED and to_inch != cur_inch
+                                and not _inch_demand_done(m, cur_inch, machine_skus,
+                                                          sku_inch, _defc, _buf_of(m), rate)):
+                            continue
                         # respect the flex/soft-lock off-dominant-inch gate (as Phase B)
                         if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
-                                and to_inch != dom and not s["primary_done"]):
+                                and to_inch != dom and not s["primary_done"]
+                                and not _INCH_RULES_ENABLED):
                             continue
                         target = min(dr, draw * GT_SHELF_LIFE_SHIFTS)
                         room = target - projected_gt.get(sku, 0.0)
@@ -1526,8 +1703,12 @@ def _assign_building_shift(
         # via Campaign 2+ (merged sort prefers dominant). This is the anti-
         # carry-over protection that lets us generalize the 7001/7003 soft-lock
         # to the high-demand VMIMAXX inches without the prior regression.
+        # Disabled under the client inch rules: forcing a return to the dominant
+        # inch IS a revisit, which Rule 1a forbids. (Expect the inch-flex gain to
+        # go with it — that is the cost of one-way inch movement.)
         _flex_reclaim = (
-            machine in _INCH_FLEX_MACHINES
+            not _INCH_RULES_ENABLED
+            and machine in _INCH_FLEX_MACHINES
             and cur_inch != dom_inch
             and any(sku_inch.get(s, "") == dom_inch and _deficit(s) > 0 for s in eligible)
         )
@@ -2523,6 +2704,14 @@ def run_rolling_pipeline(
             # 7501 dominant=12" but can also run 13" (confirmed allowable)
             "7501":{"12","13"},  "7502":{"13"},        "7503":{"13"},
         }
+        # Client inch rules, variant A: the +/-2 anchor band REPLACES the
+        # dominant-inch hard locks, so every machine starts from its full DB
+        # allowable and is bound only by anchor+/-2 and the no-revisit rule.
+        # Variant B (_INCH_BAND_REPLACES_HARD=False) keeps _HARD as well, so the
+        # machine is bound by the INTERSECTION (most restrictive) — this also
+        # preserves the UNI_NARROW 12"/13" physical limit.
+        if _INCH_RULES_ENABLED and _INCH_BAND_REPLACES_HARD:
+            _HARD = {}
         # Inch-flexibility: drop flex machines from _HARD so their full DB
         # allowable (all eligible inches) passes through — off-inch access is
         # then gated at Campaign-2+ (primary_demand_done) + reclamation guard.
@@ -2565,6 +2754,161 @@ def run_rolling_pipeline(
     press_count: dict[str, int] = defaultdict(int)
     for st in press_state.values():
         press_count[st["sku"]] += 1
+
+    # ── C2: Mould pool (client mould-availability gate) ───────────────────────
+    # sku_moulds[sku] = eligible mould IDs; mould_owner[mould] = press it's mounted
+    # on (None = free in storage). Day-0 mounting comes from the running-moulds
+    # MouldNos list (2 moulds per press). A press CO/run is feasible only if 2
+    # eligible moulds are free (or already on this press). See _MOULD_GATE_ENABLED.
+    _sku_moulds: dict[str, set] = {}
+    _mould_skus: dict[str, set] = {}
+    _mould_owner: dict[str, str] = {}
+    _press_moulds: dict[str, set] = {}
+    mould_blocked_cos = 0
+    _mould_selfcheck = [0]                      # debug: count RUNNING-without-2-moulds
+    _mould_gate = _MOULD_GATE_ENABLED          # local (may disable on load failure)
+    _mould_opt  = _MOULD_OPT_ENABLED           # Phase-2 optimisation (needs the gate)
+    mould_retargeted_cos = 0                    # planned COs saved by retarget-on-block
+    if _mould_gate:
+        try:
+            _elig = cetl.load_mould_eligibility()
+            _sku_moulds = {k: set(v) for k, v in _elig["sku_moulds"].items()}
+            _mould_skus = {k: set(v) for k, v in _elig["mould_skus"].items()}
+        except Exception as _e:
+            print(f"  [Rolling] mould eligibility load FAILED ({_e}); gate disabled")
+            _mould_gate = False
+    if _mould_gate:
+        # Seed Day-0 mounted moulds from the running-moulds MouldNos list.
+        for _, r in df_moulds.iterrows():
+            _p = str(r["Machine"]); _sku0 = str(r["SKUCode"])
+            _mn = r.get("MouldNos", []) or []
+            for _m in _mn:
+                _m = str(_m).strip()
+                if not _m or _m.lower() == "nan":
+                    continue
+                _mould_owner[_m] = _p
+                _press_moulds.setdefault(_p, set()).add(_m)
+                # Fold Day-0 orphan pairs into eligibility so the seed never
+                # self-violates (5 mounted moulds aren't listed for their SKU).
+                _sku_moulds.setdefault(_sku0, set()).add(_m)
+                _mould_skus.setdefault(_m, set()).add(_sku0)
+
+        # Day-0 second-mould top-up: a few presses list only 1 mould in
+        # Daily_Running_Moulds (e.g. 75214, 9404). A press physically has 2 cavities,
+        # so give each such press a 2nd COMPATIBLE FREE mould for its Day-0 SKU (the
+        # realistic floor state). Deterministic (sorted free pool). Runs AFTER all
+        # presses are seeded so the free pool is complete.
+        _topped = 0
+        for _, r in df_moulds.iterrows():
+            _p = str(r["Machine"]); _sku0 = str(r["SKUCode"])
+            _have = _press_moulds.get(_p, set())
+            if len(_have) >= 2:
+                continue
+            _elig0 = _sku_moulds.get(_sku0, set())
+            _free0 = sorted(m for m in _elig0 if _mould_owner.get(m) is None)
+            for _m in _free0:
+                if len(_press_moulds.get(_p, set())) >= 2:
+                    break
+                _mould_owner[_m] = _p
+                _press_moulds.setdefault(_p, set()).add(_m)
+                _topped += 1
+        if _topped:
+            print(f"  [Rolling] Day-0 second-mould top-up: {_topped} moulds "
+                  f"assigned to single-mould presses")
+
+    # Old moulds whose release is deferred to end-of-day: a planned CO placed in
+    # shift B/C keeps running its OLD sku (needs its old moulds) until the CO fires,
+    # so the old moulds must stay reserved to the press until the day completes —
+    # freeing them at day-start let another press grab them and made the OLD sku's
+    # pre-CO production physically mould-less. {press: set(old moulds to free)}.
+    _deferred_free: dict[str, set] = {}
+
+    def _try_mount(press: str, new_sku: str, defer_free: bool = False) -> bool:
+        """Allocate 2 eligible moulds for `new_sku` on `press`, or return False.
+
+        Prefers moulds already on this press (shared → no movement, leaves more free
+        moulds for others). `defer_free`=True (planned COs): keep the press's OLD
+        moulds reserved to it until end-of-day (they still serve the old SKU in
+        pre-CO shifts). `defer_free`=False (reactive mid-shift CO): free old moulds
+        immediately (the press is CHANGEOVER that shift, not producing).
+        """
+        if not _mould_gate:
+            return True
+        elig = _sku_moulds.get(new_sku, set())
+        if len(elig) < 2:
+            return False
+        own = _press_moulds.get(press, set())
+        # candidates: eligible moulds free OR already on this press. SORTED — set
+        # iteration order is hash-randomised → would break determinism.
+        reuse = sorted(m for m in own if m in elig)
+        free  = sorted(m for m in elig if _mould_owner.get(m) is None and m not in reuse)
+        chosen = (reuse + free)[:2]
+        if len(chosen) < 2:
+            return False
+        old_extra = [m for m in own if m not in chosen]
+        if defer_free:
+            # keep old moulds reserved to the press (still serving old sku); free
+            # them at end-of-day. The press temporarily "holds" old ∪ new.
+            _deferred_free.setdefault(press, set()).update(old_extra)
+            _press_moulds[press] = set(own) | set(chosen)
+        else:
+            for m in old_extra:
+                _mould_owner[m] = None
+            _press_moulds[press] = set(chosen)
+        for m in chosen:
+            _mould_owner[m] = press
+        return True
+
+    def _n_free_for(new_sku: str, press: str) -> int:
+        """How many eligible moulds could `press` mount for `new_sku` right now
+        (own moulds reusable for free + currently-free eligible moulds). ≥2 ⇒ a
+        _try_mount would succeed."""
+        elig = _sku_moulds.get(new_sku, set())
+        if len(elig) < 2:
+            return 0
+        own = _press_moulds.get(press, set())
+        reuse = sum(1 for m in own if m in elig)
+        free  = sum(1 for m in elig if _mould_owner.get(m) is None and m not in own)
+        return reuse + free
+
+    def _pick_retarget(press: str):
+        """Phase 2b: a planned CO whose new-SKU has no free moulds would idle the
+        press on its (usually demand-done) old SKU. Instead retarget it to the
+        NEEDIEST SKU the press is allowable for that still has 2 free moulds.
+        Returns the SKU or None. Deterministic (sorted candidate list, tuple key)."""
+        _cur = press_state.get(press, {}).get("sku")
+        best = None
+        best_key = None
+        for s in press_allow_skus.get(press, ()):     # pre-sorted list
+            if s == _cur:
+                continue
+            rem = demand_remaining.get(s, 0.0)
+            if rem <= 0:
+                continue
+            if _n_free_for(s, press) < 2:
+                continue
+            npr = max(1, press_count.get(s, 0))
+            key = (rem / npr, rem, s)                  # neediest per serving-press first
+            if best_key is None or key > best_key:
+                best_key = key
+                best = s
+        return best
+
+    def _release_deferred():
+        """Free the deferred old moulds at end-of-day (their CO has now completed).
+
+        `_olds` is exactly the set of old moulds NOT kept as current (computed as
+        old_extra in _try_mount), so free them unconditionally: drop from the
+        press's owned set AND release ownership so they return to the free pool.
+        """
+        for _p, _olds in _deferred_free.items():
+            _cur = _press_moulds.get(_p, set())
+            for _m in _olds:
+                if _mould_owner.get(_m) == _p:
+                    _mould_owner[_m] = None
+                _cur.discard(_m)
+            _press_moulds[_p] = _cur
+        _deferred_free.clear()
 
     # Curing allowable: {sku: [press_ids]} for demand fulfillment sheet
     curing_allowable: dict[str, list] = defaultdict(list)
@@ -2718,6 +3062,34 @@ def run_rolling_pipeline(
     # Guards against micro-campaigns across shift boundaries (< MIN_CAMPAIGN_MINS).
     machine_minutes_on_sku: dict[str, float] = {m: 0.0 for m in machine_skus}
 
+    # ── Client inch-rule state (persists across the whole horizon) ────────────
+    # machine_anchor_inch: the inch of the machine's FIRST assignment — fixes its
+    #   +/-_INCH_BAND_WIDTH band for the month (Rule 2).
+    # machine_used_inches: every inch the machine has run — an inch it has left
+    #   can never be re-used (Rule 1a).
+    machine_anchor_inch: dict[str, str] = {}
+    machine_used_inches: dict[str, set] = {}
+    # Stage-1 carcass machines are scheduled in Step 3b, not in
+    # _assign_building_shift, so they need their own current-inch tracker.
+    s1_current_inch: dict[str, str] = {}
+
+    # Anchor the +/-2 band to the machine's REAL Day-0 inch whenever the plant
+    # running state is known (machine_current_sku seeded above). Without this the
+    # anchor is whatever the Day-1 greedy happens to pick first, which then locks
+    # the machine for the whole month — the plant state is a far better anchor
+    # (e.g. the plant runs a 17" machine that the greedy abandoned entirely).
+    if _INCH_RULES_ENABLED and machine_current_sku:
+        for _m0, _sku0 in machine_current_sku.items():
+            _i0 = sku_inch.get(str(_sku0), "")
+            if not _i0:
+                continue
+            machine_anchor_inch.setdefault(str(_m0), _i0)
+            machine_used_inches.setdefault(str(_m0), set()).add(_i0)
+            if str(_m0) in _S1_MACHINES:
+                s1_current_inch.setdefault(str(_m0), _i0)
+        print(f"  [Rolling] Inch anchors seeded from Day-0 machine state: "
+              f"{len(machine_anchor_inch)} machines")
+
     # ══════════════════════════════════════════════════════════════════════════
     # Data accumulators (matching output sheet formats)
     # ══════════════════════════════════════════════════════════════════════════
@@ -2782,6 +3154,26 @@ def run_rolling_pipeline(
         print(f"  [Stage2Check] Legacy-only : {sorted(_legacy_set - _rolling_set)}")
         import sys; sys.exit(0)
 
+    # Phase 2b — press → allowable demand-SKUs (sorted), the retarget candidate
+    # universe. Built once, only when the optimisation is on (a DB read otherwise
+    # skipped). Restricted to demand SKUs so retarget never chases a zero-demand SKU.
+    press_allow_skus: dict[str, list] = {}
+    if _mould_gate and _mould_opt:
+        try:
+            _dfca = cetl.load_curing_allowable()
+            _dem_skus = set(demand_dict.keys())
+            _tmp: dict[str, set] = {}
+            for _, _row in _dfca.iterrows():
+                _sk = str(_row["SKUCode"]).strip()
+                if _sk in _dem_skus:
+                    for _mp in (_row.get("Machines", []) or []):
+                        _tmp.setdefault(str(_mp), set()).add(_sk)
+            press_allow_skus = {_p: sorted(_ss) for _p, _ss in _tmp.items()}
+        except Exception as _e:
+            print(f"  [Rolling] curing-allowable load for retarget FAILED ({_e}); "
+                  f"retarget disabled")
+            press_allow_skus = {}
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
@@ -2819,6 +3211,40 @@ def run_rolling_pipeline(
             sku_campaign_tier = {}
         else:
             today_cos = co_by_day.get(day, [])
+        # ── Mould gate (planned COs) ──────────────────────────────────────────
+        # A planned CO can only happen if 2 eligible moulds are free for the new
+        # SKU. Gate HERE (day-start) — not at apply-time — because co_press_map
+        # drives the curing sim THIS day; a CO blocked later would already have
+        # been cured. Feasible COs get their moulds committed now (_try_mount);
+        # blocked ones are dropped so the press keeps its old SKU all day.
+        if _mould_gate and today_cos:
+            # Phase 2a — scarce-first: claim moulds for the SCARCEST new-SKU first
+            # (fewest eligible moulds) so a 2-mould SKU is not blocked by a 6-mould
+            # SKU grabbing a shared mould first. Pure reordering — the SET of COs
+            # attempted is unchanged, so this can only REDUCE blocks, never add them.
+            # Deterministic tiebreak on (press, new_sku). MOULD_OPT=0 keeps input order.
+            _co_order = today_cos
+            if _mould_opt:
+                _co_order = sorted(
+                    today_cos,
+                    key=lambda t: (len(_sku_moulds.get(t[2], set())), str(t[0]), str(t[2])),
+                )
+            _kept = []
+            for _p, _os, _ns in _co_order:
+                if _try_mount(_p, _ns, defer_free=True):
+                    _kept.append((_p, _os, _ns))
+                else:
+                    # Phase 2b — retarget-on-block: the scheduled new-SKU has no free
+                    # moulds; rather than idle the press on its old (usually demand-done)
+                    # SKU, redirect the CO to the neediest allowable SKU that still has
+                    # 2 free moulds. Recovers a wasted CO slot; demand cap still clips.
+                    _alt = _pick_retarget(_p) if _mould_opt else None
+                    if _alt is not None and _try_mount(_p, _alt, defer_free=True):
+                        _kept.append((_p, _os, _alt))
+                        mould_retargeted_cos += 1
+                    else:
+                        mould_blocked_cos += 1
+            today_cos = _kept
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
         # SKUs that curing presses are switching TO today — building must pre-build for these
         co_target_skus_today: frozenset = frozenset(co_press_map.values())
@@ -2933,6 +3359,8 @@ def run_rolling_pipeline(
                 days_left=planning_days - day + 1,
                 demand_dict=demand_dict,
                 machine_total_demand=machine_total_demand,
+                machine_anchor_inch=machine_anchor_inch,
+                machine_used_inches=machine_used_inches,
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
@@ -3013,6 +3441,20 @@ def run_rolling_pipeline(
                     # Update current SKU at end of THIS SHIFT (not end of day)
                     machine_current_sku[machine] = campaigns[-1][0]
 
+                    # ── Client inch rules: advance the machine's anchor + inch history.
+                    # The FIRST inch a machine ever runs fixes its +/-2 band for the
+                    # month; every inch it runs is recorded so it can never be re-used
+                    # after the machine leaves it (Rule 1a).
+                    if _INCH_RULES_ENABLED:
+                        _used = machine_used_inches.setdefault(machine, set())
+                        for _c_sku, _c_qty, _c_type in campaigns:
+                            _ci = sku_inch.get(_c_sku, "")
+                            if not _ci:
+                                continue
+                            if machine not in machine_anchor_inch:
+                                machine_anchor_inch[machine] = _ci
+                            _used.add(_ci)
+
                     # Update cross-shift minute tracker.
                     # Accumulate production minutes after the LAST CO in this shift.
                     # If no CO occurred: add all production minutes to existing total.
@@ -3056,12 +3498,28 @@ def run_rolling_pipeline(
             # has leftover capacity, instead of splitting it across SKUs with no
             # changeover between them.
             s1_machines_used_this_shift: set = set()
+
+            def _s1_inch_ok(_m: str, _sku: str) -> bool:
+                """Client inch rules applied to Stage-1 carcass machines too.
+
+                Same anchor +/- band and never-revisit rules as the GT machines;
+                Stage-1 keeps its own current-inch tracker because it is scheduled
+                here (Step 3b, derived from Stage-2 output), not in
+                _assign_building_shift.
+                """
+                if not _INCH_RULES_ENABLED:
+                    return True
+                return _inch_ok(sku_inch.get(_sku, ""),
+                                s1_current_inch.get(_m, ""),
+                                machine_anchor_inch.get(_m, ""),
+                                machine_used_inches.get(_m, set()))
+
             for sku, need in sorted(stage2_built_this_shift.items(), key=lambda kv: (-kv[1], kv[0])):
                 if need <= 0:
                     continue
                 eligible = sorted(
                     (m for m in s1_sku_to_machines.get(sku, ())
-                     if m not in s1_machines_used_this_shift),
+                     if m not in s1_machines_used_this_shift and _s1_inch_ok(m, sku)),
                     key=lambda m: (-_bld_qty_per_shift(m), m),
                 )
                 remaining_need = need
@@ -3074,6 +3532,15 @@ def run_rolling_pipeline(
                     alloc = min(cap, remaining_need)
                     s1_machines_used_this_shift.add(m)
                     remaining_need -= alloc
+                    # Advance the Stage-1 machine's inch history (first inch fixes
+                    # its band; every inch run is closed once it moves on).
+                    if _INCH_RULES_ENABLED:
+                        _s1_i = sku_inch.get(sku, "")
+                        if _s1_i:
+                            if m not in machine_anchor_inch:
+                                machine_anchor_inch[m] = _s1_i
+                            machine_used_inches.setdefault(m, set()).add(_s1_i)
+                            s1_current_inch[m] = _s1_i
                     # One SKU per Stage-1 machine per shift → carcass run starts
                     # at the shift clock start; duration = alloc × CT.
                     _c_start = _shift_start
@@ -3174,6 +3641,22 @@ def run_rolling_pipeline(
                 _cleaned  = False
                 prod_mins = 0.0
                 if status == "RUNNING":
+                    # DEBUG self-check: a RUNNING press must own 2 moulds eligible
+                    # for its SKU. Counts leaks where the gate failed to block.
+                    if _mould_gate and os.environ.get("MOULD_DEBUG"):
+                        _ow = [m for m in _press_moulds.get(press, set())
+                               if sku in _mould_skus.get(m, set())]
+                        if len(_ow) < 2:
+                            _mould_selfcheck[0] += 1
+                            _mould_selfcheck.append((day, shift, press, sku, len(_ow),
+                                                     len(_sku_moulds.get(sku, set()))))
+                        # targeted: dump the actual owned-mould state for SRBT0 presses
+                        if (os.environ.get("MOULD_DUMP") and day == 22 and shift == "C"
+                                and sku == "1325119015008SRBT0"):
+                            print(f"    [DUMP] press {press} sku {sku} owns "
+                                  f"{sorted(_press_moulds.get(press, set()))} | "
+                                  f"eligible-of-those={sorted(_ow)} | "
+                                  f"sku_moulds[SRBT0]={len(_sku_moulds.get(sku,set()))}")
                     # Cap curing at remaining demand — never over-produce.
                     demand_left = max(0.0, demand_remaining.get(sku, 0.0))
                     if _MOULD_CLEAN_ENABLED:
@@ -3263,6 +3746,11 @@ def run_rolling_pipeline(
                                         cure_ct_map, priority_score_map,
                                         gt_inventory, _horizon_left, _already,
                                     )
+                                # Mould gate: only fire the reactive CO if 2 eligible
+                                # moulds are free for the target; else keep this SKU.
+                                if _target is not None and not _try_mount(press, _target):
+                                    mould_blocked_cos += 1
+                                    _target = None
                                 if _target is not None:
                                     # CO starts NOW — mid-shift, the moment demand was
                                     # met. Charge the real CURING_CO_CHANGEOVER_MINS from
@@ -3418,6 +3906,8 @@ def run_rolling_pipeline(
                   f"{endday_gt_inv:,.0f} > cap {MAX_ENDOFDAY_GT_INVENTORY:,}")
 
         # ── 6. Apply CO transitions ───────────────────────────────────────
+        # today_cos was already mould-gated at day-start (moulds committed there),
+        # so every entry here is feasible — just apply the transition.
         for press, old_sku, new_sku in today_cos:
             press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
             press_count[new_sku] = press_count.get(new_sku, 0) + 1
@@ -3440,6 +3930,11 @@ def run_rolling_pipeline(
                 "Target_SKU": new_sku,
                 "CO_Type":    "Planned",
             })
+
+        # The planned COs have now completed for the day — release the old moulds
+        # that were held reserved through their pre-CO shifts.
+        if _mould_gate:
+            _release_deferred()
 
         # Daily summary — report GT-only (not carcass) for "built" KPI
         d_gt_built = sum(day_gt_built.values())  # real GT (excludes Stage-1 carcass)
@@ -3496,6 +3991,24 @@ def run_rolling_pipeline(
     print(f"  Mould cleans taken   : {_n_mould_cleans:>10,}  "
           f"(clean {'ON' if _MOULD_CLEAN_ENABLED else 'OFF'}, "
           f"CO-spread {'ON' if _CO_SHIFT_SPREAD_ENABLED else 'OFF'})")
+    print(f"  Mould-blocked COs    : {mould_blocked_cos:>10,}  "
+          f"(mould gate {'ON' if _mould_gate else 'OFF'})")
+    print(f"  Mould-retargeted COs : {mould_retargeted_cos:>10,}  "
+          f"(Phase-2 opt {'ON' if (_mould_gate and _mould_opt) else 'OFF'})")
+    if os.environ.get("MOULD_DEBUG"):
+        # Cross-press exclusivity: is any mould listed in >1 press's owned set?
+        _own_by_mould: dict = {}
+        for _pr, _ms in _press_moulds.items():
+            for _m in _ms:
+                _own_by_mould.setdefault(_m, set()).add(_pr)
+        _dbl = {m: ps for m, ps in _own_by_mould.items() if len(ps) > 1}
+        print(f"  [MOULD-DBL] moulds claimed by >1 press (final state): {len(_dbl)}")
+        # also cross-check _mould_owner vs _press_moulds consistency
+        _mismatch = sum(1 for _m, _ps in _own_by_mould.items()
+                        if _mould_owner.get(_m) not in _ps)
+        print(f"  [MOULD-DBL] _mould_owner/_press_moulds mismatches: {_mismatch}")
+        if _mould_selfcheck[0]:
+            print(f"  [MOULD-LEAK] {_mould_selfcheck[0]} running press-shifts own <2 moulds")
     print(f"  Demand coverage      : {final_cov:>9.1f}%  ({dem_met:,.0f} / {total_demand:,.0f})")
     _eod_inv = [r["EndDay_GT_Inventory"] for r in daily_summary if "EndDay_GT_Inventory" in r]
     if _eod_inv:
@@ -3555,6 +4068,8 @@ def run_rolling_pipeline(
         "n_co_planned":      _n_co_planned,
         "n_co_dynamic":      _n_co_dynamic,
         "n_mould_cleans":    _n_mould_cleans,
+        "mould_blocked_cos": mould_blocked_cos,
+        "mould_retargeted_cos": mould_retargeted_cos,
         "build_output":      build_output,
         "curing_output":     curing_output,
     }

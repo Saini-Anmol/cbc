@@ -16,7 +16,7 @@ Sections:
     6. Physical constants  (do NOT change — plant constraints)
     7. Output paths
 """
-
+# I have updated GT invenoty value from 8k to 6k, so i needs to update the docker image for this? So, please update the dcoker image and update and push this same image to the docker hub. 
 from __future__ import annotations
 
 import os
@@ -29,8 +29,8 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 31                                # number of days in plan horizon
+PLAN_START    = datetime(2026, 6, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 30                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. INPUT FILES
@@ -39,7 +39,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "june_production_data.xlsx")
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
@@ -51,7 +51,7 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
+RUNNING_MOULDS_TABLE = "testing_Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -69,7 +69,13 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 12   # was 18 — user set 12 for the surplus-release test
+MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+# Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
+#   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
+#   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
+# Caps 10/11/13/15/16 are UNTESTED — the earlier 10-16 sweep used the retired
+# june_Daily_Running_Moulds table and is void. Run the 7x3 sweep before trusting 16.
+# Cloud is unaffected by this line: the cap comes from jkt_plan_params.noOfChangeOver.
 # Hard cap on CURING PRESS COs scheduled per calendar day (unchanged in new arch).
 # 8  → ~594k GT (May 2026 baseline).
 # 10 → ~615k (balanced NRI activation).
@@ -179,7 +185,7 @@ GT_SHELF_LIFE_DAYS      = 3
 # GT cannot sit more than 3 days before curing (plant rule).
 # TopUp will not pre-build GT beyond this window.
 
-MAX_ENDOFDAY_GT_INVENTORY = 8000
+MAX_ENDOFDAY_GT_INVENTORY = 7000
 # Plant capacity constraint: total GT held in inventory at the END of any day
 # (summed over all SKUs, after curing + stale writeoff) cannot exceed this many
 # units. Enforced PROACTIVELY during building (never build past the ceiling) so
@@ -222,7 +228,7 @@ DEFAULT_CURING_CT = 17.0
 
 CURING_CO_DURATION_SHIFTS  = 1     # shifts idle during CO: Shift A only (CHANGEOVER).
 #                                    Mould clean removed from scheduler model.
-CURING_CO_CHANGEOVER_MINS  = 480   # Shift A: press occupied for changeover (full shift)
+CURING_CO_CHANGEOVER_MINS  = 490   # Shift A: press occupied for changeover (full shift)
 # Shift B: PRODUCTION begins for new SKU immediately (no mould-clean idle shift).
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -271,3 +277,18 @@ CURING_OUTPUT      = os.path.join(_MAIN_OUT, f"bc_curing_schedule_{PLAN_START.da
 CURING_B2C_OUTPUT  = os.path.join(_MAIN_OUT, f"bc_curing_b2c_{PLAN_START.date()}.xlsx")
 ANALYSIS_OUTPUT    = os.path.join(_MAIN_OUT, "bc_analysis.xlsx")
 ROLLING_OUTPUT     = os.path.join(_MAIN_OUT, "bc_rolling_schedule.xlsx")
+
+# 9 runs executing (~12 min): 3 months × {baseline, rules@cap12, rules@cap14}, all on Daily_Running_Moulds.
+
+# -- 
+#  
+
+# As of now, we were not using the mould to SKU mapping data from the db table we have to use this- SELECT * FROM jkplanningV1.Master_Mapping_Mould_SKU; I have already added the updated data in the above table ,,,; now, we must have to incorporate this mould to SKU mapping in our codebase, now if a press is allowable to a SKU and it's mould is also available then only we can able to cure that, otherwise if press is there and mould is not present then we cannot cure, we must to idle the press until mould is available. And, another imp. point there are some cases in which one mould can serve to multiple sku as well and 2 moulds are needed for one press to run and cure the tyre. Any doubt in the logic then please ask me. Then, designed a complete implementation plan for incorporating this work.
+
+# Now, i have incoprated the mould to sku mapping data. So, first we will get some reduction in our baseline output, but this will be our real and actual output. Now, can we increase this baseline output? because now we have to assign the assign sku to press based on it's allowable press and available moulds. Should be needs to improve our logic on this, if yes, provide me the insights from. this. How we can increase our KPIs here, note- we will consider the deafult mould life to be 3k as per our old logic only, then in the next verison we will incorporate the real mould life and fetch this mould life from this same table only. After this optimization this is new baseline for the KPIs. 
+
+# Initially in the different size CO i told that- if we are going from size 14 to size 15, then we cannot revert back to size 14 again on that particular machine, so we decided we can only go from 14 to 15 inch when demand of 14 is completed on that machine, otherwise it will not revert back to that machine anymore. But, there is one relaxation is this rule- we can revert back from one size to another [diff. size] once in a 5 days. But, this diff size CO is allowed for +2/-2 size only, and we can take as many same size CO on machine respecting our business rule, and this one hard rule will remain the same- more than +2/-2 diff size CO will not be possible on a particular machine based on what we decide on day1 of that machine [means +3/-3 and more than this will not be possible]. => Initially greedy decision will be solved by taking building running machine data [this we will take in the next version of this project]. I hope and everything is clear and better now. Any doubt in the rule and logic now. Please ask all your doubts if any, and then design a perfect implementation plan for executing this logic [by turing on the plan mode]. 
+
+# What we should proceed first, this mould to sku mapping work? or this relaxation of 5 days in the diff size CO? What yours plan? 
+
+# First download the current data present in this table using a python script- SELECT * FROM jkplanningV1.Master_Mapping_Mould_SKU; 
