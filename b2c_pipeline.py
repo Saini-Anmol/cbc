@@ -264,6 +264,20 @@ _MOULD_GATE_ENABLED = os.environ.get("MOULD_GATE", "1") != "0"
 # MOULD_OPT=0 → pure Phase-1 gate (scheduling identical to the locked mould baseline).
 _MOULD_OPT_ENABLED = os.environ.get("MOULD_OPT", "1") != "0"
 
+# Phase 3 — Unified CO scorer. Replaces the three ad-hoc changeover paths (static
+# planned COs, per-press retarget-on-block, mid-shift dynamic CO) with ONE scoring
+# function that ranks {execute planned, pull-forward tomorrow's planned, dynamic,
+# retarget, idle} per press and solves them as a GLOBAL greedy over the shared
+# resources (mould pool + a quantitative building-feed estimate + daily CO cap).
+# Default ON — measured ≥ Phase-2 on all 3 months (May +3,780, June +2,261, July +2,987;
+# all exact-mould-audit PASS, deterministic, demand cap holds). CO_SCORER=0 → Phase-2 path.
+_CO_SCORER_ENABLED = os.environ.get("CO_SCORER", "1") != "0"
+# Sub-flag (measured rollout): False = ADDITIVE (planned COs always kept; scorer only
+# fills idle presses + pulls forward tomorrow's planned COs) — the shipped mode.
+# True = FULL RE-OPT (planned COs may be cancelled/replaced) — MEASURED WORSE (utility
+# picker churns and drops good planned COs, e.g. May −40k), left OFF.
+_SCORER_FULL_REOPT = os.environ.get("SCORER_FULL", "0") != "0"
+
 # BUSINESS RULE: spread planned curing COs across shifts A/B/C.
 # Planned COs were hardcoded to Shift A (all 147), so 97% of changeover downtime
 # landed in Shift A and its curing output sat ~6.6k below Shift B — an artifact, not
@@ -3158,7 +3172,7 @@ def run_rolling_pipeline(
     # universe. Built once, only when the optimisation is on (a DB read otherwise
     # skipped). Restricted to demand SKUs so retarget never chases a zero-demand SKU.
     press_allow_skus: dict[str, list] = {}
-    if _mould_gate and _mould_opt:
+    if _mould_gate and (_mould_opt or _CO_SCORER_ENABLED):
         try:
             _dfca = cetl.load_curing_allowable()
             _dem_skus = set(demand_dict.keys())
@@ -3173,6 +3187,200 @@ def run_rolling_pipeline(
             print(f"  [Rolling] curing-allowable load for retarget FAILED ({_e}); "
                   f"retarget disabled")
             press_allow_skus = {}
+
+    # ── Phase 3: Unified CO scorer ────────────────────────────────────────────
+    # counters (provenance of every committed CO + why some were blocked)
+    co_scorer_stats = {"planned": 0, "pullfwd": 0, "dynamic": 0, "retarget": 0,
+                       "idle": 0, "cancelled": 0, "build_blocked": 0}
+    _CO_COST_UNITS   = float(os.environ.get("CO_COST_UNITS", "0"))  # 0 = cost folded into shift-draw floor
+    _DEFAULT_BLD_CT  = 120.0
+
+    def _bld_free_min_shift():
+        """Conservative per-machine spare building minutes THIS shift: SHIFT_MINS minus
+        the minutes each GT-producing machine already owes its currently-RUNNING SKUs
+        (each RUNNING SKU's per-shift draw spread evenly over its eligible machines).
+        Returns {machine: free_min}. Only clearly-free minutes count (never negative)."""
+        _committed: dict[str, float] = defaultdict(float)
+        for _pr, _st in press_state.items():
+            if _st.get("status") != "RUNNING":
+                continue
+            _s = _st["sku"]
+            if demand_remaining.get(_s, 0.0) <= 0:
+                continue
+            _ms = sku_machine_map.get(_s)
+            if not _ms:
+                continue
+            _draw = _cure_qty_per_shift(cure_ct_map.get(_s, DEFAULT_CURING_CT))
+            _per  = _draw / len(_ms)
+            for _m in _ms:
+                _committed[_m] += _per * (_BLD_CT_SEC.get(str(_m), _DEFAULT_BLD_CT) / 60.0)
+        return {str(_m): max(0.0, float(SHIFT_MINS) - _committed.get(str(_m), 0.0))
+                for _m in machine_skus}
+
+    def _bld_capacity(sku: str, bld_free: dict) -> float:
+        """Units/shift of `sku` GT that the currently-spare building machines could add."""
+        _ms = sku_machine_map.get(sku)
+        if not _ms:
+            return 0.0
+        return sum(bld_free.get(str(_m), 0.0) / (_BLD_CT_SEC.get(str(_m), _DEFAULT_BLD_CT) / 60.0)
+                   for _m in _ms)
+
+    def _bld_commit(sku: str, units: float, bld_free: dict) -> None:
+        """Live-decrement the shared building minutes when a CO to `sku` is committed."""
+        _ms = sku_machine_map.get(sku)
+        if not _ms:
+            return
+        _per = units / len(_ms)
+        for _m in _ms:
+            _ms_key = str(_m)
+            bld_free[_ms_key] = max(0.0, bld_free.get(_ms_key, 0.0)
+                                    - _per * (_BLD_CT_SEC.get(_ms_key, _DEFAULT_BLD_CT) / 60.0))
+
+    def _co_utility(press: str, target: str, horizon_left: int, bld_cap: float) -> float:
+        """One utility for 'press → target', in units. Higher = more worth a changeover.
+        expected extra cured = min(per-press residual demand load, what the press can
+        physically cure of target over the horizon, what building can actually feed),
+        minus the changeover cost (one shift of the target's own production)."""
+        _rem = demand_remaining.get(target, 0.0)
+        if _rem <= 0:
+            return -1.0
+        _npr  = max(1, press_count.get(target, 0))
+        _draw = _cure_qty_per_shift(cure_ct_map.get(target, DEFAULT_CURING_CT))
+        _residual_load = _rem / _npr
+        _horizon_cure  = _draw * 3 * max(0, horizon_left)     # this press's cure over horizon
+        _extra = min(_residual_load, _horizon_cure, bld_cap)
+        _co_cost = _draw + _CO_COST_UNITS                     # 1 lost shift + optional constant
+        return _extra - _co_cost
+
+    def _best_alt(press, bld_free, horizon_left, exclude=None, check_build=True):
+        """Highest-utility allowable target for `press` with 2 free moulds (and, if
+        check_build, enough building feed). Deterministic. Returns SKU or None."""
+        _cur = press_state.get(press, {}).get("sku")
+        _best = None
+        _best_key = None
+        for s in press_allow_skus.get(press, ()):          # pre-sorted
+            if s == _cur or s == exclude:
+                continue
+            if demand_remaining.get(s, 0.0) <= 0:
+                continue
+            if _n_free_for(s, press) < 2:
+                continue
+            _cap = _bld_capacity(s, bld_free)
+            _draw = _cure_qty_per_shift(cure_ct_map.get(s, DEFAULT_CURING_CT))
+            if check_build and _cap < _draw:
+                continue
+            _u = _co_utility(press, s, horizon_left, _cap)
+            if _u <= 0:                                     # only worthwhile changeovers
+                continue
+            _key = (_u, s)                                  # util desc, SKU tiebreak
+            if _best_key is None or _key > _best_key:
+                _best_key = _key
+                _best = s
+        return _best
+
+    def _solve_day_cos(day, today_planned):
+        """Global CO solve for one day. Returns the final list of committed COs
+        [(press, old_sku, new_sku)], reserving moulds via _try_mount(defer_free) and
+        pruning any pulled-forward COs out of tomorrow's co_by_day. Two modes:
+        ADDITIVE (keep planned COs, add pull-forward + idle-fill) and FULL_REOPT
+        (global utility scoring; planned COs may be cancelled/replaced)."""
+        horizon_left     = planning_days - day + 1
+        bld_free         = _bld_free_min_shift()
+        tomorrow_planned = list(co_by_day.get(day + 1, []))
+        planned_tom      = {p: ns for (p, _o, ns) in tomorrow_planned}
+        committed: dict[str, tuple] = {}     # press -> (target, provenance)
+        pulled: list[str] = []
+        slots = [MAX_CHANGEOVERS_PER_DAY]
+
+        def _commit(press, target, prov, check_build=True):
+            if slots[0] <= 0 or press in committed:
+                return False
+            if _n_free_for(target, press) < 2:
+                return False
+            _draw = _cure_qty_per_shift(cure_ct_map.get(target, DEFAULT_CURING_CT))
+            if check_build and _bld_capacity(target, bld_free) < _draw:
+                co_scorer_stats["build_blocked"] += 1
+                return False
+            if not _try_mount(press, target, defer_free=True):
+                return False
+            _bld_commit(target, _draw, bld_free)
+            committed[press] = (target, prov)
+            slots[0] -= 1
+            co_scorer_stats[prov] += 1
+            return True
+
+        if not _SCORER_FULL_REOPT:
+            # ADDITIVE — planned COs kept (mould-gate + retarget-on-block, no build veto
+            # so this path is a superset of Phase-2), then NEW pull-forward + idle-fill.
+            for (press, _o, ns) in today_planned:
+                if _commit(press, ns, "planned", check_build=False):
+                    continue
+                # retarget-on-block — EXACT Phase-2 (_pick_retarget, no build veto) so
+                # the planned+retarget layer matches the locked mould baseline bit-for-bit.
+                _alt = _pick_retarget(press)
+                if not (_alt is not None and _commit(press, _alt, "retarget", check_build=False)):
+                    co_scorer_stats["cancelled"] += 1
+            for (press, _o, ns) in tomorrow_planned:
+                if press in committed:
+                    continue
+                if demand_remaining.get(press_state.get(press, {}).get("sku"), 1.0) > 0:
+                    continue                                  # press still busy today
+                if _commit(press, ns, "pullfwd"):
+                    pulled.append(press)
+            for press in sorted(press_state):
+                if press in committed:
+                    continue
+                if demand_remaining.get(press_state[press]["sku"], 1.0) > 0:
+                    continue                                  # not idle — leave it running
+                _alt = _best_alt(press, bld_free, horizon_left)
+                if _alt is not None:
+                    _commit(press, _alt, "dynamic")
+        else:
+            # FULL RE-OPT — every eligible press competes; planned COs are candidates.
+            planned_today = {p: ns for (p, _o, ns) in today_planned}
+            elig = set(planned_today) | set(planned_tom)
+            for press, st in press_state.items():
+                if demand_remaining.get(st["sku"], 1.0) <= 0:
+                    elig.add(press)
+            pairs = []
+            for press in sorted(elig):
+                _cur = press_state.get(press, {}).get("sku")
+                _cands: dict[str, str] = {}
+                if press in planned_today:
+                    _cands[planned_today[press]] = "planned"
+                if press in planned_tom:
+                    _cands.setdefault(planned_tom[press], "pullfwd")
+                for s in press_allow_skus.get(press, ()):
+                    if demand_remaining.get(s, 0.0) > 0:
+                        _cands.setdefault(s, "retarget")
+                for t, prov in _cands.items():
+                    if t == _cur:
+                        continue
+                    _u = _co_utility(press, t, horizon_left, _bld_capacity(t, bld_free))
+                    pairs.append((_u, press, t, prov))
+            pairs.sort(key=lambda x: (-x[0], x[1], x[2]))
+            for _u, press, t, prov in pairs:
+                if _u <= 0:
+                    break
+                if press in committed:
+                    continue
+                if _commit(press, t, prov) and prov == "pullfwd":
+                    pulled.append(press)
+
+        if pulled:
+            _pset = set(pulled)
+            co_by_day[day + 1] = [(p, o, n) for (p, o, n) in tomorrow_planned
+                                  if p not in _pset]
+            daily_co_count[day + 1] = max(0, daily_co_count.get(day + 1, 0) - len(_pset))
+
+        co_scorer_stats["idle"] += sum(
+            1 for pr, st in press_state.items()
+            if pr not in committed and demand_remaining.get(st["sku"], 1.0) <= 0)
+
+        final = [(pr, press_state.get(pr, {}).get("sku"), tgt)
+                 for pr, (tgt, _prov) in committed.items()]
+        daily_co_count[day] = len(final)
+        return final
 
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
@@ -3217,7 +3425,12 @@ def run_rolling_pipeline(
         # drives the curing sim THIS day; a CO blocked later would already have
         # been cured. Feasible COs get their moulds committed now (_try_mount);
         # blocked ones are dropped so the press keeps its old SKU all day.
-        if _mould_gate and today_cos:
+        if _mould_gate and _CO_SCORER_ENABLED:
+            # Phase 3 — unified global CO solve (planned / pull-forward / retarget /
+            # dynamic / idle under one utility + mould + building-feed gate). Runs even
+            # when today_cos is empty (there may be idle presses to fill / pull-forwards).
+            today_cos = _solve_day_cos(day, today_cos)
+        elif _mould_gate and today_cos:
             # Phase 2a — scarce-first: claim moulds for the SCARCEST new-SKU first
             # (fewest eligible moulds) so a 2-mould SKU is not blocked by a 6-mould
             # SKU grabbing a shared mould first. Pure reordering — the SET of COs
@@ -3722,11 +3935,42 @@ def run_rolling_pipeline(
                             and press not in co_press_map
                             and press not in dynamic_co_tracker):
                         _next_day_cos = {p for p, _, _ in co_by_day.get(day + 1, [])}
-                        if press not in _next_day_cos:
+                        # Phase 3 pull-forward: a press blocked here (planned CO booked
+                        # TOMORROW) normally idles the rest of today. With the scorer on,
+                        # bring tomorrow's planned CO FORWARD to now instead of idling.
+                        _pf_target = None
+                        if _CO_SCORER_ENABLED and _mould_gate and press in _next_day_cos:
+                            _pf_target = next(
+                                (ns for (p, _o, ns) in co_by_day.get(day + 1, [])
+                                 if p == press), None)
+                        if (press not in _next_day_cos) or (_pf_target is not None):
                             _slots_left = MAX_CHANGEOVERS_PER_DAY - daily_co_count[day]
                             if _slots_left > 0:
                                 _horizon_left = planning_days - day + 1
-                                if _RATIO_CO_ALLOCATION_ENABLED or _EARLY_CO_ENABLED:
+                                _pf_fired = False
+                                if _CO_SCORER_ENABLED and _mould_gate:
+                                    # Pull-forward if tomorrow's planned CO is feasible now;
+                                    # else fall back to the SAME tuned dynamic selector as
+                                    # Phase-2 (don't disturb its behaviour — measured better
+                                    # than the utility picker for reactive mid-shift COs).
+                                    _bf = _bld_free_min_shift()
+                                    if (_pf_target is not None
+                                            and demand_remaining.get(_pf_target, 0.0) > 0
+                                            and _n_free_for(_pf_target, press) >= 2
+                                            and _bld_capacity(_pf_target, _bf)
+                                            >= _cure_qty_per_shift(cure_ct_map.get(
+                                                _pf_target, DEFAULT_CURING_CT))):
+                                        _target = _pf_target
+                                        _pf_fired = True
+                                    else:
+                                        _already = set(dynamic_co_tracker[p][1]
+                                                       for p in dynamic_co_tracker)
+                                        _target = _select_dynamic_co_target(
+                                            sku, demand_remaining, press_count,
+                                            cure_ct_map, priority_score_map,
+                                            gt_inventory, _horizon_left, _already,
+                                        )
+                                elif _RATIO_CO_ALLOCATION_ENABLED or _EARLY_CO_ENABLED:
                                     _pending_counts = Counter(
                                         dynamic_co_tracker[p][1] for p in dynamic_co_tracker
                                     )
@@ -3751,6 +3995,17 @@ def run_rolling_pipeline(
                                 if _target is not None and not _try_mount(press, _target):
                                     mould_blocked_cos += 1
                                     _target = None
+                                if _target is not None and _CO_SCORER_ENABLED:
+                                    if _pf_fired:
+                                        # consume tomorrow's planned CO so it can't fire twice
+                                        co_by_day[day + 1] = [
+                                            (p, o, n) for (p, o, n) in co_by_day.get(day + 1, [])
+                                            if p != press]
+                                        daily_co_count[day + 1] = max(
+                                            0, daily_co_count.get(day + 1, 0) - 1)
+                                        co_scorer_stats["pullfwd"] += 1
+                                    else:
+                                        co_scorer_stats["dynamic"] += 1
                                 if _target is not None:
                                     # CO starts NOW — mid-shift, the moment demand was
                                     # met. Charge the real CURING_CO_CHANGEOVER_MINS from
@@ -3995,6 +4250,12 @@ def run_rolling_pipeline(
           f"(mould gate {'ON' if _mould_gate else 'OFF'})")
     print(f"  Mould-retargeted COs : {mould_retargeted_cos:>10,}  "
           f"(Phase-2 opt {'ON' if (_mould_gate and _mould_opt) else 'OFF'})")
+    if _CO_SCORER_ENABLED:
+        _cs = co_scorer_stats
+        print(f"  CO scorer ({'FULL' if _SCORER_FULL_REOPT else 'ADD'}) : "
+              f"planned={_cs['planned']} pullfwd={_cs['pullfwd']} "
+              f"retarget={_cs['retarget']} dynamic={_cs['dynamic']} "
+              f"cancelled={_cs['cancelled']} build_blocked={_cs['build_blocked']}")
     if os.environ.get("MOULD_DEBUG"):
         # Cross-press exclusivity: is any mould listed in >1 press's owned set?
         _own_by_mould: dict = {}
@@ -4070,6 +4331,7 @@ def run_rolling_pipeline(
         "n_mould_cleans":    _n_mould_cleans,
         "mould_blocked_cos": mould_blocked_cos,
         "mould_retargeted_cos": mould_retargeted_cos,
+        "co_scorer_stats": co_scorer_stats if _CO_SCORER_ENABLED else None,
         "build_output":      build_output,
         "curing_output":     curing_output,
     }
