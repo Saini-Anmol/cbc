@@ -111,6 +111,14 @@ MIN_SHIFT_UTILISATION = 0.77
 # idle-fill assignment if a machine drops below this floor after demand cap.
 # ─────────────────────────────────────────────────────────────────────────────
 
+INCH_PLUS3_CO_MINS = 480
+# Building +3/-3 one-time inch escape (experiment). A machine may make ONE inch jump of
+# exactly 3 (beyond the ±2 band) for the whole month; that jump is a major retooling
+# costing this many minutes (8h) of building CO — vs the normal 88-180 min diff CO.
+INCH_PLUS3_MIN_DAYS_LEFT = 5
+# Only allow the +3/-3 escape when at least this many plan days remain, so the 8h CO is
+# amortised by enough remaining production. Enforced when _INCH_PLUS3_ENABLED.
+
 MAX_BUILDING_SKUS_PER_DAY = 4
 # Plant rule: a single building machine may produce at most this many DISTINCT SKUs in
 # one calendar day — the overnight carryover SKU counts as #1, so ≤3 changeovers after it.

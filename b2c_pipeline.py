@@ -68,6 +68,8 @@ from bc_config import (
     MIN_CAMPAIGN_UNITS,
     MIN_INCH_DWELL_DAYS,
     MAX_BUILDING_SKUS_PER_DAY,
+    INCH_PLUS3_CO_MINS,
+    INCH_PLUS3_MIN_DAYS_LEFT,
     BUILD_LEAD_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
     GT_BUFFER_SHIFTS,
@@ -240,6 +242,26 @@ _FWD_RISK_SHIFTS = True
 # out to writeoff within the shelf window).
 GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
 
+# IDLE-MACHINE → HIGHEST-UNMET-DEMAND targeting (ADOPTED, default ON). The forward
+# buffer above (Phase C) fills idle building capacity toward the NEAREST-TO-STARVE SKU.
+# This lever instead points idle machines at the BIGGEST unmet-demand gaps: it re-ranks
+# the Phase-C candidates by remaining demand (largest gap first). It stays on a CURABLE
+# PATH — the draw>0 gate is kept, so a candidate is only ever a SKU a press is actively
+# drawing OR CO'ing to today (the Shift-A pre-build injection makes today's CO targets
+# draw>0), and it is bounded by the shelf-safe target, the 7k end-of-day GT cap, and the
+# hard demand cap → no waste GT (invariant #4 holds).
+# MEASURED (cap=12, mould-audit PASS, deterministic): May 684,910 (+2,650), June 632,168
+# (-1,870), July 694,161 (+12,732) → net +13,512, biggest gain on the weak month (July
+# 87.5%→89.1%). Also LOWERS writeoff (1,864→1,845) and starvation (1,203→1,063).
+# Pinned ON (like the other adopted toggles). Set this to False to reproduce the
+# pre-adoption forward buffer bit-for-bit (verified May 682,260 / June 634,038 / July 681,429).
+_IDLE_UNMET_ENABLED = True
+# Sub-mode (default ON = the shipped variant): KEEP the starvation-risk throttle (only
+# near-starving SKUs are pre-built), just re-ranked by biggest-gap first. Isolates "aim
+# at the biggest gaps" from "build ahead of need". IDLE_UNMET_KEEP_GATE=0 relaxes the
+# throttle too (pure front-loading) — MEASURED WORSE (May -6,180, July -12,698), left OFF.
+_IDLE_UNMET_KEEP_GATE = True
+
 # BUSINESS RULE: curing-press mould clean. After every MOULD_CLEAN_CYCLES cycles
 # (= 6,000 tyres) a press takes an 8h (MOULD_CLEAN_MINS = 480 = 1 shift) mould clean
 # during which it produces nothing; mould life then resets. A curing CO also resets
@@ -287,6 +309,26 @@ _CO_SCORER_ENABLED = True
 # True = FULL RE-OPT (planned COs may be cancelled/replaced) — MEASURED WORSE (utility
 # picker churns and drops good planned COs, e.g. May −40k), left OFF.
 _SCORER_FULL_REOPT = os.environ.get("SCORER_FULL", "0") != "0"
+
+# Phase 4 — GLOBAL MOULD OPTIMISER (experiment, default OFF). The gate + scorer above
+# allocate moulds per-press greedily (each CO grabs the first 2 free/own eligible
+# moulds). That leaves scarce moulds (15"/13" tooling) "stuck" on presses that no longer
+# need them, so eligible presses can't serve the biggest-gap SKUs. This step runs once
+# per day (after the day's COs are fixed, before they drive the sim) and, ranked by the
+# most-under-served scarce SKU first:
+#   (1) DIRECT ADD — put a sacrificeable eligible press onto an under-served scarce SKU
+#       when it can already mount 2 moulds; and
+#   (2) LIBERATION — proactively CO a sacrificeable HOLDER of that SKU's mould to a needy
+#       retarget SKU chosen to RELEASE the scarce mould, so a future day can mount it.
+# Both respect the daily CO cap. Two aggressiveness MODES (env MOULD_OPT_MODE):
+#   "ro_only"    — only sacrifice / evict presses whose current SKU demand is DONE
+#                  (Runner-Out). Those COs are near-free. Lower risk.
+#   "full_evict" — additionally evict a RUNNING press when the target SKU's amortised
+#                  marginal value strictly exceeds the current SKU's. Bigger lever,
+#                  more churn, more CO-cap hungry.
+# MOULD_GLOBAL_OPT=0 (default) reproduces the current engine bit-for-bit.
+_MOULD_GLOBAL_OPT_ENABLED = os.environ.get("MOULD_GLOBAL_OPT", "0") != "0"
+_MOULD_GLOBAL_OPT_MODE    = os.environ.get("MOULD_OPT_MODE", "ro_only").strip().lower()
 
 # BUSINESS RULE: spread planned curing COs across shifts A/B/C.
 # Planned COs were hardcoded to Shift A (all 147), so 97% of changeover downtime
@@ -470,6 +512,12 @@ _INCH_DBG                = [0, 0, 0]   # INCH_DEBUG: [deficit-done, dwell-pass, 
 # Plant rule: max MAX_BUILDING_SKUS_PER_DAY (4) distinct SKUs per building machine per day
 # (carryover counts as #1; both same/diff-size COs count). Default ON; BLD_SKU_CAP=0 off.
 _BLD_SKU_CAP_ENABLED     = True
+# EXPERIMENT: one-time +3/-3 inch escape per machine per month, at an 8h building CO
+# (INCH_PLUS3_CO_MINS). Default OFF; INCH_PLUS3=1 to test. Only fires for a stranded
+# machine (no ±2 in-band work left) with real +3/-3 demand and enough days to amortise.
+_INCH_PLUS3_ENABLED      = os.environ.get("INCH_PLUS3", "0") != "0"
+_P3DBG                   = os.environ.get("INCH_PLUS3_DEBUG") is not None
+_PLUS3_DBG               = [0, 0, 0, 0]   # [has-room, stranded, dwell-ok, has-±3-SKU]
 _INCH_BAND_WIDTH         = int(os.environ.get("INCH_BAND", "2"))   # Rule 2: anchor +/- N
 # Variant A (True): the +/-2 band REPLACES the _HARD dominant-inch locks.
 # Variant B (False): keep _HARD as well, so the machine is bound by the
@@ -1220,6 +1268,7 @@ def _assign_building_shift(
     machine_inch_since:     dict | None = None,   # {machine: day its current inch began}
     day:                    int = 1,              # current plan day (for the 5-day dwell)
     machine_day_skus:       dict | None = None,   # {machine: set(SKUs built today)} — 4/day cap
+    machine_plus3_used:     set | None = None,    # machines that spent their +3/-3 escape
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -1240,6 +1289,7 @@ def _assign_building_shift(
     machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
     machine_inch_since  = machine_inch_since  if machine_inch_since  is not None else {}
     machine_day_skus    = machine_day_skus    if machine_day_skus    is not None else {}
+    machine_plus3_used  = machine_plus3_used  if machine_plus3_used  is not None else set()
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
         """Rule 2 (+/-2 band) for a candidate (machine, to_inch)."""
@@ -1462,6 +1512,66 @@ def _assign_building_shift(
             s["co_count"] += 1
             s["cur_sku"] = sku
 
+        # ── Phase B2: one-time +3/-3 inch escape for STRANDED machines (experiment) ──
+        # A machine whose ±2 in-band work is exhausted this shift may make ONE inch jump
+        # of exactly 3 (beyond the band) for the whole month, at an 8h building CO
+        # (INCH_PLUS3_CO_MINS). Gated to real +3/-3 demand + enough days to amortise —
+        # UNLESS its in-band demand is fully completed (take it immediately; idle is worse).
+        if _INCH_PLUS3_ENABLED:
+            for m in sorted(machines):
+                if m in machine_plus3_used:
+                    continue
+                s = stg[m]; rate = s["rate"]
+                # The 8h CO fills a whole shift → the machine must be idle this shift
+                # (a full free shift for the CO; production begins next shift).
+                if rate <= 0 or s["campaigns"] or s["remaining"] < INCH_PLUS3_CO_MINS:
+                    continue
+                if _P3DBG: _PLUS3_DBG[0] += 1              # idle this shift + escape available
+                _a = _inch_num(machine_anchor_inch.get(m, ""))
+                if _a is None:
+                    continue
+                _buf = _buf_of(m); _elig = machine_skus.get(m, set())
+                _cur_inch = sku_inch.get(s["cur_sku"], "")
+                # STRANDED: no in-band (±2) deficit left this shift (Phase A/B used it all)
+                if any(_defc(x, _buf) > 0 and _inch_num(sku_inch.get(x, "")) is not None
+                       and abs(_inch_num(sku_inch.get(x, "")) - _a) <= _INCH_BAND_WIDTH
+                       for x in _elig):
+                    continue
+                if _P3DBG: _PLUS3_DBG[1] += 1              # stranded (no in-band ±2 deficit)
+                # the +3/-3 move is still a diff-inch CO → respect the 5-day dwell gate
+                if not _may_leave_inch(m, _cur_inch, _defc, _buf, rate):
+                    continue
+                if _P3DBG: _PLUS3_DBG[2] += 1              # passed dwell gate
+                _has3 = any(_inch_num(sku_inch.get(x, "")) is not None
+                            and abs(_inch_num(sku_inch.get(x, "")) - _a) == 3 for x in _elig)
+                if _P3DBG and _has3: _PLUS3_DBG[3] += 1    # has ANY ±3 eligible SKU (data)
+                # AMORTISE: need ≥ N days left, UNLESS in-band demand is fully completed
+                # for the month (machine would otherwise idle → take the escape now).
+                _inband_demand_left = any(
+                    demand_remaining.get(x, 0.0) > 0
+                    and _inch_num(sku_inch.get(x, "")) is not None
+                    and abs(_inch_num(sku_inch.get(x, "")) - _a) <= _INCH_BAND_WIDTH
+                    for x in _elig)
+                if days_left < INCH_PLUS3_MIN_DAYS_LEFT and _inband_demand_left:
+                    continue
+                # TARGET: exactly 3 inches from anchor, real deficit + unmet demand
+                _cands = [x for x in _elig
+                          if _defc(x, _buf) > 0 and demand_remaining.get(x, 0.0) > 0
+                          and _inch_num(sku_inch.get(x, "")) is not None
+                          and abs(_inch_num(sku_inch.get(x, "")) - _a) == 3]
+                if not _cands:
+                    continue
+                _best  = max(_cands, key=lambda x: (_defc(x, _buf), x))
+                # The 8h CO occupies the WHOLE shift (INCH_PLUS3_CO_MINS = one shift), so
+                # this shift produces nothing; the machine switches to the +3 target and
+                # builds it from the NEXT shift (Phase A continuation). Record a CO-only
+                # campaign (qty=0) carrying its real 480-min cost.
+                s["campaigns"].append((_best, 0, "plus3_CO"))
+                s["remaining"] -= INCH_PLUS3_CO_MINS
+                s["co_count"] += 1
+                s["cur_sku"]   = _best
+                machine_plus3_used.add(m)                  # one escape per machine per month
+
         # ── Phase C: forward-buffer slack-fill (level-loading) ──
         # Use building capacity that Phase A/B left idle to PRE-BUILD a shelf-life-safe
         # forward buffer for SKUs that WILL be cured in the next 3 days. Builds ONLY
@@ -1494,7 +1604,10 @@ def _assign_building_shift(
                         # starvation-risk gate: skip SKUs that already hold enough GT
                         # (>= _FWD_RISK_SHIFTS shifts of draw) — they are NOT about to
                         # starve, so pre-building them would only front-load early month.
-                        if (_FWD_RISK_SHIFTS > 0
+                        # IDLE_UNMET relaxes this: aim idle capacity at the biggest unmet
+                        # gaps up to the shelf-safe target regardless of current on-hand.
+                        if ((not _IDLE_UNMET_ENABLED or _IDLE_UNMET_KEEP_GATE)
+                                and _FWD_RISK_SHIFTS > 0
                                 and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
                             continue
                         need_co = (sku != cur)
@@ -1533,7 +1646,9 @@ def _assign_building_shift(
                                (0 if to_inch == cur_inch else 1) if _INCH_RULES_ENABLED else 0,
                                0 if to_inch == dom else 1,        # dominant inch first
                                0 if sku == cur else 1,            # avoid a CO if possible
-                               -(draw / (projected_gt.get(sku, 0.0) + 1.0)),  # most starving
+                               # IDLE_UNMET: biggest unmet-demand gap first; else nearest-to-starve.
+                               (-dr if _IDLE_UNMET_ENABLED
+                                else -(draw / (projected_gt.get(sku, 0.0) + 1.0))),
                                -room, sku)
                         if best is None or key < best_key:
                             best = sku; best_key = key; best_room = room
@@ -2331,6 +2446,7 @@ def _write_rolling_curing_excel(
     output_path: str,
     cure_shift_rows: list,         # per-shift press events
     cure_co_events: list,          # curing press CO events (Planned + Dynamic) — Changeover Plan sheet
+    mould_clean_events: list,      # curing press mould-clean events — Changeover Plan sheet
     press_stats: dict,             # {press: {running_mins, co_mins, clean_mins, skus, cycles, units}}
     press_sku_stats: dict,         # {(press,sku): {cycles, units, mins_used}}
     daily_cured: dict,             # {date_str: qty}
@@ -2444,12 +2560,19 @@ def _write_rolling_curing_excel(
     ws = wb.create_sheet("Machine Utilization")
     all_presses = sorted(press_stats)
     if all_presses:
-        avg_u    = sum(press_stats[p]["running_mins"] / avail_mins for p in all_presses) / len(all_presses)
+        # Overall occupancy = (Σ Used + Σ CO + Σ Mould-Clean) / Σ Available across all
+        # presses for the whole month (all presses share the same monthly Available_Mins).
+        _busy    = sum(press_stats[p]["running_mins"] + press_stats[p]["co_mins"]
+                       + press_stats[p]["clean_mins"] for p in all_presses)
+        avg_u    = _busy / (len(all_presses) * avail_mins) if avail_mins else 0.0
         total_co = sum(press_stats[p]["co_mins"] for p in all_presses)
-        high     = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins >= 0.90)
-        low      = sum(1 for p in all_presses if press_stats[p]["running_mins"] / avail_mins < 0.05)
+        _occ_p   = lambda p: ((press_stats[p]["running_mins"] + press_stats[p]["co_mins"]
+                               + press_stats[p]["clean_mins"]) / avail_mins if avail_mins else 0.0)
+        high     = sum(1 for p in all_presses if _occ_p(p) >= 0.90)
+        low      = sum(1 for p in all_presses if _occ_p(p) < 0.05)
         ws.cell(row=1, column=1,
-                value=(f"Avg util: {avg_u:.1%}  |  High(≥90%): {high}  |  Idle(<5%): {low}  |  "
+                value=(f"Avg util (occupancy = used+CO+clean): {avg_u:.1%}  |  "
+                       f"High(≥90%): {high}  |  Idle(<5%): {low}  |  "
                        f"Presses: {len(all_presses)}  |  Total CO_Mins: {int(total_co):,}")
                 ).font = _bold(10)
     _ml = mould_life or {}
@@ -2510,32 +2633,46 @@ def _write_rolling_curing_excel(
     ws.column_dimensions["A"].width = 14; ws.column_dimensions["D"].width = 32
     ws.column_dimensions["I"].width = 16; ws.freeze_panes = "A2"
 
-    # ── Sheet 3b: Changeover Plan — every curing press CO (Planned + Dynamic) ──
-    # Makes dynamic/reactive COs visible in the output, not just the console log.
+    # ── Sheet 3b: Changeover Plan — every curing press CO (Planned + Dynamic) AND
+    # every mould clean (each 8h / 480 min). Both consume a shift, so both are shown
+    # here with their Mins, not just in the console log.
     ws = wb.create_sheet("Changeover Plan")
-    co_cols = ["Date", "Day", "Shift", "Press", "From_SKU", "Target_SKU", "CO_Type"]
+    co_cols = ["Date", "Day", "Shift", "Press", "From_SKU", "Target_SKU", "CO_Type", "Mins"]
     _hdr(ws, 1, co_cols)
-    _co_sorted = sorted(
-        (cure_co_events or []),
+    _co_events   = list(cure_co_events or [])
+    _clean_events = list(mould_clean_events or [])
+    _all_events = sorted(
+        _co_events + _clean_events,
         key=lambda e: (int(e.get("Day", 0)),
                        {"A": 0, "B": 1, "C": 2}.get(e.get("Shift", "A"), 0),
                        str(e.get("Press", ""))),
     )
-    for ri, e in enumerate(_co_sorted, 2):
-        f = _fill(_ORANGE) if e.get("CO_Type") == "Dynamic" else _fill(_LYELL)
+    for ri, e in enumerate(_all_events, 2):
+        _ct = e.get("CO_Type")
+        if _ct == "Mould Clean":
+            f = _fill("D9E1F2")                      # blue — mould clean
+        elif _ct == "Dynamic":
+            f = _fill(_ORANGE)
+        else:
+            f = _fill(_LYELL)                        # planned CO
+        _mins = e.get("Mins", CURING_CO_CHANGEOVER_MINS if _ct != "Mould Clean" else MOULD_CLEAN_MINS)
         for ci, h in enumerate(co_cols, 1):
-            cell = ws.cell(row=ri, column=ci, value=e.get(h, ""))
+            cell = ws.cell(row=ri, column=ci, value=(_mins if h == "Mins" else e.get(h, "")))
             cell.fill = f; cell.alignment = _ctr()
             if h == "CO_Type":
                 cell.font = Font(bold=True)
-    _n_plan = sum(1 for e in _co_sorted if e.get("CO_Type") == "Planned")
-    _n_dyn  = sum(1 for e in _co_sorted if e.get("CO_Type") == "Dynamic")
-    _foot = len(_co_sorted) + 3
+    _n_plan  = sum(1 for e in _co_events if e.get("CO_Type") == "Planned")
+    _n_dyn   = sum(1 for e in _co_events if e.get("CO_Type") in ("Dynamic", "Early-CO"))
+    _n_clean = len(_clean_events)
+    _foot = len(_all_events) + 3
     ws.cell(row=_foot, column=1,
-            value=f"Total curing COs: {len(_co_sorted)}  "
-                  f"(Planned: {_n_plan}, Dynamic: {_n_dyn})").font = Font(bold=True)
+            value=f"Total curing COs: {len(_co_events)}  "
+                  f"(Planned: {_n_plan}, Dynamic: {_n_dyn})   |   "
+                  f"Mould cleans: {_n_clean}  (each {MOULD_CLEAN_MINS} min = 8h)"
+            ).font = Font(bold=True)
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["E"].width = 32; ws.column_dimensions["F"].width = 32
+    ws.column_dimensions["G"].width = 14
     ws.freeze_panes = "A2"
 
     # ── Sheet 4: Mould Tracker ────────────────────────────────────────────────
@@ -3285,6 +3422,8 @@ def run_rolling_pipeline(
     # Distinct SKUs each building machine has produced TODAY (reset per day, seeded with
     # the carryover SKU) — enforces the max-4-SKUs-per-machine-per-day plant rule.
     machine_day_skus:   dict[str, set] = {}
+    # Machines that have spent their one-time +3/-3 inch escape this month (experiment).
+    machine_plus3_used: set = set()
     # Stage-1 carcass machines are scheduled in Step 3b, not in
     # _assign_building_shift, so they need their own current-inch tracker.
     s1_current_inch: dict[str, str] = {}
@@ -3315,6 +3454,7 @@ def run_rolling_pipeline(
     bld_co_events:   list[dict] = []   # building machine CO events
     cure_shift_rows: list[dict] = []   # curing Shift Schedule rows
     cure_co_events:  list[dict] = []   # curing press CO events (Planned + Dynamic)
+    mould_clean_events: list[dict] = []  # curing press mould-clean events (each = 8h/480min)
     press_stats:     dict = defaultdict(lambda: {
         "running_mins": 0.0, "co_mins": 0.0, "clean_mins": 0.0,
         "skus": set(), "cycles": 0, "units": 0,
@@ -3391,6 +3531,143 @@ def run_rolling_pipeline(
             print(f"  [Rolling] curing-allowable load for retarget FAILED ({_e}); "
                   f"retarget disabled")
             press_allow_skus = {}
+
+    # ── Phase 4: Global mould optimiser (experiment, MOULD_GLOBAL_OPT) ─────────
+    # Reverse of press_allow_skus: {sku: [presses eligible to cure it]} (sorted).
+    sku_allow_presses: dict[str, list] = {}
+    for _p_al, _ss_al in press_allow_skus.items():
+        for _s_al in _ss_al:
+            sku_allow_presses.setdefault(_s_al, []).append(_p_al)
+    for _s_al in sku_allow_presses:
+        sku_allow_presses[_s_al].sort()
+    mould_global_stats = {"add": 0, "lib": 0}
+
+    def _amort_value(sku: str, hleft: int) -> float:
+        """Amortised marginal value of +1 press on `sku`: how much it could cure over
+        the remaining horizon, capped by remaining demand. Ranks targets and gates
+        whether a full_evict is worth the production it sacrifices."""
+        rem = demand_remaining.get(sku, 0.0)
+        if rem <= 0:
+            return 0.0
+        draw = _cure_qty_per_shift(cure_ct_map.get(sku, DEFAULT_CURING_CT))
+        return min(rem, draw * 3 * max(1, hleft))
+
+    def _global_mould_boost(day: int, today_cos: list) -> list:
+        """Move scarce moulds toward the most-under-served SKUs, once per day, before
+        today's COs drive the sim. Returns today_cos + extra proactive COs (their
+        moulds already reserved via _try_mount, daily_co_count already bumped).
+        No-op unless _MOULD_GLOBAL_OPT_ENABLED. Respects the daily CO cap. Two modes:
+          ro_only    — only sacrifice/evict presses whose current SKU demand is DONE.
+          full_evict — also evict a RUNNING press when the target's amortised value
+                       strictly exceeds the current SKU's.
+        """
+        if not (_MOULD_GLOBAL_OPT_ENABLED and _mould_gate):
+            return today_cos
+        hleft = planning_days - day
+        slots = MAX_CHANGEOVERS_PER_DAY - daily_co_count.get(day, 0)
+        if slots <= 0:
+            return today_cos
+        full_evict = (_MOULD_GLOBAL_OPT_MODE == "full_evict")
+        busy = {p for p, _, _ in today_cos}          # presses already CO'ing today
+        added: list = []
+
+        # Under-served scarce targets: real remaining demand the CURRENT presses cannot
+        # cure over the horizon, biggest-gap first (scarcest-mould tiebreak → 15"/13").
+        targets = []
+        for T in demand_remaining:
+            rem = demand_remaining.get(T, 0.0)
+            if rem <= MIN_CAMPAIGN_UNITS:
+                continue
+            if len(_sku_moulds.get(T, ())) < 2:
+                continue
+            draw = _cure_qty_per_shift(cure_ct_map.get(T, DEFAULT_CURING_CT))
+            cur_cap = press_count.get(T, 0) * draw * 3 * max(1, hleft)
+            if rem <= cur_cap:                        # current presses already suffice
+                continue
+            targets.append(T)
+        targets.sort(key=lambda s: (-demand_remaining.get(s, 0.0),
+                                    len(_sku_moulds.get(s, ())), s))
+
+        for T in targets:
+            if slots <= 0:
+                break
+            t_val = _amort_value(T, hleft)
+            if t_val <= 0:
+                continue
+            # eligible presses for T we may sacrifice, least-sacrifice first
+            cands = []
+            for P in sku_allow_presses.get(T, ()):
+                if P in busy:
+                    continue
+                st = press_state.get(P)
+                if not st or st.get("status") != "RUNNING":
+                    continue
+                cur = st.get("sku")
+                if not cur or cur == T:
+                    continue
+                cur_rem = demand_remaining.get(cur, 0.0)
+                if cur_rem > 0:
+                    if not full_evict:                # ro_only: never evict a productive press
+                        continue
+                    c_val = _amort_value(cur, hleft)
+                    if t_val <= c_val:                # not worth the sacrifice
+                        continue
+                    cands.append((c_val, str(P), P))
+                else:
+                    cands.append((0.0, str(P), P))    # demand-done → free to reassign
+            cands.sort()
+
+            # (1) DIRECT ADD — a sacrificeable press that can already mount 2 T-moulds.
+            done = False
+            for _sac, _ps, P in cands:
+                if _n_free_for(T, P) >= 2 and _try_mount(P, T, defer_free=True):
+                    added.append((P, press_state[P]["sku"], T))
+                    busy.add(P); slots -= 1
+                    daily_co_count[day] = daily_co_count.get(day, 0) + 1
+                    mould_global_stats["add"] += 1
+                    done = True
+                    break
+            if done or slots <= 0:
+                continue
+            if not cands:                             # nobody would use a freed mould → skip
+                continue
+
+            # (2) LIBERATION — T's moulds are stuck. Free ONE scarce T-mould from a
+            # sacrificeable holder by CO'ing it to a needy SKU that does NOT reuse that
+            # mould, so a later day can mount the freed mould on T.
+            for X in sorted(_sku_moulds.get(T, ())):
+                H = _mould_owner.get(X)
+                if not H or H in busy:
+                    continue
+                st = press_state.get(H)
+                if not st or st.get("status") != "RUNNING":
+                    continue
+                hcur = st.get("sku")
+                if not hcur or hcur == T:             # already serving T — leave it
+                    continue
+                hrem = demand_remaining.get(hcur, 0.0)
+                if hrem > 0 and not (full_evict and t_val > _amort_value(hcur, hleft)):
+                    continue                          # holder still productive / not worth it
+                # neediest retarget SKU for H that does NOT need mould X (so X frees)
+                HT = None; HT_key = None
+                for s in press_allow_skus.get(H, ()):
+                    if s == hcur or demand_remaining.get(s, 0.0) <= 0:
+                        continue
+                    if X in _sku_moulds.get(s, ()):   # would keep X on H
+                        continue
+                    if _n_free_for(s, H) < 2:
+                        continue
+                    key = (demand_remaining.get(s, 0.0), s)
+                    if HT_key is None or key > HT_key:
+                        HT_key = key; HT = s
+                if HT is None or not _try_mount(H, HT, defer_free=True):
+                    continue
+                added.append((H, press_state[H]["sku"], HT))
+                busy.add(H); slots -= 1
+                daily_co_count[day] = daily_co_count.get(day, 0) + 1
+                mould_global_stats["lib"] += 1
+                break                                 # one liberation per target per day
+        return today_cos + added
 
     # ── Phase 3: Unified CO scorer ────────────────────────────────────────────
     # counters (provenance of every committed CO + why some were blocked)
@@ -3666,6 +3943,9 @@ def run_rolling_pipeline(
                     else:
                         mould_blocked_cos += 1
             today_cos = _kept
+        # Phase 4 — global mould optimiser: proactively move scarce moulds toward the
+        # most-under-served SKUs (adds COs within the daily cap). No-op unless enabled.
+        today_cos = _global_mould_boost(day, today_cos)
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
         # SKUs that curing presses are switching TO today — building must pre-build for these
         co_target_skus_today: frozenset = frozenset(co_press_map.values())
@@ -3785,6 +4065,7 @@ def run_rolling_pipeline(
                 machine_inch_since=machine_inch_since,
                 day=day,
                 machine_day_skus=machine_day_skus,
+                machine_plus3_used=machine_plus3_used,
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
@@ -3801,7 +4082,8 @@ def run_rolling_pipeline(
                 _ct_sec   = _BLD_CT_SEC.get(str(machine), 120.0)
                 for _tier_idx, (sku, qty, co_type) in enumerate(campaigns):
                     if co_type != "start":
-                        co_mins = _co_cost(machine, prev_inch, sku_inch.get(sku, ""))
+                        co_mins = (INCH_PLUS3_CO_MINS if co_type == "plus3_CO"
+                                   else _co_cost(machine, prev_inch, sku_inch.get(sku, "")))
                         _co_start = _cursor
                         _cursor   = _cursor + timedelta(minutes=co_mins)
                         bld_shift_rows.append({
@@ -4127,6 +4409,19 @@ def run_rolling_pipeline(
                             clean_carry[press] = MOULD_CLEAN_MINS - clean_here
                             mould_life[press]  = MOULD_CLEAN_CYCLES
                             _cleaned = True
+                            # Record the mould-clean event (one per trigger, 8h/480 min
+                            # total; may overhang into the next shift) — surfaced in the
+                            # Changeover Plan sheet alongside curing COs.
+                            mould_clean_events.append({
+                                "Date":       date_str,
+                                "Day":        day,
+                                "Shift":      shift,
+                                "Press":      press,
+                                "From_SKU":   sku,
+                                "Target_SKU": sku,          # clean keeps the same SKU
+                                "CO_Type":    "Mould Clean",
+                                "Mins":       float(MOULD_CLEAN_MINS),
+                            })
 
                     # ── Instant CO when demand is met ─────────────────────────
                     # Demand just hit 0: CO starts immediately (remaining shift
@@ -4452,8 +4747,11 @@ def run_rolling_pipeline(
     _n_co_planned = sum(1 for e in cure_co_events if e.get("CO_Type") == "Planned")
     _n_co_dynamic = sum(1 for e in cure_co_events if e.get("CO_Type") in ("Dynamic", "Early-CO"))
     _n_co_total   = _n_co_planned + _n_co_dynamic
-    _n_mould_cleans = int(round(sum(s.get("clean_mins", 0.0)
-                                    for s in press_stats.values()) / MOULD_CLEAN_MINS))
+    # One event per clean trigger = the authoritative clean count (matches the
+    # Changeover Plan sheet exactly). Cross-checked against total clean-minutes/480.
+    _n_mould_cleans = len(mould_clean_events)
+    _n_cleans_by_mins = int(round(sum(s.get("clean_mins", 0.0)
+                                      for s in press_stats.values()) / MOULD_CLEAN_MINS))
 
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Results")
@@ -4465,8 +4763,14 @@ def run_rolling_pipeline(
     print(f"  Curing COs (total)   : {_n_co_total:>10,}"
           f"  (planned {_n_co_planned:,} + dynamic {_n_co_dynamic:,})")
     print(f"  Mould cleans taken   : {_n_mould_cleans:>10,}  "
-          f"(clean {'ON' if _MOULD_CLEAN_ENABLED else 'OFF'}, "
-          f"CO-spread {'ON' if _CO_SHIFT_SPREAD_ENABLED else 'OFF'})")
+          f"(events={_n_mould_cleans}, by-minutes={_n_cleans_by_mins}; "
+          f"clean {'ON' if _MOULD_CLEAN_ENABLED else 'OFF'})")
+    if _INCH_PLUS3_ENABLED:
+        print(f"  +3/-3 inch escapes   : {len(machine_plus3_used):>10,}  "
+              f"(one-time per machine, {INCH_PLUS3_CO_MINS} min/8h each)")
+        if _P3DBG:
+            print(f"    [P3-debug] machine-shifts [has-room, stranded, dwell-ok, "
+                  f"has-±3-SKU] = {_PLUS3_DBG}")
     print(f"  Mould-blocked COs    : {mould_blocked_cos:>10,}  "
           f"(mould gate {'ON' if _mould_gate else 'OFF'})")
     print(f"  Mould-retargeted COs : {mould_retargeted_cos:>10,}  "
@@ -4479,6 +4783,10 @@ def run_rolling_pipeline(
               f"planned={_cs['planned']} pullfwd={_cs['pullfwd']} "
               f"retarget={_cs['retarget']} dynamic={_cs['dynamic']} "
               f"cancelled={_cs['cancelled']} build_blocked={_cs['build_blocked']}")
+    if _MOULD_GLOBAL_OPT_ENABLED:
+        print(f"  Global mould opt ({_MOULD_GLOBAL_OPT_MODE}): "
+              f"direct-add={mould_global_stats['add']} "
+              f"liberations={mould_global_stats['lib']}")
     if os.environ.get("MOULD_DEBUG"):
         # Cross-press exclusivity: is any mould listed in >1 press's owned set?
         _own_by_mould: dict = {}
@@ -4522,6 +4830,7 @@ def run_rolling_pipeline(
         output_path       = curing_output,
         cure_shift_rows   = cure_shift_rows,
         cure_co_events    = cure_co_events,
+        mould_clean_events= mould_clean_events,
         press_stats       = dict(press_stats),
         press_sku_stats   = dict(press_sku_stats),
         daily_cured       = dict(daily_cured),

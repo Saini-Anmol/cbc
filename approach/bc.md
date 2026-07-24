@@ -1,5 +1,17 @@
 # B2C Scheduler — Technical Architecture (current)
 
+> **CURRENT STATE (2026-07-24) — read `CLAUDE.md` §"Rules & features added this cycle" for
+> the authoritative, up-to-date summary.** Since this spec was last fully revised, the live
+> engine adds: **(1) mould→SKU availability gate + retarget + unified CO scorer + mould life
+> v2** (a press needs 2 eligible moulds; opening life from the DB); **(2) building inch rules**
+> — 5-day minimum inch dwell + ±2 band + idle-recovery Levers B/C (the old permanent one-way
+> rule is retired); **(3) max 4 distinct SKUs/building machine/day**; **(4) +3/−3 inch escape**
+> (experiment, default OFF). Config now: `MAX_CHANGEOVERS_PER_DAY=12`,
+> `MAX_ENDOFDAY_GT_INVENTORY=7000`, `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
+> **Current LOCAL KPIs (cap=12, all rules live, +3/−3 off, mould-audit PASS):**
+> May 682,260/98.34% · June 634,038/96.56% · July 681,429/87.48%. These rules are physical
+> restrictions that make the plan floor-realistic (KPI below the mould-blind baseline by design).
+
 **Building-to-Curing (B2C):** the building schedule is the **primary output**; the
 curing schedule is **fully derived** from it. Building runs first; curing consumes
 exactly what building produces. Direction is the reverse of the old C2B design.

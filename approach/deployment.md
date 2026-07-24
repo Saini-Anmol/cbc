@@ -1,5 +1,17 @@
 # B2C Scheduler — Deployment DB Contract & Config Mapping (v1)
 
+> **CURRENT STATE (2026-07-24).** Since this spec was written, the engine adds several
+> plant rules — all **engine-side toggles/defaults in `b2c_pipeline.py`**, so **cloud inherits
+> them automatically with NO DB-contract change**: mould→SKU availability gate + retarget +
+> CO scorer + mould life v2 (reads `Master_Mapping_Mould_SKU` + `Daily_Running_Moulds."Mould
+> life"` via the engine's own ETL, both paths), building inch rules (5-day dwell + ±2 band +
+> Levers B/C), max-4-SKU/day cap. The `+3/−3 escape` is default OFF. Config values that
+> changed: `MAX_CHANGEOVERS_PER_DAY=12` (cloud still reads it from
+> `jkt_plan_params.noOfChangeOver`), `MAX_ENDOFDAY_GT_INVENTORY=7000` (pinned in
+> `main.CLOUD_CONFIG`). New tuning constants (`MIN_INCH_DWELL_DAYS`, `MAX_BUILDING_SKUS_PER_DAY`,
+> `INCH_PLUS3_*`, `GT_BUFFER_SHIFTS_VMI/OTHER`) live in `bc_config`; if the cloud must pin them,
+> add to `main.CLOUD_CONFIG`. Re-run the LOCAL↔CLOUD parity gate after any of these move.
+
 Authoritative spec for the cloud deployment. Two halves:
 1. **DDL changes** to apply to the schema (items 1–3 below) — runnable SQL.
 2. **ETL rules** the deployment code (`connection.py` / `main.py`) must follow
