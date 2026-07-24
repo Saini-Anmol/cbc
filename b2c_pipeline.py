@@ -67,6 +67,7 @@ from bc_config import (
     MIN_CAMPAIGN_MINS,
     MIN_CAMPAIGN_UNITS,
     MIN_INCH_DWELL_DAYS,
+    MAX_BUILDING_SKUS_PER_DAY,
     BUILD_LEAD_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
     GT_BUFFER_SHIFTS,
@@ -245,6 +246,12 @@ GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
 # mould life (the CO already includes a clean). env MOULD_CLEAN=0 disables → the
 # pre-mould-clean 690,180 baseline reproduces bit-for-bit.
 _MOULD_CLEAN_ENABLED = True
+
+# Mould life v2: seed each press's OPENING mould life from the real DB remaining life
+# (min over its 2 moulds, so both clean together) instead of a flat 3,000. env
+# MOULD_LIFE_DB=0 → v1 (everyone opens fresh at 3,000) bit-for-bit. Only the FIRST
+# clean's timing changes; a clean/CO still resets to 3,000 (per-press, unchanged).
+_MOULD_LIFE_FROM_DB = True
 
 # ── MOULD→SKU AVAILABILITY GATE (client hard rule) ────────────────────────────
 # A press can only run/CO to an SKU if it physically has 2 eligible moulds mounted
@@ -460,6 +467,9 @@ _INCH_FLEX_EXTRA_COS          = 2   # extra building-CO budget for flex machines
 # explicitly with INCH_RULES=1 only when working the inch plan.
 _INCH_RULES_ENABLED      = True
 _INCH_DBG                = [0, 0, 0]   # INCH_DEBUG: [deficit-done, dwell-pass, dwell-BLOCK]
+# Plant rule: max MAX_BUILDING_SKUS_PER_DAY (4) distinct SKUs per building machine per day
+# (carryover counts as #1; both same/diff-size COs count). Default ON; BLD_SKU_CAP=0 off.
+_BLD_SKU_CAP_ENABLED     = True
 _INCH_BAND_WIDTH         = int(os.environ.get("INCH_BAND", "2"))   # Rule 2: anchor +/- N
 # Variant A (True): the +/-2 band REPLACES the _HARD dominant-inch locks.
 # Variant B (False): keep _HARD as well, so the machine is bound by the
@@ -1209,6 +1219,7 @@ def _assign_building_shift(
     machine_used_inches:    dict | None = None,
     machine_inch_since:     dict | None = None,   # {machine: day its current inch began}
     day:                    int = 1,              # current plan day (for the 5-day dwell)
+    machine_day_skus:       dict | None = None,   # {machine: set(SKUs built today)} — 4/day cap
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -1228,12 +1239,22 @@ def _assign_building_shift(
     machine_anchor_inch = machine_anchor_inch if machine_anchor_inch is not None else {}
     machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
     machine_inch_since  = machine_inch_since  if machine_inch_since  is not None else {}
+    machine_day_skus    = machine_day_skus    if machine_day_skus    is not None else {}
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
         """Rule 2 (+/-2 band) for a candidate (machine, to_inch)."""
         return _inch_ok(to_inch, cur_inch,
                         machine_anchor_inch.get(m, ""),
                         machine_used_inches.get(m, set()))
+
+    def _sku_cap_blocks(m: str, sku: str, shift_skus) -> bool:
+        """Plant 4-SKU/day rule: block a CO that would introduce a 5th DISTINCT SKU on
+        machine `m` today. `shift_skus` = SKUs already in this shift's plan. Carryover +
+        prior shifts live in machine_day_skus[m]. Revisiting an already-built SKU is free."""
+        if not _BLD_SKU_CAP_ENABLED:
+            return False
+        _distinct = machine_day_skus.get(m, set()) | set(shift_skus)
+        return sku not in _distinct and len(_distinct) >= MAX_BUILDING_SKUS_PER_DAY
 
     def _may_leave_inch(m: str, cur_inch: str, defc, buf, rate: float = 0.0) -> bool:
         """Plant 5-day rule: a machine may change to a DIFFERENT inch only if its
@@ -1376,6 +1397,9 @@ def _assign_building_shift(
                     d = _defc(sku, buf)
                     if d <= 0:
                         continue
+                    # 4-SKU/day cap: skip a CO that would be the 5th distinct SKU today.
+                    if _sku_cap_blocks(m, sku, (c[0] for c in s["campaigns"])):
+                        continue
                     to_inch = sku_inch.get(sku, "")
                     # ── Client inch rules (Rule 1a no-revisit + Rule 2 band) ──
                     if not _inch_gate(m, to_inch, cur_inch):
@@ -1475,6 +1499,9 @@ def _assign_building_shift(
                             continue
                         need_co = (sku != cur)
                         if need_co and s["co_count"] >= s["max_cos"]:
+                            continue
+                        # 4-SKU/day cap: don't let the forward buffer spend the day's 5th SKU.
+                        if need_co and _sku_cap_blocks(m, sku, (c[0] for c in s["campaigns"])):
                             continue
                         to_inch = sku_inch.get(sku, "")
                         # ── Client inch rules (same gates as Phase B) ──
@@ -1779,6 +1806,9 @@ def _assign_building_shift(
             for sku in eligible:
                 d = _deficit(sku)
                 if sku == cur_sku or d <= 0:
+                    continue
+                # 4-SKU/day cap (legacy path): block a CO that would be the 5th SKU today.
+                if _sku_cap_blocks(machine, sku, seen_in_plan):
                     continue
                 to_inch = sku_inch.get(sku, "")
                 is_urgent = sku in urgent_co_set or sku in starving_set
@@ -3087,10 +3117,26 @@ def run_rolling_pipeline(
     gt_inventory: dict[str, float] = defaultdict(float, opening_gt)
 
     # ── D2: Mould-clean state (per press) ─────────────────────────────────────
-    # remaining_mould_life = cycles a press may still run before a mandatory clean
-    # (starts at MOULD_CLEAN_CYCLES; v2 will load real opening life). clean_carry =
-    # minutes of an in-progress clean owed at the start of a press's next shift.
+    # remaining_mould_life = cycles a press may still run before a mandatory clean.
+    # v1: everyone opens fresh at MOULD_CLEAN_CYCLES. v2 (_MOULD_LIFE_FROM_DB): seed the
+    # OPENING life from the real DB remaining (3000 − consumed cycles), taken as the MIN
+    # over the press's 2 moulds so both clean together — already computed by
+    # load_running_moulds() as MouldLife_remaining. clean_carry = minutes of an in-progress
+    # clean owed at the start of a press's next shift.
     mould_life:  dict[str, int]   = defaultdict(lambda: MOULD_CLEAN_CYCLES)
+    if _MOULD_LIFE_FROM_DB and _MOULD_CLEAN_ENABLED and "MouldLife_remaining" in df_moulds.columns:
+        _n_seeded = _n_low = 0
+        for _, _r in df_moulds.iterrows():
+            _rem = _r.get("MouldLife_remaining")
+            if _rem is None or pd.isna(_rem):
+                continue
+            _rem = max(0, min(MOULD_CLEAN_CYCLES, int(_rem)))   # 3000 − consumed, clamped
+            mould_life[str(_r["Machine"])] = _rem
+            _n_seeded += 1
+            if _rem < MOULD_CLEAN_CYCLES:
+                _n_low += 1
+        print(f"  [Rolling] Mould life v2: seeded {_n_seeded} presses from DB "
+              f"({_n_low} open below 3000 → earlier cleans)")
     clean_carry: dict[str, float] = defaultdict(float)
     # Minutes of an in-progress CURING CHANGEOVER owed at the start of a press's
     # next shift. A dynamic (instant) CO fires mid-shift the moment demand is met,
@@ -3236,6 +3282,9 @@ def run_rolling_pipeline(
     # that inch campaign began — the 5-day-dwell clock (Rule: min 5 days per size).
     machine_inch_now:   dict[str, str] = {}
     machine_inch_since: dict[str, int] = {}
+    # Distinct SKUs each building machine has produced TODAY (reset per day, seeded with
+    # the carryover SKU) — enforces the max-4-SKUs-per-machine-per-day plant rule.
+    machine_day_skus:   dict[str, set] = {}
     # Stage-1 carcass machines are scheduled in Step 3b, not in
     # _assign_building_shift, so they need their own current-inch tracker.
     s1_current_inch: dict[str, str] = {}
@@ -3543,6 +3592,9 @@ def run_rolling_pipeline(
 
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
+        # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
+        machine_day_skus = {str(_m): ({str(_s)} if _s else set())
+                            for _m, _s in machine_current_sku.items()}
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
         if _ROLLING_HORIZON_CO_ENABLED:
@@ -3732,6 +3784,7 @@ def run_rolling_pipeline(
                 machine_used_inches=machine_used_inches,
                 machine_inch_since=machine_inch_since,
                 day=day,
+                machine_day_skus=machine_day_skus,
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
@@ -3811,6 +3864,9 @@ def run_rolling_pipeline(
                 if campaigns:
                     # Update current SKU at end of THIS SHIFT (not end of day)
                     machine_current_sku[machine] = campaigns[-1][0]
+                    # Record this shift's SKUs into the day set (4-SKU/day cap tracker).
+                    machine_day_skus.setdefault(machine, set()).update(
+                        _c[0] for _c in campaigns)
 
                     # ── Client inch rules: advance the machine's anchor + inch history.
                     # The FIRST inch a machine ever runs fixes its +/-2 band for the

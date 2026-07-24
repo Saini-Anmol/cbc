@@ -111,6 +111,12 @@ MIN_SHIFT_UTILISATION = 0.77
 # idle-fill assignment if a machine drops below this floor after demand cap.
 # ─────────────────────────────────────────────────────────────────────────────
 
+MAX_BUILDING_SKUS_PER_DAY = 4
+# Plant rule: a single building machine may produce at most this many DISTINCT SKUs in
+# one calendar day — the overnight carryover SKU counts as #1, so ≤3 changeovers after it.
+# Both same-size and diff-size COs count. Per-machine (not plant-wide). Enforced when
+# _BLD_SKU_CAP_ENABLED (env BLD_SKU_CAP) in b2c_pipeline.py; stacks on the per-shift CO cap.
+
 MIN_INCH_DWELL_DAYS = 5
 # Plant diff-size (inch-change) building-CO rule: once a machine builds an inch size
 # it must stay on that size ≥ this many days before changing to a DIFFERENT inch —
