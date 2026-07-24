@@ -96,6 +96,76 @@ GT built for SKU A cannot be cured as SKU B even if both are 16".
    Unistage machines have no Stage-1 dependency.
 4. **No waste GT.** Building output ≤ curing consumption. In B2C, this is
    architecture: curing is derived from building, not the other way around.
+5. **Mould availability is physical (LIVE).** A curing press can only run / CO to an SKU
+   if it holds **2 eligible moulds** (`Master_Mapping_Mould_SKU`); a mould serves one press
+   at a time (contention). Every plan must pass the exact bipartite mould-feasibility audit
+   (`scratch_mould_audit.py`). See "Mould→SKU availability constraint".
+6. **Building inch rules (LIVE).** A machine stays within **anchor ±2 inches** and must
+   dwell **≥5 days** on a size before a diff-inch change (deficit-done override). Max **4
+   distinct SKUs per machine per day**. See "Building inch rules" + "Max-4-SKU cap".
+
+---
+
+## Rules & features added this cycle (all LIVE unless noted) — READ THIS
+
+Everything below is in `b2c_pipeline.py`, toggle-gated. Several toggles are **hardcoded
+`True`** (the user pinned them ON): `_MOULD_GATE_ENABLED`, `_MOULD_OPT_ENABLED`,
+`_CO_SCORER_ENABLED`, `_MOULD_LIFE_FROM_DB`, `_MOULD_CLEAN_ENABLED`, `_INCH_RULES_ENABLED`,
+`_BLD_SKU_CAP_ENABLED`. The `+3/−3 escape` (`_INCH_PLUS3_ENABLED`) is env-gated **default
+OFF**. OFF paths reproduce the prior baseline bit-for-bit.
+
+### 1. Mould→SKU availability constraint (curing) — LIVE
+- **Gate (Phase 1):** a press runs / CO's to an SKU only if it has **2 eligible moulds**
+  free. Mapping `Master_Mapping_Mould_SKU` (`Mould`/`Matl.Code`/`Active Flag`=1); loaded by
+  `curing_consumption.load_mould_eligibility()`. 1,284 moulds, one copy each, one press at
+  a time (contention). Movement rides the existing 480-min press CO. Env `MOULD_GATE`.
+- **Retarget (Phase 2, `MOULD_OPT`):** a planned CO blocked for want of moulds redirects to
+  the neediest allowable SKU with 2 free moulds instead of idling.
+- **Unified CO scorer (Phase 3, `CO_SCORER`, ADDITIVE):** one utility ranks {planned /
+  pull-forward / dynamic / retarget / idle} per press, gated by moulds + a quantitative
+  building-feed estimate. `_co_utility` / `_solve_day_cos`. FULL re-opt sub-flag
+  (`SCORER_FULL`) measured WORSE → OFF.
+- **Day-0 second-mould top-up:** single-mould presses (75214, 9404) get a 2nd compatible
+  free mould so both cavities clean together.
+- **Mould life v2 (`MOULD_LIFE_DB`, LIVE):** opening `mould_life` per press seeded from the
+  real DB remaining = `3000 − "Mould life"(consumed)`, **min over the press's 2 moulds** (so
+  both clean together) — already computed by `load_running_moulds().MouldLife_remaining`.
+  Countdown / 8h-clean-at-0 / CO-reset-to-3000 unchanged (per-press). Mean opening ≈2,000;
+  KPI: May +564, June −99, July −12,113.
+- Every plan passes the exact bipartite mould-feasibility audit (`scratch_mould_audit.py`).
+
+### 2. Building inch rules — LIVE (`INCH_RULES`, hardcoded ON)
+Replaces the old permanent one-way / no-revisit rule with a **5-day minimum inch dwell**:
+- A machine may change to a **different** inch only if it has dwelled **≥ `MIN_INCH_DWELL_DAYS`
+  (5) days**, OR the current size's servable demand is done (deficit-done override → change
+  early). It may run one size all month. `_may_leave_inch`, `machine_inch_since`.
+- **±2 band kept** (`_inch_ok`, anchor = first inch). **Revisits now allowed** (dwell-gated).
+- **Applies to all groups incl Stage-1.** Verified: 0 dwell violations; ~75k candidate
+  inch-changes blocked/month.
+- **Idle-recovery levers (both LIVE):** **Lever B** (`INCH_GATE_THRESH`, ON) — sub-campaign
+  remainder counts as "inch done" so a pinned machine leaves early instead of idling.
+  **Lever C** (`INCH_PHASEC_SAME`=**False**, ON) — idle machine's forward-buffer may pre-build
+  any IN-BAND inch (current-inch-first). B+C recover +3.6k/+10.4k/+18.9k (May/June/July).
+  **Lever D** (buffer 3/2) tested, HURT → OFF. **Note the double-negative:** Lever C is ON
+  when `_INCH_RULES_PHASE_C_SAME_INCH = False`.
+- **+3/−3 escape (`INCH_PLUS3`, default OFF experiment):** one inch jump of exactly 3 per
+  machine per month, at an 8h CO (a full shift — CO-only, production next shift), only for a
+  stranded machine with real +3/−3 demand. Net +7,218 (July +6,692). Not adopted yet.
+
+### 3. Max 4 distinct SKUs per building machine per day — LIVE (`BLD_SKU_CAP`, ON)
+Per machine, ≤ `MAX_BUILDING_SKUS_PER_DAY` (4) distinct SKUs/day (carryover = #1; both CO
+types count). Gated in Phase B / Phase C / legacy candidate loops. ~KPI-neutral (July even
+gained — longer, less-churny campaigns). 0 rule violations.
+
+### 4. Output-sheet changes (curing)
+- **Changeover Plan** sheet now lists **mould-clean rows** (`CO_Type = "Mould Clean"`, 480
+  min) alongside curing COs, with a `Mins` column. Counts reconcile across Changeover Plan /
+  Shift Schedule / Machine Utilization / terminal.
+- **Mould Tracker** sheet expanded to one row per (press, mould, SKU-run) — Day-0 opening +
+  every changeover mount; plus a **Mould Movement** sheet (one row per swap).
+- Curing **Machine Utilization** header "Avg util" now = **occupancy** =
+  `(ΣUsed+ΣCO+ΣClean)/ΣAvailable`; per-press `Occupancy_Pct = Util + CO_Pct +
+  Mould_Clean_Utilization_%`, `Available = planning_days×3×480` (whole month).
 
 ---
 
@@ -113,12 +183,18 @@ down). At 0, an **8h clean = `MOULD_CLEAN_MINS = 480` = 1 shift** fires **immedi
 (mid-shift allowed): production caps at the 3,000th cycle, the clean fills the rest of that
 shift, the overhang carries into the next shift, then life resets to 3,000. **A curing CO
 also resets mould life** (the CO includes a clean — no separate clean on a CO shift).
-Impact is tiny (~4 presses trigger, ≤−250 tyres) because v1 starts every press **fresh at
-3,000**. **v2:** real opening mould life lives in the running-moulds DB tables
-(`Mould life` / `Target life` columns, mean ~2,000 remaining) — loading it would make ~110
-of 167 presses need a clean; deferred. Output columns in curing Machine Utilization:
-`total_cycle` (renamed from `Total_Cycles`), `Mould_Clean_Mins`, `Mould_Clean_Utilization_%`,
-`Remaining_Mould_Life`; identity `Available = Used + CO + MouldClean + Idle`.
+**v2 is now LIVE (`_MOULD_LIFE_FROM_DB`, env `MOULD_LIFE_DB`, hardcoded ON):** opening
+`mould_life` per press is seeded from the **real DB remaining life** = `3000 − "Mould life"
+(consumed cycles)`, taken as the **min over the press's 2 moulds** (so both clean together) —
+already computed by `load_running_moulds().MouldLife_remaining`. Mean opening ≈ 2,000; 6
+presses open at 0 (clean Day-1), 23 below 500; cleans jump ~4 → 52–65/month. KPI: May +564,
+June −99, **July −12,113** (July is press-tight so early cleans bind). `MOULD_LIFE_DB=0`
+restores v1 (everyone fresh at 3,000). Clean threshold stays the model's flat **3,000**, not
+the DB `Target life` (which has 1500/30001 outliers). Also: **mould clean events now appear
+as rows in the curing Changeover Plan sheet** (480 min each). Curing Machine-Utilization
+columns: `total_cycle`, `Mould_Clean_Mins`, `Mould_Clean_Utilization_%`, `Remaining_Mould_Life`;
+per-press `Occupancy_Pct = Util + CO_Pct + Mould_Clean_Utilization_%`; header "Avg util" now =
+occupancy `(ΣUsed+ΣCO+ΣClean)/ΣAvailable`.
 
 **LH / RH press labelling:** Each physical curing press appears as two rows in
 `RUNNING_MOULDS_TABLE` — one with suffix `LH` and one with `RH`.
@@ -343,13 +419,16 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. |
 | `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap per calendar day (12 this cycle for the surplus-release test; plant hard limit is 18). Single source of truth in `bc_config.py`. Sweep with forward-buffer live (8→14): all 98.9–99.9%; 14→692,988/99.89%, 12→690,180/99.49% (lowest starvation). Total curing COs scale 174→250. |
-| `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 8,000 (was 10,000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` written to building "Daily GT & Carcass" sheet (verified max ~4,978). |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **7000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 7,000 (was 8,000 → 10,000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` in building "Daily GT & Carcass" sheet. |
 | `MOULD_CLEAN_CYCLES` / `MOULD_CLEAN_MINS` | **3000 / 480** | Mould clean: 3,000 cycles (=6,000 tyres) → 8h (480 min = 1 shift) clean, then reset. Toggle `_MOULD_CLEAN_ENABLED` (default ON). See "Mould setup + mould clean". |
 | `RUNNING_MOULDS_TABLE` | **"Daily\_Running\_Moulds"** | Single source of truth for the Day-0 running-moulds ETL table (curing press state). All 4 SQL sites import it. **ALWAYS `Daily_Running_Moulds` (the live snapshot) — every month, local and cloud. Do NOT switch to the historical `testing_` / `june_` variants; they are retired.** Pinned for cloud in `main.CLOUD_CONFIG`. |
 | `_CO_SHIFT_SPREAD_ENABLED` | **True** | Spread planned curing COs across A/B/C by when each press finishes its old SKU (hardcoded ON; flip to `False` → old shift-A-only). |
 | `_FORWARD_BUFFER_ENABLED` / `_FWD_RISK_SHIFTS` | **ON / 1.0** | Forward-buffer (Phase C) + starvation-risk gate. `b2c_pipeline.py:197/206`. Idle machines pre-build about-to-starve SKUs up to `GT_SHELF_LIFE_SHIFTS = 9` ahead, bounded by `MAX_ENDOFDAY_GT_INVENTORY` (**8k**). Historically the +16k win (674k→690k on the pre-priority-score baseline). |
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
-| `GT_BUFFER_SHIFTS` | **2** | Rolling pipeline: shifts of GT to pre-build as buffer. VMI uses 2; BJ/UNI/STAGE use 1. |
+| `GT_BUFFER_SHIFTS_VMI` / `GT_BUFFER_SHIFTS_OTHER` | **2 / 1** | Flat GT pre-build buffer depth per group (was a single `GT_BUFFER_SHIFTS=2` + hardcoded `1` for others). VMI banks 2 shifts, BJ/UNI/STAGE 1. **Lever D** tested a 3/2 bump — it HURT (front-loading, −8.6k May) → kept at 2/1. Env `GT_BUF_VMI` / `GT_BUF_OTHER`. |
+| `MIN_INCH_DWELL_DAYS` | **5** | Building diff-size (inch-change) rule: a machine must stay on an inch size ≥5 days before changing to a DIFFERENT inch, UNLESS the current size's servable demand is done (deficit-done override → change early). See "Building inch rules". Toggle `_INCH_RULES_ENABLED` (default ON). |
+| `MAX_BUILDING_SKUS_PER_DAY` | **4** | Max distinct SKUs a single building machine may produce per calendar day (overnight carryover counts as #1; both same/diff-size COs count). Per-machine. Toggle `_BLD_SKU_CAP_ENABLED` (env `BLD_SKU_CAP`, default ON). ~KPI-neutral. |
+| `INCH_PLUS3_CO_MINS` / `INCH_PLUS3_MIN_DAYS_LEFT` | **480 / 5** | EXPERIMENT: one-time +3/−3 inch escape per building machine per month at an 8h CO (a full shift). Only for a stranded machine with real +3/−3 demand, ≥5 days left (or in-band demand fully done). Toggle `_INCH_PLUS3_ENABLED` (env `INCH_PLUS3`, **default OFF**). Net +7,218 (July +6,692). |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | **2** | Cap on changeovers a single building machine may perform in one shift (rolling pipeline only). Plant averages 0.57 CO/shift/machine; upper bound of 2 lets one machine serve up to 3 SKU campaigns/shift. Must be `same_size_CO` to hold the 80% utilisation floor — 2× `diff_size_CO` (240 min VMI) would blow past it and is blocked. |
 | `MIN_SHIFT_UTILISATION` | **0.80** | Target: each building machine should hit ≥80% production time per shift (384 of 480 min). **Defined in `bc_config.py` but not currently imported/referenced by `b2c_pipeline.py`, `building_b2c.py`, or `building.py`** — grep confirms no other file reads this constant. Treat it as an aspirational target documented in `bc.md` §19, not an enforced guard, until it is wired into the rolling-pipeline code. |
 | `CURING_CO_DURATION_SHIFTS` | **1** | Shifts a curing press is idle during CO: Shift A only. Mould-clean removed from model. |
@@ -629,33 +708,36 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed Jul 20 2026 — priority-score v1 + planning_days fix live)
+## Current KPIs (confirmed 2026-07-24 — full rule stack live)
 
-The rolling pipeline is **deterministic** (verified: 4 identical runs, fixed and random
-`PYTHONHASHSEED`). Committed default = forward-buffer risk=1.0 + **8k cap** ON, surplus-release ON,
-mould-clean ON, CO-shift-spread ON, `MAX_CHANGEOVERS_PER_DAY = 12`.
+The rolling pipeline is **deterministic** (verified, fixed + random `PYTHONHASHSEED`).
+Current committed stack (toggles hardcoded ON, cap=12, 7k GT cap): **mould gate + retarget +
+CO scorer + mould life v2 + mould clean + inch rules (5-day dwell, ±2 band, Lever B+C) +
+4-SKU/day cap**. `+3/−3 escape` OFF (experiment). Each feature's OFF path reproduces its
+prior baseline bit-for-bit.
 
-**Verified on all 3 months, LOCAL and CLOUD byte-identical** (the parity gate — see
-`approach/deployment.md`). Each month uses its own Day-0 snapshot:
+**LOCAL, cap=12, `Daily_Running_Moulds`, all exact mould-feasibility-audit PASS, demand cap
+0-over, deterministic:**
 
-End-to-end through the **deployed container API**, all with `Daily_Running_Moulds`:
+| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Mould cleans |
+|-------|-------------|--------|----------|----------|----------|-----------|--------------|
+| May  | `demand_may.xlsx`           | 693,748 | 678,348 | **682,260** | **98.34%** | 215 | 65 |
+| June | `june_production_data.xlsx` | 656,608 | 629,886 | **634,038** | **96.56%** | 229 | 52 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 | 676,553 | **681,429** | **87.48%** | 186 | 58 |
 
-| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Building COs | Infeasible SKUs |
-|-------|-------------|--------|----------|----------|----------|-----------|--------------|-----------------|
-| May  | `demand_may.xlsx`           | 693,748 (85 SKUs)  | 681,029 | **687,028** | **99.03%** | 200 | 2,256 | 4 |
-| June | `june_production_data.xlsx` | 656,608 (92 SKUs)  | 643,259 | **648,031** | **98.69%** | 225 | 2,359 | 0 |
-| July | `july_demand_tomerJi1.xlsx` | 778,981 (105 SKUs) | 700,298 | **705,399** | **90.55%** | 179 | 2,494 | 8 |
+**Context — the rules are RESTRICTIONS that make the plan floor-realistic.** Mould-blind
+baseline (physically infeasible) was May 688,873 / June 647,423 / July 704,831; the mould
+gate + inch dwell + mould-life are real plant constraints, so the current KPI sits below
+that by design (July most, because it is press/mould-constrained on 15"/13"). The
+idle-recovery levers (inch B+C) and +3/−3 escape (+7,218, OFF) partly offset.
 
-Machine-group occupancy % (production + CO / available):
-
-| Month | Curing | Building (39) | VMI | BJ | UNI_NARROW | Stage-2 | Stage-1 |
-|-------|--------|---------------|-----|----|------------|---------|---------|
-| May  | 87.76 | 65.67 | 80.16 | 84.90 | 65.41 | 71.88 | 46.54 |
-| June | 86.29 | 67.57 | 81.00 | 81.03 | 55.03 | 81.52 | 51.05 |
-| July | 91.52 | 70.40 | 79.25 | 94.67 | 82.86 | 81.07 | 47.60 |
+**July is the weak month (87.5%, ~90.9k unmet):** gap concentrated in the highest-demand
+inches (15" 39.2k, 13" 21.5k). 73% building-limited (no GT built) + 27% curing-limited (GT
+sitting) — deeper cause is **curing-press / mould scarcity on 15"/13"** (no press draw →
+building sits idle). July building idle: VMI 25%, Stage-2 18%, Stage-1 49% (structural, by
+design). Biggest recoverable lever = a **global mould-allocation optimiser** (deferred).
 
 **Per-SKU demand cap verified on all 3 months: 0 SKUs cured above demand.**
-Runs take ~75-79 s each through the container.
 
 > ⚠️ **Use `june_production_data.xlsx` for June — NOT `demand_tomerji_june_normalized.xlsx`.**
 > The latter totals 742,094 and is a DB export of plan `BTP_June_Plan_R2_941998` (147 rows,

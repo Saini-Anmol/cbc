@@ -17,12 +17,12 @@ frontend is in `API.md`; deployment spec in `approach/deployment.md`.
 
 | Table | Purpose |
 |-------|---------|
-| **`Daily_Running_Moulds`** | **Day-0 curing press state** — which SKU each press runs, mould life. **ALWAYS this table**, every month, local and cloud. The historical `testing_Daily_Running_Moulds` and `june_Daily_Running_Moulds` snapshots are **retired — do not use them.** |
+| **`Daily_Running_Moulds`** | **Day-0 curing press state** — which SKU each press runs, mounted `Current MouldNo` (LH/RH), and `Mould life` (**consumed** cycles → remaining = `3000 − Mould life`). **ALWAYS this table**, every month, local and cloud; historical `testing_`/`june_` snapshots are **retired.** As of 2026-07 the engine USES this life to seed each press's opening mould life (v2, `MOULD_LIFE_DB`, min over the 2 moulds). |
 | `Master_Curing_Design_CycleTime` | raw cure time per SKU (missing → default 17.0) |
 | `Master_Curing_Allowable_Machines` / `_source` | SKU ↔ allowable curing press |
 | `Master_Building_Allowable_Machines` | SKU ↔ allowable building machine (comma-separated `Machines`) |
 | `Master_Building_ChangeoverTime`, `Master_Building_Machine_Design_cycleTime` | building CO times / design CTs |
-| `Master_WC_Master`, `Master_Mapping_Mould_SKU` | work-centre and mould↔SKU mapping |
+| `Master_WC_Master`, `Master_Mapping_Mould_SKU` | work-centre and mould↔SKU mapping. **`Master_Mapping_Mould_SKU` is now ENFORCED** (cols `Mould`/`Matl.Code`/`Active Flag`=1): a curing press may only run/CO to an SKU it has 2 eligible moulds for (1,284 moulds, one press at a time). |
 | `gt_inventory_manual`, `carcass_inventory_manual` | opening GT / carcass inventory |
 | `jkt_sku_description` | SKU → description; fills output `skuDescription` when demand omits it |
 | `Building_Stage1_Best_Machines`, `Building_Stage2_Best_Machines` | preferred machine lists |

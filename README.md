@@ -1,5 +1,14 @@
 # CBC Scheduler — Curing → Building → Curing
 
+> **CURRENT STATE (2026-07-24).** The live engine now models several plant rules (all in
+> `b2c_pipeline.py`; see `CLAUDE.md` §"Rules & features added this cycle" for the authoritative
+> detail): **mould→SKU availability gate + retarget + unified CO scorer + mould life v2**
+> (a curing press needs 2 eligible moulds; opening mould life read from the DB); **building
+> inch rules** (5-day minimum inch dwell + ±2 band + idle-recovery Levers B/C, replacing the
+> old one-way rule); **max 4 distinct SKUs / building machine / day**; and an optional
+> **+3/−3 inch escape** (default OFF). Current LOCAL KPIs (cap=12, all rules live):
+> May 682,260/98.34% · June 634,038/96.56% · July 681,429/87.48%.
+
 A feed-aware production scheduler for the **JK Tyre BTP PCR line**. It couples
 the two existing stage schedulers — **curing** (press allocation) and
 **building** (green-tyre manufacture) — so that curing only commits SKUs its

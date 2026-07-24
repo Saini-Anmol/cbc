@@ -1,5 +1,15 @@
 # CBC Scheduler — Detailed Technical Architecture
 
+> **CURRENT STATE (2026-07-24).** Beyond the core design below, the live engine adds these
+> plant rules (authoritative summary in `CLAUDE.md` §"Rules & features added this cycle"):
+> **(1)** curing **mould→SKU availability** gate + retarget + unified CO scorer + mould life
+> v2 (a press needs 2 eligible moulds from `Master_Mapping_Mould_SKU`; opening life from
+> `Daily_Running_Moulds`); **(2)** building **inch rules** — 5-day minimum inch dwell + ±2
+> band + idle-recovery Levers B/C (retires the old one-way rule); **(3)** **max 4 distinct
+> SKUs / building machine / day**; **(4)** optional **+3/−3 inch escape** (default OFF).
+> Every plan passes the exact bipartite mould-feasibility audit. Current LOCAL KPIs (cap=12):
+> May 682,260/98.34% · June 634,038/96.56% · July 681,429/87.48%.
+
 End-to-end design of the **C**uring → **B**uilding → **C**uring scheduler for
 the JK Tyre BTP PCR line: where data comes from, how each stage processes it,
 and how the stages are chained so curing presses no longer starve.

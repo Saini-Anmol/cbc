@@ -189,8 +189,11 @@ bc_curing_b2c_<plan_id>_<planStartDate>.xlsx
 Building sheets: `Shift Schedule`, `Changeover Plan`, `SKU Classification`,
 `Daily GT & Carcass`, `Demand Fulfillment (B2C)`, `Machine Utilization`.
 Curing sheets: `Demand Fulfillment`, `Machine Utilization`, `Shift Schedule`,
-`Changeover Plan`, `Mould Tracker`, `Machine Schedule`, `Daily Cured tyres`,
-`GT Gap Diagnostic`.
+`Changeover Plan`, `Mould Tracker`, `Mould Movement`, `Machine Schedule`,
+`Daily Cured tyres`, `GT Gap Diagnostic`.
+(As of 2026-07: `Changeover Plan` also lists **mould-clean** rows (480 min) alongside COs;
+`Mould Tracker` is now one row per press×mould×SKU-run and `Mould Movement` logs every mould
+swap; curing `Machine Utilization` "Avg util" = occupancy `(Used+CO+Clean)/Available`.)
 
 ### Downloading them — `GET /plan/download/<plan_id>/<kind>`
 
