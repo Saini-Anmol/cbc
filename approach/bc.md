@@ -1,16 +1,22 @@
 # B2C Scheduler — Technical Architecture (current)
 
-> **CURRENT STATE (2026-07-24) — read `CLAUDE.md` §"Rules & features added this cycle" for
+> **CURRENT STATE (2026-07-25) — read `CLAUDE.md` §"Rules & features added this cycle" for
 > the authoritative, up-to-date summary.** Since this spec was last fully revised, the live
 > engine adds: **(1) mould→SKU availability gate + retarget + unified CO scorer + mould life
 > v2** (a press needs 2 eligible moulds; opening life from the DB); **(2) building inch rules**
 > — 5-day minimum inch dwell + ±2 band + idle-recovery Levers B/C (the old permanent one-way
-> rule is retired); **(3) max 4 distinct SKUs/building machine/day**; **(4) +3/−3 inch escape**
-> (experiment, default OFF). Config now: `MAX_CHANGEOVERS_PER_DAY=12`,
-> `MAX_ENDOFDAY_GT_INVENTORY=7000`, `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
-> **Current LOCAL KPIs (cap=12, all rules live, +3/−3 off, mould-audit PASS):**
-> May 682,260/98.34% · June 634,038/96.56% · July 681,429/87.48%. These rules are physical
-> restrictions that make the plan floor-realistic (KPI below the mould-blind baseline by design).
+> rule is retired); **(3) max 4 distinct SKUs/building machine/day** (env `BLD_SKU_MAX`;
+> tightening to 3 = −32k, kept at 4); **(4) IUkeep — idle building machines re-ranked toward
+> the biggest unmet-demand gaps** (keeps the starvation gate + curable-path, so no waste GT;
+> ADOPTED, `_IDLE_UNMET_ENABLED`); **(5) +3/−3 inch escape** and **(6) global mould optimiser**
+> — experiments, default OFF (the mould optimiser was measured and REJECTED: July is true
+> scarcity, `full_evict` −38k because every mould move costs an 8h clean-shift). Config now:
+> `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=7000`, `MIN_INCH_DWELL_DAYS=5`,
+> `MAX_BUILDING_SKUS_PER_DAY=4`.
+> **Current LOCAL KPIs (cap=12, all rules live incl. IUkeep, +3/−3 & mould-opt off, mould-audit
+> PASS):** May 684,910/98.73% · June 632,168/96.28% · July 694,161/89.11% (IUkeep net +13,512,
+> July +12,732). These rules are physical restrictions that make the plan floor-realistic (KPI
+> below the mould-blind baseline by design).
 
 **Building-to-Curing (B2C):** the building schedule is the **primary output**; the
 curing schedule is **fully derived** from it. Building runs first; curing consumes
@@ -419,6 +425,11 @@ RI keeps raw-deficit ranking.
 
 ### Phase C — Forward buffer (see §8)
 After A and B, idle machine-minutes bank GT for live-draw SKUs that are about to run dry.
+**IUkeep (ADOPTED 2026-07-25):** among those about-to-starve, curable-path candidates, idle
+machines now pick the **biggest unmet-demand gap first** (was nearest-to-starve). The two
+safety gates are kept (draw>0 curable path + starvation-risk throttle → no waste GT); only the
+ranking changed. Toggles `_IDLE_UNMET_ENABLED` / `_IDLE_UNMET_KEEP_GATE` (hardcoded ON; env
+`IDLE_UNMET=0` reverts). Net +13,512 cured (July +12,732 → 89.11%), lower writeoff + starvation.
 
 **Utilisation floor (target, not an override of the demand cap):** `MIN_SHIFT_UTILISATION = 0.77`
 is documented but yields to the demand cap and the CO-cost guard. GT machines only — Stage-1 is

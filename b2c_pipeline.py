@@ -92,6 +92,12 @@ from bc_config import (
 if os.environ.get("MAX_CO"):
     MAX_CHANGEOVERS_PER_DAY = int(os.environ["MAX_CO"])
 
+# Optional env override for the max distinct SKUs a building machine may build per day
+# (committed default 4 in bc_config). Lets us A/B a tighter cap (e.g. 3) without editing
+# bc_config. Unset ⇒ the committed value. Gated by _BLD_SKU_CAP_ENABLED as usual.
+if os.environ.get("BLD_SKU_MAX"):
+    MAX_BUILDING_SKUS_PER_DAY = int(os.environ["BLD_SKU_MAX"])
+
 # Optional OUT_TAG — suffix all output files so parallel runs don't clobber each
 # other (used for concurrent CO-cap sweeps). Unset ⇒ the normal output paths.
 if os.environ.get("OUT_TAG"):

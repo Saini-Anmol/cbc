@@ -111,8 +111,10 @@ GT built for SKU A cannot be cured as SKU B even if both are 16".
 Everything below is in `b2c_pipeline.py`, toggle-gated. Several toggles are **hardcoded
 `True`** (the user pinned them ON): `_MOULD_GATE_ENABLED`, `_MOULD_OPT_ENABLED`,
 `_CO_SCORER_ENABLED`, `_MOULD_LIFE_FROM_DB`, `_MOULD_CLEAN_ENABLED`, `_INCH_RULES_ENABLED`,
-`_BLD_SKU_CAP_ENABLED`. The `+3/−3 escape` (`_INCH_PLUS3_ENABLED`) is env-gated **default
-OFF**. OFF paths reproduce the prior baseline bit-for-bit.
+`_BLD_SKU_CAP_ENABLED`, **`_IDLE_UNMET_ENABLED` + `_IDLE_UNMET_KEEP_GATE`** (the idle→unmet
+lever, §5, adopted 2026-07-24). The `+3/−3 escape` (`_INCH_PLUS3_ENABLED`) and the **global
+mould optimizer** (`_MOULD_GLOBAL_OPT_ENABLED`, §6 — REJECTED) are env-gated **default OFF**.
+OFF paths reproduce the prior baseline bit-for-bit.
 
 ### 1. Mould→SKU availability constraint (curing) — LIVE
 - **Gate (Phase 1):** a press runs / CO's to an SKU only if it has **2 eligible moulds**
@@ -155,7 +157,11 @@ Replaces the old permanent one-way / no-revisit rule with a **5-day minimum inch
 ### 3. Max 4 distinct SKUs per building machine per day — LIVE (`BLD_SKU_CAP`, ON)
 Per machine, ≤ `MAX_BUILDING_SKUS_PER_DAY` (4) distinct SKUs/day (carryover = #1; both CO
 types count). Gated in Phase B / Phase C / legacy candidate loops. ~KPI-neutral (July even
-gained — longer, less-churny campaigns). 0 rule violations.
+gained — longer, less-churny campaigns). 0 rule violations. **Value is env-overridable via
+`BLD_SKU_MAX` (`b2c_pipeline.py`, default = the bc_config 4) for A/B.** Tightening to **3**
+was measured a clear regression (May −7,283, June −8,646, July −16,401 = **−32,330 net**;
+mould-audit PASS) — less per-machine flexibility to match building to curing draw → more
+idle/starvation. **Keep at 4.**
 
 ### 4. Output-sheet changes (curing)
 - **Changeover Plan** sheet now lists **mould-clean rows** (`CO_Type = "Mould Clean"`, 480
@@ -166,6 +172,38 @@ gained — longer, less-churny campaigns). 0 rule violations.
 - Curing **Machine Utilization** header "Avg util" now = **occupancy** =
   `(ΣUsed+ΣCO+ΣClean)/ΣAvailable`; per-press `Occupancy_Pct = Util + CO_Pct +
   Mould_Clean_Utilization_%`, `Available = planning_days×3×480` (whole month).
+
+### 5. Idle building machines → highest-unmet-demand targeting ("IUkeep") — ADOPTED (LIVE)
+The forward buffer (Phase C, §"Forward-buffer") used to fill idle building capacity toward the
+**nearest-to-starve** SKU. This lever re-ranks those Phase-C candidates by **biggest unmet-demand
+gap first** — idle machines aim at the largest demand holes instead of the most-starving SKU.
+- **Keeps the two safety gates** so there is **no waste GT** (invariant #4): the `draw>0`
+  curable-path gate (a press is drawing the SKU now, or CO'ing to it today via the Shift-A
+  pre-build injection) **and** the starvation-risk throttle. It only changes the *ranking*.
+- Two hardcoded-`True` toggles: `_IDLE_UNMET_ENABLED` (ranking) and `_IDLE_UNMET_KEEP_GATE`
+  (keep the throttle). Env `IDLE_UNMET=0` reproduces the prior forward buffer bit-for-bit;
+  `IDLE_UNMET_KEEP_GATE=0` **relaxes** the throttle too (pure front-loading) = MEASURED WORSE
+  (May −6,180, July −12,698) → left OFF. The shipped variant is "keep the gate, re-rank only."
+- **Measured (cap=12, mould-audit PASS, deterministic): May 684,910 (+2,650), June 632,168
+  (−1,870), July 694,161 (+12,732) → net +13,512.** Biggest gain on the weak month (July
+  87.48% → 89.11%). Also LOWERS writeoff (1,864→1,845) and starvation (1,203→1,063).
+- **CO-cap interaction:** WITHOUT this lever, cap=10 was best (+9.5k). WITH it, July peaks at
+  **cap=12** (694,161, beating 10/11/13/14/16) — the optimum flips because IUkeep feeds more
+  presses and needs the CO budget to cure that GT. **Cap kept at 12.**
+
+### 6. Global mould optimiser — REJECTED (env `MOULD_GLOBAL_OPT`, default OFF, code retained)
+Experiment to reallocate scarce 15″/13″ moulds globally each day (`_global_mould_boost`): rank
+the most-under-served scarce SKUs, then either DIRECT-ADD a sacrificeable press or LIBERATE a
+stuck mould. Two modes (`MOULD_OPT_MODE`): `ro_only` (only sacrifice demand-done presses) /
+`full_evict` (also evict running presses). **Both rejected:**
+- `ro_only`: +1,596 **May only**, fires **0× in July** (nothing to reallocate) — marginal.
+- `full_evict`: May −11,519 / June −6,629 / July −19,942 (**−38,090 net**). Every mould move is
+  a press CO = 480 min (the 8h clean) + mould-life reset to 3000 (charged, `b2c_pipeline.py`
+  end-of-day CO loop), so its ~150 July moves burned ~150 clean-shifts.
+- **Finding:** July's 15″/13″ gap is **true mould scarcity, not misallocation** — every mould is
+  already on an in-demand SKU. The existing daily scarce-first ordering + retarget + CO scorer
+  already allocate near the ceiling. More moulds/presses (a capacity decision) is the only lever
+  left there, not smarter allocation. Toggle left in the code, OFF, for the record.
 
 ---
 
@@ -427,7 +465,7 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `CO_CLASS_B_THRESHOLD` | **0.8** | CO fires if `current_days > H × 0.8`. Lower = more COs scheduled. |
 | `GT_BUFFER_SHIFTS_VMI` / `GT_BUFFER_SHIFTS_OTHER` | **2 / 1** | Flat GT pre-build buffer depth per group (was a single `GT_BUFFER_SHIFTS=2` + hardcoded `1` for others). VMI banks 2 shifts, BJ/UNI/STAGE 1. **Lever D** tested a 3/2 bump — it HURT (front-loading, −8.6k May) → kept at 2/1. Env `GT_BUF_VMI` / `GT_BUF_OTHER`. |
 | `MIN_INCH_DWELL_DAYS` | **5** | Building diff-size (inch-change) rule: a machine must stay on an inch size ≥5 days before changing to a DIFFERENT inch, UNLESS the current size's servable demand is done (deficit-done override → change early). See "Building inch rules". Toggle `_INCH_RULES_ENABLED` (default ON). |
-| `MAX_BUILDING_SKUS_PER_DAY` | **4** | Max distinct SKUs a single building machine may produce per calendar day (overnight carryover counts as #1; both same/diff-size COs count). Per-machine. Toggle `_BLD_SKU_CAP_ENABLED` (env `BLD_SKU_CAP`, default ON). ~KPI-neutral. |
+| `MAX_BUILDING_SKUS_PER_DAY` | **4** | Max distinct SKUs a single building machine may produce per calendar day (overnight carryover counts as #1; both same/diff-size COs count). Per-machine. Toggle `_BLD_SKU_CAP_ENABLED` (env `BLD_SKU_CAP`, default ON). ~KPI-neutral at 4. **Value env-overridable via `BLD_SKU_MAX`**; tightening to **3** = −32,330 net (regression, see §3) → keep 4. |
 | `INCH_PLUS3_CO_MINS` / `INCH_PLUS3_MIN_DAYS_LEFT` | **480 / 5** | EXPERIMENT: one-time +3/−3 inch escape per building machine per month at an 8h CO (a full shift). Only for a stranded machine with real +3/−3 demand, ≥5 days left (or in-band demand fully done). Toggle `_INCH_PLUS3_ENABLED` (env `INCH_PLUS3`, **default OFF**). Net +7,218 (July +6,692). |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | **2** | Cap on changeovers a single building machine may perform in one shift (rolling pipeline only). Plant averages 0.57 CO/shift/machine; upper bound of 2 lets one machine serve up to 3 SKU campaigns/shift. Must be `same_size_CO` to hold the 80% utilisation floor — 2× `diff_size_CO` (240 min VMI) would blow past it and is blocked. |
 | `MIN_SHIFT_UTILISATION` | **0.80** | Target: each building machine should hit ≥80% production time per shift (384 of 480 min). **Defined in `bc_config.py` but not currently imported/referenced by `b2c_pipeline.py`, `building_b2c.py`, or `building.py`** — grep confirms no other file reads this constant. Treat it as an aspirational target documented in `bc.md` §19, not an enforced guard, until it is wired into the rolling-pipeline code. |
@@ -510,6 +548,12 @@ aggressive/more front-load; `0` = gate off.
 buffer (survive a rotation to a partner and back — needs a partner) · **forward-buffer** (bank GT for a
 live SKU's own future need using idle time, up to 9 shifts, **no partner required** — the gap the other
 two never covered).
+
+> **Now re-ranked by the IUkeep lever (§5, ADOPTED 2026-07-24).** The starvation-risk gate above is
+> KEPT (still only pre-builds about-to-starve, curable-path SKUs — no waste GT), but among those
+> candidates idle machines now pick the **biggest unmet-demand gap first** instead of the most-starving
+> one. Net +13,512 (July +12,732 → 89.11%), lower writeoff + starvation. `IDLE_UNMET=0` reverts to the
+> nearest-to-starve ranking documented above.
 
 **Honest limit:** forward-buffer is a throughput **accelerator** — it cures more, *earlier*, so it
 **front-loads building** (daily-GT CV 12.4% → 16%), the opposite of the plant's flat ~22.4k/day curve.
@@ -708,34 +752,41 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (confirmed 2026-07-24 — full rule stack live)
+## Current KPIs (confirmed 2026-07-25 — full rule stack live, IUkeep ADOPTED)
 
 The rolling pipeline is **deterministic** (verified, fixed + random `PYTHONHASHSEED`).
 Current committed stack (toggles hardcoded ON, cap=12, 7k GT cap): **mould gate + retarget +
 CO scorer + mould life v2 + mould clean + inch rules (5-day dwell, ±2 band, Lever B+C) +
-4-SKU/day cap**. `+3/−3 escape` OFF (experiment). Each feature's OFF path reproduces its
-prior baseline bit-for-bit.
+4-SKU/day cap + IUkeep idle→unmet targeting (§5)**. `+3/−3 escape` and the **global mould
+optimiser (§6)** are OFF (experiments). Each feature's OFF path reproduces its prior baseline
+bit-for-bit.
 
 **LOCAL, cap=12, `Daily_Running_Moulds`, all exact mould-feasibility-audit PASS, demand cap
 0-over, deterministic:**
 
 | Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Mould cleans |
 |-------|-------------|--------|----------|----------|----------|-----------|--------------|
-| May  | `demand_may.xlsx`           | 693,748 | 678,348 | **682,260** | **98.34%** | 215 | 65 |
-| June | `june_production_data.xlsx` | 656,608 | 629,886 | **634,038** | **96.56%** | 229 | 52 |
-| July | `july_demand_tomerJi1.xlsx` | 778,981 | 676,553 | **681,429** | **87.48%** | 186 | 58 |
+| May  | `demand_may.xlsx`           | 693,748 | 680,073 | **684,910** | **98.73%** | 215 | 67 |
+| June | `june_production_data.xlsx` | 656,608 | 627,907 | **632,168** | **96.28%** | 232 | 51 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 | 689,388 | **694,161** | **89.11%** | 184 | 61 |
+
+> **IUkeep delta (vs the prior 4-SKU-cap baseline of May 682,260 / June 634,038 / July
+> 681,429):** May +2,650, June −1,870, **July +12,732** → **net +13,512**, biggest gain on the
+> weak month. Also LOWERS writeoff and starvation. `IDLE_UNMET=0` restores the prior numbers.
 
 **Context — the rules are RESTRICTIONS that make the plan floor-realistic.** Mould-blind
 baseline (physically infeasible) was May 688,873 / June 647,423 / July 704,831; the mould
 gate + inch dwell + mould-life are real plant constraints, so the current KPI sits below
 that by design (July most, because it is press/mould-constrained on 15"/13"). The
-idle-recovery levers (inch B+C) and +3/−3 escape (+7,218, OFF) partly offset.
+idle-recovery levers (inch B+C, IUkeep) and +3/−3 escape (+7,218, OFF) partly offset.
 
-**July is the weak month (87.5%, ~90.9k unmet):** gap concentrated in the highest-demand
-inches (15" 39.2k, 13" 21.5k). 73% building-limited (no GT built) + 27% curing-limited (GT
-sitting) — deeper cause is **curing-press / mould scarcity on 15"/13"** (no press draw →
-building sits idle). July building idle: VMI 25%, Stage-2 18%, Stage-1 49% (structural, by
-design). Biggest recoverable lever = a **global mould-allocation optimiser** (deferred).
+**July is the weak month (89.1%, ~85k unmet):** gap concentrated in the highest-demand
+inches (15" and 13"). Deeper cause is **curing-press / mould scarcity on 15"/13"** (no press
+draw → building sits idle). **A global mould-allocation optimiser was built and measured
+(§6) — REJECTED:** July is true mould scarcity, not misallocation (the optimiser fires 0× in
+July; aggressive `full_evict` is −38k because every mould move costs an 8h clean-shift). The
+remaining July lever is **more moulds/presses on 15"/13" (a capacity decision)**, not smarter
+scheduling.
 
 **Per-SKU demand cap verified on all 3 months: 0 SKUs cured above demand.**
 
