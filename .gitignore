@@ -26,4 +26,5 @@ docker_output/
 
 # Bipartite gragh for the feasible plan as per moulds and press data, assignment of moulds as per the allowable matrix and business rules and based on priority score- remaining demand/running press
 
-# Added mould tracker sheet in the curing schedule output.
+
+# Now, we have implemented the different size CO on the building machine rules as well. But, we got too much reduction in our overall KPIs. But, we have a lot of building machines idle. why we are not able to utilise the machine capacity and how can we improve our KPIs? Provide apporach for this, and root cause is idle building machine. Right? 

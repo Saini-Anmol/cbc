@@ -111,6 +111,13 @@ MIN_SHIFT_UTILISATION = 0.77
 # idle-fill assignment if a machine drops below this floor after demand cap.
 # ─────────────────────────────────────────────────────────────────────────────
 
+MIN_INCH_DWELL_DAYS = 5
+# Plant diff-size (inch-change) building-CO rule: once a machine builds an inch size
+# it must stay on that size ≥ this many days before changing to a DIFFERENT inch —
+# UNLESS the current size's demand it can serve is already completed on that machine
+# (deficit-done override, then it may change early). A machine may run one size all
+# month. Only enforced when _INCH_RULES_ENABLED (env INCH_RULES=1) in b2c_pipeline.py.
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. BUILDING SCHEDULER  →  building_b2c.py  +  building.py Config
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,6 +203,14 @@ GT_BUFFER_SHIFTS        = 2
 # to stay active. With _buf=2, target = 2× cure rate → each sibling fills ~1 shift
 # worth → total 2 shifts of buffer maintained.
 # BJ/UNISTAGE/STAGE use 1× (see _assign_building_shift _buf logic).
+
+# Flat GT pre-build buffer depth per group (shifts of cure-draw to bank ahead). Lever D
+# for idle-machine recovery under the inch rules: raising these lets an idle/pinned
+# machine bank more current-inch GT (bounded by the demand cap + MAX_ENDOFDAY_GT_INVENTORY,
+# so no overbuild/excess carry). Defaults = today's values (VMI 2 / others 1) so the
+# baseline is unchanged; test the recovery config with GT_BUF_VMI=3 GT_BUF_OTHER=2.
+GT_BUFFER_SHIFTS_VMI    = int(os.environ.get("GT_BUF_VMI",   "2"))
+GT_BUFFER_SHIFTS_OTHER  = int(os.environ.get("GT_BUF_OTHER", "1"))
 
 POOL_SIZE = 3
 # Max SKUs per building machine pool.

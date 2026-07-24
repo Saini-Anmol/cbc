@@ -66,9 +66,12 @@ from bc_config import (
     MAX_CHANGEOVERS_PER_DAY,
     MIN_CAMPAIGN_MINS,
     MIN_CAMPAIGN_UNITS,
+    MIN_INCH_DWELL_DAYS,
     BUILD_LEAD_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
     GT_BUFFER_SHIFTS,
+    GT_BUFFER_SHIFTS_VMI,
+    GT_BUFFER_SHIFTS_OTHER,
     BUILDING_CO_SAME_SIZE,
     BUILDING_CO_DIFF_SIZE,
     SHIFT_MINS,
@@ -455,7 +458,8 @@ _INCH_FLEX_EXTRA_COS          = 2   # extra building-CO budget for flex machines
 # DEFAULT OFF — the inch rules are a SEPARATE, parked, not-yet-approved plan. They
 # must not be live for the mould baseline (they dropped July ~90%→79%). Turn on
 # explicitly with INCH_RULES=1 only when working the inch plan.
-_INCH_RULES_ENABLED      = os.environ.get("INCH_RULES", "0") != "0"
+_INCH_RULES_ENABLED      = True
+_INCH_DBG                = [0, 0, 0]   # INCH_DEBUG: [deficit-done, dwell-pass, dwell-BLOCK]
 _INCH_BAND_WIDTH         = int(os.environ.get("INCH_BAND", "2"))   # Rule 2: anchor +/- N
 # Variant A (True): the +/-2 band REPLACES the _HARD dominant-inch locks.
 # Variant B (False): keep _HARD as well, so the machine is bound by the
@@ -464,16 +468,21 @@ _INCH_BAND_REPLACES_HARD = os.environ.get("INCH_BAND_REPLACES_HARD", "1") != "0"
 # Keep the opportunistic forward buffer (Phase C) on the machine's CURRENT inch:
 # under one-way movement an inch change is irreversible, so it should be spent on
 # real demand (Phase B), not on speculative pre-building.
-_INCH_RULES_PHASE_C_SAME_INCH = os.environ.get("INCH_PHASEC_SAME", "1") != "0"
+# DEFAULT OFF (Lever C): with the 5-day dwell + revisits an inch change is NO LONGER a
+# one-time door, so the idle-machine forward-buffer may pre-build any IN-BAND inch (still
+# gated by the ±2 band + 5-day leave gate + starvation gate). Current-inch is preferred
+# first via the Phase-C sort key. INCH_PHASEC_SAME=1 restores the old same-inch-only lock.
+_INCH_RULES_PHASE_C_SAME_INCH = False
 # Rule 1a (never re-use an inch the machine has left) as its own sub-toggle, so
 # the cost of the one-way rule can be measured separately from the +/-2 band.
 _INCH_NO_REVISIT = os.environ.get("INCH_NO_REVISIT", "1") != "0"
-# Treat a sub-campaign leftover deficit as "inch finished" so the machine may
-# leave. DEFAULT OFF — measured on all 3 months and it made every one WORSE
-# (May -13,197 / June -8,550 / July -28,304). Under one-way movement an easier
-# exit burns the machine's limited inches sooner. Kept as a toggle to document
-# the experiment; do not enable without re-measuring.
-_INCH_GATE_CAMPAIGN_THRESHOLD = os.environ.get("INCH_GATE_THRESH", "0") != "0"
+# Treat a sub-campaign leftover deficit as "inch finished" so a pinned machine may leave
+# early instead of idling to day 5 (Lever B). DEFAULT ON. The earlier "made it worse"
+# result (May -13,197 / June -8,550 / July -28,304) was measured under PERMANENT one-way
+# movement, where an easier exit burned the machine's limited inches forever. That no
+# longer applies: with the 5-day dwell + revisits allowed, leaving is not permanent, so a
+# nearly-exhausted inch should be releasable. INCH_GATE_THRESH=0 restores the strict gate.
+_INCH_GATE_CAMPAIGN_THRESHOLD = True
 
 # Machine groups for the flex brute-force (plant multi-inch ranking: VMI 4.6 >
 # BJ 2.4 ~ UNI 2.3 > IRM 1.5 inches/machine).
@@ -681,11 +690,17 @@ def _inch_num(inch: str):
 
 
 def _inch_ok(to_inch: str, cur_inch: str, anchor: str, used: set) -> bool:
-    """Client inch rules — Rule 2 (+/-2 band) and Rule 1a (never revisit an inch).
+    """Client inch rules — Rule 2 (+/-2 band) ONLY.
 
     anchor == "" means the machine has not been assigned yet, so its first
     assignment is unconstrained (that assignment sets the anchor).
     Staying on the current inch is always allowed.
+
+    Rule 1a (permanent no-revisit) has been RETIRED: the plant rule is now a 5-day
+    minimum inch dwell (MIN_INCH_DWELL_DAYS), so a machine MAY return to an inch it
+    left once the dwell/deficit-done leave gate permits. Revisit is therefore legal
+    here; the timing is enforced by _may_leave_inch at the leave sites. `used` is kept
+    in the signature for callers but no longer gates.
     """
     if not _INCH_RULES_ENABLED:
         return True
@@ -695,10 +710,6 @@ def _inch_ok(to_inch: str, cur_inch: str, anchor: str, used: set) -> bool:
     # Rule 2 — must stay within anchor +/- _INCH_BAND_WIDTH.
     a, t = _inch_num(anchor), _inch_num(to_inch)
     if a is not None and t is not None and abs(t - a) > _INCH_BAND_WIDTH:
-        return False
-
-    # Rule 1a — an inch the machine has already left can never be re-used.
-    if _INCH_NO_REVISIT and to_inch in (used or ()):
         return False
     return True
 
@@ -1196,6 +1207,8 @@ def _assign_building_shift(
     machine_total_demand:   dict | None = None,
     machine_anchor_inch:    dict | None = None,
     machine_used_inches:    dict | None = None,
+    machine_inch_since:     dict | None = None,   # {machine: day its current inch began}
+    day:                    int = 1,              # current plan day (for the 5-day dwell)
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -1214,12 +1227,26 @@ def _assign_building_shift(
     # Client inch-rule state (persisted across shifts by run_rolling_pipeline).
     machine_anchor_inch = machine_anchor_inch if machine_anchor_inch is not None else {}
     machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
+    machine_inch_since  = machine_inch_since  if machine_inch_since  is not None else {}
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
-        """Rules 1a + 2 for a candidate (machine, to_inch)."""
+        """Rule 2 (+/-2 band) for a candidate (machine, to_inch)."""
         return _inch_ok(to_inch, cur_inch,
                         machine_anchor_inch.get(m, ""),
                         machine_used_inches.get(m, set()))
+
+    def _may_leave_inch(m: str, cur_inch: str, defc, buf, rate: float = 0.0) -> bool:
+        """Plant 5-day rule: a machine may change to a DIFFERENT inch only if its
+        current size's servable demand is already done (deficit-done override → leave
+        early), OR it has dwelled >= MIN_INCH_DWELL_DAYS on the current inch."""
+        if not _INCH_RULES_ENABLED or not cur_inch:
+            return True
+        if _inch_demand_done(m, cur_inch, machine_skus, sku_inch, defc, buf, rate):
+            if os.environ.get("INCH_DEBUG"): _INCH_DBG[0] += 1     # deficit-done exits
+            return True                                    # deficit-done → may leave early
+        _ok = (day - machine_inch_since.get(m, day)) >= MIN_INCH_DWELL_DAYS
+        if os.environ.get("INCH_DEBUG"): _INCH_DBG[1 if _ok else 2] += 1  # dwell-pass / dwell-block
+        return _ok
 
     def _max_cos(mach: str) -> int:
         # Flex machines get extra CO budget so they can take an off-inch
@@ -1240,7 +1267,8 @@ def _assign_building_shift(
         # remaining (machine,SKU) pairs are scored together and assigned best-first,
         # with constraint=min(flex_machine,flex_sku) so constrained machines/SKUs win.
         def _buf_of(m: str) -> float:
-            return GT_BUFFER_SHIFTS if _MACHINE_GROUP.get(m, "") == "VMI" else 1
+            return (GT_BUFFER_SHIFTS_VMI if _MACHINE_GROUP.get(m, "") == "VMI"
+                    else GT_BUFFER_SHIFTS_OTHER)
 
         def _defc(sku: str, _b: float) -> float:
             built_ahead = projected_gt.get(sku, 0.0)
@@ -1352,11 +1380,9 @@ def _assign_building_shift(
                     # ── Client inch rules (Rule 1a no-revisit + Rule 2 band) ──
                     if not _inch_gate(m, to_inch, cur_inch):
                         continue
-                    # ── Rule 1b: leave the current inch only when nothing at that
-                    #    inch still needs this machine right now ──
+                    # ── Leave gate: 5-day inch dwell OR deficit-done override ──
                     if (_INCH_RULES_ENABLED and to_inch != cur_inch
-                            and not _inch_demand_done(m, cur_inch, machine_skus,
-                                                      sku_inch, _defc, buf, rate)):
+                            and not _may_leave_inch(m, cur_inch, _defc, buf, rate)):
                         continue
                     if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
                             and to_inch != dom and not s["primary_done"]
@@ -1463,8 +1489,7 @@ def _assign_building_shift(
                         if not _inch_gate(m, to_inch, cur_inch):
                             continue
                         if (_INCH_RULES_ENABLED and to_inch != cur_inch
-                                and not _inch_demand_done(m, cur_inch, machine_skus,
-                                                          sku_inch, _defc, _buf_of(m), rate)):
+                                and not _may_leave_inch(m, cur_inch, _defc, _buf_of(m), rate)):
                             continue
                         # respect the flex/soft-lock off-dominant-inch gate (as Phase B)
                         if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
@@ -1475,7 +1500,11 @@ def _assign_building_shift(
                         room = target - projected_gt.get(sku, 0.0)
                         if room <= 0:
                             continue
-                        key = (0 if to_inch == dom else 1,        # dominant inch first
+                        key = (# Lever C: under the inch rules, keep the machine on its
+                               # CURRENT inch first — only move to another in-band inch when
+                               # no current-inch SKU is starving (i.e. move only for starvation).
+                               (0 if to_inch == cur_inch else 1) if _INCH_RULES_ENABLED else 0,
+                               0 if to_inch == dom else 1,        # dominant inch first
                                0 if sku == cur else 1,            # avoid a CO if possible
                                -(draw / (projected_gt.get(sku, 0.0) + 1.0)),  # most starving
                                -room, sku)
@@ -1575,7 +1604,7 @@ def _assign_building_shift(
 
     for machine in sorted_machines:
         group = _MACHINE_GROUP.get(machine, "")
-        _buf = GT_BUFFER_SHIFTS if group == "VMI" else 1
+        _buf = GT_BUFFER_SHIFTS_VMI if group == "VMI" else GT_BUFFER_SHIFTS_OTHER
 
         def _deficit(sku: str, _b: float = _buf) -> float:
             built_ahead = projected_gt.get(sku, 0.0)
@@ -3203,6 +3232,10 @@ def run_rolling_pipeline(
     #   can never be re-used (Rule 1a).
     machine_anchor_inch: dict[str, str] = {}
     machine_used_inches: dict[str, set] = {}
+    # machine_inch_now / machine_inch_since: the machine's CURRENT inch and the day
+    # that inch campaign began — the 5-day-dwell clock (Rule: min 5 days per size).
+    machine_inch_now:   dict[str, str] = {}
+    machine_inch_since: dict[str, int] = {}
     # Stage-1 carcass machines are scheduled in Step 3b, not in
     # _assign_building_shift, so they need their own current-inch tracker.
     s1_current_inch: dict[str, str] = {}
@@ -3219,6 +3252,8 @@ def run_rolling_pipeline(
                 continue
             machine_anchor_inch.setdefault(str(_m0), _i0)
             machine_used_inches.setdefault(str(_m0), set()).add(_i0)
+            machine_inch_now.setdefault(str(_m0), _i0)
+            machine_inch_since.setdefault(str(_m0), 1)     # Day-0 inch clock starts day 1
             if str(_m0) in _S1_MACHINES:
                 s1_current_inch.setdefault(str(_m0), _i0)
         print(f"  [Rolling] Inch anchors seeded from Day-0 machine state: "
@@ -3695,6 +3730,8 @@ def run_rolling_pipeline(
                 machine_total_demand=machine_total_demand,
                 machine_anchor_inch=machine_anchor_inch,
                 machine_used_inches=machine_used_inches,
+                machine_inch_since=machine_inch_since,
+                day=day,
             )
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
@@ -3777,8 +3814,8 @@ def run_rolling_pipeline(
 
                     # ── Client inch rules: advance the machine's anchor + inch history.
                     # The FIRST inch a machine ever runs fixes its +/-2 band for the
-                    # month; every inch it runs is recorded so it can never be re-used
-                    # after the machine leaves it (Rule 1a).
+                    # month (Rule 2). machine_inch_since restarts the 5-day-dwell clock
+                    # whenever the machine's current inch actually changes.
                     if _INCH_RULES_ENABLED:
                         _used = machine_used_inches.setdefault(machine, set())
                         for _c_sku, _c_qty, _c_type in campaigns:
@@ -3788,6 +3825,10 @@ def run_rolling_pipeline(
                             if machine not in machine_anchor_inch:
                                 machine_anchor_inch[machine] = _ci
                             _used.add(_ci)
+                        _end_inch = sku_inch.get(campaigns[-1][0], "")
+                        if _end_inch and machine_inch_now.get(machine) != _end_inch:
+                            machine_inch_since[machine] = day      # new inch → reset dwell clock
+                            machine_inch_now[machine]   = _end_inch
 
                     # Update cross-shift minute tracker.
                     # Accumulate production minutes after the LAST CO in this shift.
@@ -3875,6 +3916,9 @@ def run_rolling_pipeline(
                                 machine_anchor_inch[m] = _s1_i
                             machine_used_inches.setdefault(m, set()).add(_s1_i)
                             s1_current_inch[m] = _s1_i
+                            if machine_inch_now.get(m) != _s1_i:   # dwell clock (Stage-1 follows Stage-2)
+                                machine_inch_since[m] = day
+                                machine_inch_now[m]   = _s1_i
                     # One SKU per Stage-1 machine per shift → carcass run starts
                     # at the shift clock start; duration = alloc × CT.
                     _c_start = _shift_start
@@ -4371,6 +4415,8 @@ def run_rolling_pipeline(
           f"(mould gate {'ON' if _mould_gate else 'OFF'})")
     print(f"  Mould-retargeted COs : {mould_retargeted_cos:>10,}  "
           f"(Phase-2 opt {'ON' if (_mould_gate and _mould_opt) else 'OFF'})")
+    if _INCH_RULES_ENABLED and os.environ.get("INCH_DEBUG"):
+        print(f"  Inch leave-gate [deficit-done, dwell-pass, dwell-BLOCK]: {_INCH_DBG}")
     if _CO_SCORER_ENABLED:
         _cs = co_scorer_stats
         print(f"  CO scorer ({'FULL' if _SCORER_FULL_REOPT else 'ADD'}) : "
