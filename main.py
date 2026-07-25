@@ -44,6 +44,8 @@ CLOUD_CONFIG: dict = {
     "TOPUP_LOOKAHEAD_DAYS_GT":                3,
     "CARCASS_SHELF_LIFE_DAYS":                1,
     "GT_BUFFER_SHIFTS":                       2,
+    "GT_BUFFER_SHIFTS_VMI":                   2,      # split buffer (VMI banks 2 shifts)
+    "GT_BUFFER_SHIFTS_OTHER":                 1,      # BJ/UNI/STAGE bank 1
     # ── Mould clean (curing press) ──────────────────────────────────────
     "MOULD_CLEAN_CYCLES":                     3000,
     "MOULD_CLEAN_MINS":                       480,
@@ -55,11 +57,22 @@ CLOUD_CONFIG: dict = {
     "POOL_SIZE":                              3,
     "STARVATION_BUFFER_MINS":                 30,
     "STAGE2_CO_TIME_MULTIPLIER":              2.0,
+    "BUILD_LEAD_SHIFTS":                      3,
+    # ── Building inch rules + SKU cap (this cycle) ──────────────────────
+    "MIN_INCH_DWELL_DAYS":                    5,      # 5-day min inch dwell (INCH_RULES)
+    "MAX_BUILDING_SKUS_PER_DAY":              4,      # 4 distinct SKUs/machine/day (BLD_SKU_CAP)
+    "INCH_PLUS3_CO_MINS":                     480,    # +3/−3 escape (toggle OFF by default)
+    "INCH_PLUS3_MIN_DAYS_LEFT":               5,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
-    "CURING_CO_CHANGEOVER_MINS":              480,
+    "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)
     "CURING_CO_DURATION_SHIFTS":              1,
 }
+# NOTE: the b2c_pipeline behaviour toggles (IUkeep `_IDLE_UNMET_ENABLED`/`_IDLE_UNMET_KEEP_GATE`,
+# mould gate, CO scorer, inch rules, mould-clean, mould-life-v2 — all pinned ON in the engine
+# module; +3/−3 escape and the global mould optimiser — env-gated default OFF) are MODULE-LEVEL
+# in b2c_pipeline.py, so the cloud path inherits them automatically by importing the engine.
+# They are NOT bc_config attributes and cannot be pinned here; keep them in sync in the engine.
 
 for _k, _v in CLOUD_CONFIG.items():
     setattr(_bc, _k, _v)
@@ -152,6 +165,7 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         planning_days=run_cfg["planning_days"],
         build_output=build_out,
         curing_output=curing_out,
+        sku_desc_map=sku_desc,          # DB master descriptions → output sheets
     )
 
     # ── write the 4 output tables (rules 4 & 5 applied inside write_db) ────

@@ -29,7 +29,7 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 5, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -39,7 +39,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "demand_may.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
@@ -69,7 +69,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
@@ -288,6 +288,25 @@ GT_MACHINES = frozenset({
     "7201",                                            # BJ
     "7501", "7502", "7503",                            # UNI_NARROW
 })
+
+# Building machine CODE → plant NAME (client-supplied). Output sheets show the name
+# in a column next to every building-machine code so the plant reads plans by name,
+# not code. Curing PRESS ids are NOT in this dict (presses stay code-only). A code
+# not found here falls back to "NA".
+BUILDING_MACHINE_NAMES = {
+    "6001": "VMIExxium01", "6002": "VMIExxium02", "6003": "VMIExxium03", "6004": "VMIExxium04",
+    "6801": "bj1stage1",   "6802": "bj2stage1",   "6803": "bj3stage1",
+    "6909": "nrm9stage1",  "6911": "nrm11stage1",
+    "7001": "vmi1Maxx",    "7002": "vmi2Maxx",    "7003": "vmi3Maxx",    "7004": "vmi4Maxx",
+    "7101": "bj4", "7102": "bj5", "7103": "bj6", "7104": "bj7", "7105": "bj9", "7106": "bj10",
+    "7201": "bj8", "7301": "newirm",
+    "7501": "us1", "7502": "us2", "7503": "us3",
+    "7601": "ltmstage1",   "7701": "midland5stage1",
+    "7801": "midland1stage1", "7802": "midland2stage1", "7803": "midland3stage1", "7804": "midland4stage1",
+    "8001": "sai1stage1",  "8002": "sai2stage1",  "8003": "sai3stage1",
+    "8101": "88d1stage1",  "8201": "oldirm",      "8301": "gtic1",       "8302": "gtic2",
+    "8501": "vmi1",        "8502": "vmi2",
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. OUTPUT PATHS  —  derived automatically from PLAN_START

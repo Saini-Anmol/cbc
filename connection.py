@@ -183,6 +183,16 @@ def _desc(series: pd.Series, sku_desc: dict) -> pd.Series:
     return series.astype(str).map(_one)
 
 
+def _machine_name(series: pd.Series) -> pd.Series:
+    """Building machine code → plant name (bc_config.BUILDING_MACHINE_NAMES); "NA"
+    for anything not in the dict. Curing presses are not mapped (press-id column)."""
+    try:
+        from bc_config import BUILDING_MACHINE_NAMES as _names
+    except Exception:
+        _names = {}
+    return series.astype(str).str.strip().map(lambda x: _names.get(x, "NA"))
+
+
 def write_db(engine, plan_id: str, result: dict,
              building_xlsx: str, curing_xlsx: str,
              sku_desc: dict | None = None,
@@ -200,6 +210,7 @@ def write_db(engine, plan_id: str, result: dict,
         "Date":           pd.to_datetime(bs["Date"]).dt.date,
         "Shift":          bs["Shift"].astype(str),
         "Machine":        bs["Machine"].astype(str),
+        "machineName":    _machine_name(bs["Machine"]),
         "SKUCode":        bs["SKUCode"].astype(str),
         "skuDescription": _desc(bs["SKUCode"], sku_desc),
         "StartTime":      pd.to_datetime(bs["StartTime"]),

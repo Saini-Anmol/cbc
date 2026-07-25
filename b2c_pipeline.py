@@ -75,6 +75,7 @@ from bc_config import (
     GT_BUFFER_SHIFTS,
     GT_BUFFER_SHIFTS_VMI,
     GT_BUFFER_SHIFTS_OTHER,
+    BUILDING_MACHINE_NAMES,
     BUILDING_CO_SAME_SIZE,
     BUILDING_CO_DIFF_SIZE,
     SHIFT_MINS,
@@ -2877,12 +2878,107 @@ def _write_rolling_curing_excel(
 # ROLLING PIPELINE — main function
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _build_sku_desc_map(demand_path: str) -> dict:
+    """SKU code → description from the demand file, consolidated across market rows.
+    Rule (client): among a SKU's rows take the description from the largest-Requirement
+    row that HAS a non-empty description; if none has one, "NA". Cosmetic only (does not
+    affect the plan) — any read failure degrades to {} (all-"NA" downstream)."""
+    try:
+        df = (pd.read_csv(demand_path) if str(demand_path).lower().endswith(".csv")
+              else pd.read_excel(demand_path))
+    except Exception:
+        return {}
+    low = {str(c).strip().lower(): c for c in df.columns}
+    def _find(cands):
+        for c in cands:
+            if c in low:
+                return low[c]
+        return None
+    sku_c = _find(["skucode", "sku_code", "sapcode", "sku"])
+    qty_c = _find(["requirement", "updated_requirement", "quantity", "qty"])
+    dsc_c = _find(["sku description", "skudescription", "sku_description", "description"])
+    if sku_c is None or dsc_c is None:
+        return {}
+    keep = [sku_c, dsc_c] + ([qty_c] if qty_c else [])
+    tmp = df[keep].copy()
+    tmp[sku_c] = tmp[sku_c].astype(str).str.strip()
+    out: dict = {}
+    for sku, g in tmp.groupby(sku_c):
+        if not sku or sku.lower() == "nan":
+            continue
+        d = g[dsc_c].astype(str).str.strip()
+        valid = g[d.notna() & (d != "") & (d.str.lower() != "nan")]
+        if len(valid):
+            if qty_c:
+                valid = valid.sort_values(qty_c, ascending=False)
+            out[sku] = str(valid.iloc[0][dsc_c]).strip()
+        else:
+            out[sku] = "NA"
+    return out
+
+
+def _inject_label_columns(xlsx_path: str, sku_desc: dict,
+                          machine_names: dict | None = None) -> None:
+    """Post-process a finished workbook: after every SKU-code column insert a
+    "<col> Description" column (value from sku_desc, "NA" if unknown), and — only
+    when machine_names is given (the building workbook) — after every building
+    Machine column insert a "<col> Name" column. Header-driven so it covers every
+    sheet and tolerates the sheets whose header is not on row 1. Cosmetic-only:
+    on any error the workbook is left exactly as written."""
+    import openpyxl
+    _SKU_HDRS  = {"skucode", "from_sku", "target_sku", "new_sku", "sku_built"}
+    _MACH_HDRS = {"machine"}
+    _SENT = {"CHANGEOVER", "MOULD_CLEAN", "MOULD CLEAN", "C/O", "CO"}
+    try:
+        wb = openpyxl.load_workbook(xlsx_path)
+    except Exception:
+        return
+    for ws in wb.worksheets:
+        # header row = first of rows 1..4 that holds any known code header
+        hdr = None
+        for r in range(1, 5):
+            vals = {str(ws.cell(r, c).value or "").strip().lower()
+                    for c in range(1, ws.max_column + 1)}
+            if vals & (_SKU_HDRS | _MACH_HDRS):
+                hdr = r
+                break
+        if hdr is None:
+            continue
+        targets = []                                   # (col_idx, kind, orig_header)
+        for c in range(1, ws.max_column + 1):
+            h = str(ws.cell(hdr, c).value or "").strip().lower()
+            if h in _SKU_HDRS:
+                targets.append((c, "desc", ws.cell(hdr, c).value))
+            elif machine_names is not None and h in _MACH_HDRS:
+                targets.append((c, "name", ws.cell(hdr, c).value))
+        # insert right-to-left so already-collected column indices stay valid
+        for c, kind, orig in sorted(targets, key=lambda t: -t[0]):
+            ws.insert_cols(c + 1)
+            ws.cell(hdr, c + 1,
+                    value=f"{orig} Description" if kind == "desc" else f"{orig} Name")
+            for r in range(hdr + 1, ws.max_row + 1):
+                code = ws.cell(r, c).value
+                if code is None or str(code).strip() == "":
+                    continue
+                key = str(code).strip()
+                if kind == "desc":
+                    val = key if key.upper() in _SENT else sku_desc.get(key, "NA")
+                else:
+                    val = machine_names.get(key, "NA")
+                ws.cell(r, c + 1, value=val)
+    try:
+        wb.save(xlsx_path)
+    except Exception:
+        pass
+
+
 def run_rolling_pipeline(
     demand_path:    str | None = None,
     plan_start:     datetime | None = None,
     planning_days:  int | None = None,
     build_output:   str | None = None,
     curing_output:  str | None = None,
+    sku_desc_map:   dict | None = None,
 ) -> dict:
     """
     Rolling day-by-day B2C pipeline.
@@ -2897,6 +2993,13 @@ def run_rolling_pipeline(
     planning_days = planning_days or PLANNING_DAYS
     build_output  = build_output  or BUILD_OUTPUT
     curing_output = curing_output or CURING_OUTPUT
+    # SKU code → description for the output sheets. Cloud passes it (from the DB
+    # master); local builds it from the demand file's "SKU Description" column,
+    # consolidated across market rows. Missing → "NA" downstream. Purely cosmetic
+    # (never touches the plan); LABELS=0 skips it to reproduce label-free sheets.
+    _labels_on = os.environ.get("LABELS", "1") != "0"
+    if _labels_on and sku_desc_map is None:
+        sku_desc_map = _build_sku_desc_map(demand_path)
 
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Pre-computation")
@@ -4865,6 +4968,15 @@ def run_rolling_pipeline(
             "assignments":   mould_assignments,     # full (press, sku, 2-moulds) timeline incl Day-0
         } if _mould_gate else None),
     )
+
+    # Client output rule: next to every SKU-code column write its description, and
+    # next to every BUILDING machine-code column write the machine name. Building
+    # workbook gets both; curing workbook gets descriptions only (its "Machine" is a
+    # press id, not a building machine). Cosmetic post-pass — never alters the plan
+    # (runs AFTER total_cured is computed). LABELS=0 reproduces label-free sheets.
+    if _labels_on:
+        _inject_label_columns(build_output,  sku_desc_map or {}, BUILDING_MACHINE_NAMES)
+        _inject_label_columns(curing_output, sku_desc_map or {}, None)
 
     return {
         "total_built":       total_built,

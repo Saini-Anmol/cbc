@@ -321,13 +321,29 @@ Local (`bc_config` + Excel) vs cloud (`main.py` + DB) on identical inputs.
 `testing_` / `june_` tables are retired and must not be used).
 
 Parity was proven month-by-month (all 7 KPIs byte-identical on both paths).
-Final end-to-end results through the **deployed container API**:
 
-| Month | Demand file | Demand | Built | Cured | Coverage | Curing COs | Building COs |
+**RE-VERIFIED 2026-07-25 with the current full rule stack (IUkeep adopted, cap=12).** The
+engine is shared, so cloud inherits every `b2c_pipeline` toggle by import; only `CLOUD_CONFIG`
+needed reconciling — `CURING_CO_CHANGEOVER_MINS` was pinned at 480 while `bc_config` had drifted
+to 490 (fixed → 490), and the new-cycle params (`MIN_INCH_DWELL_DAYS`, `MAX_BUILDING_SKUS_PER_DAY`,
+`GT_BUFFER_SHIFTS_VMI/OTHER`, `INCH_PLUS3_*`, `BUILD_LEAD_SHIFTS`) are now explicitly pinned.
+Cloud (`main.run_plan` on seeded `PARITY_<month>` rows, eff=94%, cap=12) matched local **byte-for-byte
+on all 7 KPIs**:
+
+| Month | Demand file | Demand | Built | Cured | Coverage | Curing COs | Mould cleans |
 |---|---|---|---|---|---|---|---|
-| May  | `demand_may.xlsx`           | 693,748 | 681,029 | 687,028 | 99.03% | 200 | 2,256 |
-| June | `june_production_data.xlsx` | 656,608 | 643,259 | 648,031 | 98.69% | 225 | 2,359 |
-| July | `july_demand_tomerJi1.xlsx` | 778,981 | 700,298 | 705,399 | 90.55% | 179 | 2,494 |
+| May  | `demand_may.xlsx`           | 693,748 | 680,073 | 684,910 | 98.73% | 215 | 67 |
+| June | `june_production_data.xlsx` | 656,608 | 627,907 | 632,168 | 96.28% | 232 | 51 |
+| July | `july_demand_tomerJi1.xlsx` | 778,981 | 689,388 | 694,161 | 89.11% | 184 | 61 |
+
+<details><summary>Prior parity gate (pre-mould-gate / pre-IUkeep engine, for history)</summary>
+
+| Month | Built | Cured | Coverage | Curing COs | Building COs |
+|---|---|---|---|---|---|
+| May  | 681,029 | 687,028 | 99.03% | 200 | 2,256 |
+| June | 643,259 | 648,031 | 98.69% | 225 | 2,359 |
+| July | 700,298 | 705,399 | 90.55% | 179 | 2,494 |
+</details>
 
 > ⚠️ **June must use `june_production_data.xlsx` (656,608).** The file
 > `demand_tomerji_june_normalized.xlsx` totals 742,094 — a DB export of plan
