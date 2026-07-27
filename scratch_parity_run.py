@@ -30,11 +30,14 @@ def emit(res):
 if mode == "local":
     import cbc_env
     import bc_config as bc
-    bc.DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, fname)
+    # Env overrides let a test point a month at a custom demand file / running-moulds table
+    # (e.g. June/July with the user-specified files) without editing the MONTHS table.
+    _dovr = os.environ.get("DEMAND_OVR")
+    bc.DEMAND_FILE = _dovr if _dovr else os.path.join(cbc_env.INPUT_DIR, fname)
     bc.PLAN_START = datetime(Y, M, D, 7, 0, 0)
     bc.PLANNING_DAYS = days
-    bc.RUNNING_MOULDS_TABLE = rmt
-    bc.MAX_CHANGEOVERS_PER_DAY = 12
+    bc.RUNNING_MOULDS_TABLE = os.environ.get("RMT_OVR", rmt)
+    bc.MAX_CHANGEOVERS_PER_DAY = int(os.environ.get("MAX_CO", "12"))
     import b2c_pipeline
     from b2c_pipeline import run_rolling_pipeline
     wd = tempfile.mkdtemp()

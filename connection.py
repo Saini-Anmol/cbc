@@ -102,22 +102,14 @@ def read_db(engine, plan_id: str):
     demand_df = (dem.groupby("skuCode", as_index=False)["requirement"].sum()
                     .rename(columns={"skuCode": "SKUCode",
                                      "requirement": "Requirement"}))
-    # Description lookup. Seed from the FULL master first, then let jkt_demand
-    # override. It must not be scoped to the demand SKUs: the curing schedule
-    # also contains Runner-Out SKUs (already mounted on a press but with zero
-    # demand), which never appear in jkt_demand and would otherwise be NULL.
+    # Description lookup — SOLE source is the uploaded jkt_demand.skuDescription (the
+    # jkt_sku_description master table is retired / not used). SKUs absent from jkt_demand
+    # (e.g. Runner-Out SKUs on a press with zero demand) have no description → "NA"
+    # downstream (see _desc). The frontend must upload skuDescription with the demand.
     sku_desc: dict = {}
-    try:
-        master = pd.read_sql(
-            text("SELECT SkuCode, Description FROM jkt_sku_description"), engine)
-        sku_desc = {str(k).strip(): v
-                    for k, v in zip(master["SkuCode"], master["Description"])
-                    if v is not None and str(v).strip()}
-    except Exception as exc:  # master missing/renamed — not fatal
-        print(f"  [conn] sku description master unavailable: {exc}")
     for k, v in zip(dem["skuCode"], dem["skuDescription"]):
         if v is not None and str(v).strip() and str(v).lower() != "nan":
-            sku_desc[k] = v
+            sku_desc[str(k).strip()] = v
 
     prm = pd.read_sql(
         text("SELECT * FROM jkt_plan_params WHERE plan_id = :p"),

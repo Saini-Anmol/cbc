@@ -23,9 +23,13 @@ sku_moulds = {k: set(v) for k, v in
               cc.ConsumptionETL(eng).load_mould_eligibility()["sku_moulds"].items()}
 # Fold Day-0 mounted (mould,SKU) pairs into eligibility — the scheduler does this
 # too (orphan moulds mounted at Day 0 but not listed in the mapping), so the audit
-# must use the SAME eligibility to be a fair feasibility test.
-_rm = pd.read_sql("SELECT WCNAME, Sapcode, `Current MouldNo` AS mould "
-                  "FROM jkplanningV1.Daily_Running_Moulds", eng)
+# must use the SAME eligibility to be a fair feasibility test. The Day-0 table MUST match
+# the one the PLAN was built from (env RMT_OVR), else a plan built from a non-live snapshot
+# (e.g. testing_/june_ variants) is falsely flagged short by 1 slot.
+import os as _os
+_rmt = _os.environ.get("RMT_OVR", "Daily_Running_Moulds")
+_rm = pd.read_sql(f"SELECT WCNAME, Sapcode, `Current MouldNo` AS mould "
+                  f"FROM jkplanningV1.{_rmt}", eng)
 for _s, _m in zip(_rm["Sapcode"].astype(str).str.strip(), _rm["mould"].astype(str).str.strip()):
     if _s and _m and _s.lower() != "nan" and _m.lower() != "nan":
         sku_moulds.setdefault(_s, set()).add(_m)

@@ -70,6 +70,8 @@ from bc_config import (
     MAX_BUILDING_SKUS_PER_DAY,
     INCH_PLUS3_CO_MINS,
     INCH_PLUS3_MIN_DAYS_LEFT,
+    DIFF_CO_MIN_DWELL_DAYS,
+    DIFF_CO_MIN_TARGET_UNITS,
     BUILD_LEAD_SHIFTS,
     MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT,
     GT_BUFFER_SHIFTS,
@@ -146,6 +148,22 @@ def _group_label(machine: str) -> str:
 
 _S1_MACHINES = frozenset(m for m, g in _MACHINE_GROUP.items() if g == "STAGE1")
 
+# ── Idle-recoverability diagnostic (env IDLE_DIAG=1, read-only, plan-neutral) ──
+# For each (machine, shift) with meaningful idle time, decide whether a REACHABLE
+# SKU (allowable + in ±2 band + dwell-OK) with a live press draw and a GT deficit
+# went unbuilt this shift. Splits the momentary curing shortfall into:
+#   - recoverable_units : a reachable idle machine could have pre-built the missing GT
+#                         → allocation/timing-fixable WITHOUT relaxing the plant rules
+#   - ceiling_units     : no reachable machine existed → true curing/press/mould ceiling
+# The accumulator is a plain dict so it survives across the day loop; printed at run end.
+_IDLE_DIAG_ON = os.environ.get("IDLE_DIAG", "0") != "0"
+_IDLE_DIAG = {
+    "rec_units": 0.0, "ceil_units": 0.0,          # per-shift press shortfall, by reachability
+    "rec_shifts": 0, "ceil_shifts": 0,            # #(machine,shift) idle buckets touched
+    "gt_idle_min": 0.0, "s1_idle_min": 0.0,       # idle minutes, GT vs Stage-1
+    "rec_by_inch": {}, "ceil_by_inch": {},        # shortfall units by inch
+}
+
 # Round-trip buffer sizing: when a machine alternates between its current SKU
 # and another live, unfulfilled SKU, the buffer left behind for the current
 # SKU must survive CO(cur->partner) + partner's own dwell time + CO(partner->cur),
@@ -181,8 +199,10 @@ _RI_RATIO_GLOBAL  = os.environ.get("RI_RATIO_GLOBAL") == "1"
 # running-machine snapshot (data/running_prod/building_running_machines_39_near7AM.xlsx)
 # instead of the DB loader (which returns empty here -> machines start blank and
 # the scheduler derives its own machine->SKU). Off = current behaviour (blank/DB).
-_SEED_FROM_PLANT_RUNNING = os.environ.get("PLANT_SEED") == "1"
-_PLANT_RUNNING_FILE = "data/running_prod/building_running_machines_39_near7AM.xlsx"
+_SEED_FROM_PLANT_RUNNING = True
+# Per-month building running-machine snapshot: env PLANT_RUNNING_FILE overrides (June/July use
+# their own near-8AM snapshots built from the stage1+stage2 running data). Default = May.
+_PLANT_RUNNING_FILE = "data/running_prod/building_running_machines_july_near8AM.xlsx"
 
 # EXPERIMENT: captive-first ordering. A captive building machine (eligible for
 # exactly ONE SKU, e.g. 7301 -> only LSTL0) sits idle whenever flexible machines
@@ -549,6 +569,135 @@ _INCH_NO_REVISIT = os.environ.get("INCH_NO_REVISIT", "1") != "0"
 # nearly-exhausted inch should be releasable. INCH_GATE_THRESH=0 restores the strict gate.
 _INCH_GATE_CAMPAIGN_THRESHOLD = True
 
+# ── STRICT INCH RULES (experiments, default OFF) ─────────────────────────────
+# Rule 1 — STRICT inch dwell (env INCH_STRICT). Redefines "inch demand done" in
+# _inch_demand_done from the MOMENTARY buffer-filled deficit to FULL remaining-demand
+# exhaustion: a machine may only leave its inch early when every same-inch SKU it can
+# serve has demand_remaining - projected_gt <= 0 (and the Lever-B sub-campaign shortcut
+# is disabled). The 5-day dwell early-exit and the +/-2 band are unchanged. Removes the
+# temporary off-inch excursions (7002's 14->15->16 hop) — a machine stays single-inch
+# through each dwell window, building the SAME inch ahead (or idling) when buffer-full.
+# INCH_STRICT=0 reproduces the pre-adoption lenient behaviour bit-for-bit.
+# ADOPTED default ON — this is the plant rule ("a machine changes inch only once per 5 days
+# OR when its current inch's demand is complete"). It removes the JIT inch-hopping churn
+# (diff-size COs fall from ~293-354 toward the rule's natural level). Paired with the anchor
+# allocation below to recover the 13"/15" coverage. NEW baseline KPIs (cap=12): see §KPIs.
+_INCH_STRICT = True
+
+# Cooldown variant of the leave rule (env INCH_COOLDOWN, default OFF). Instead of "dwell ≥5 days
+# on the CURRENT inch before leaving" (which measures the clock from arrival and can strand a
+# machine that arrived recently), the machine may change inch whenever its LAST diff-size CO was
+# ≥ INCH_COOLDOWN_DAYS ago — i.e. "one diff-size CO per machine per 5 days" — with the SAME
+# demand-complete immediate-switch override. Because the frequency cap forbids a second diff-CO
+# within the window, a machine also cannot RETURN to a size it left for < that many days (re-entry
+# is naturally allowed only after the cooldown). The ±2 band and 4-SKU/day cap are unchanged.
+# INCH_COOLDOWN=0 → the strict dwell-from-arrival rule above (bit-for-bit).
+_INCH_COOLDOWN_RULE = os.environ.get("INCH_COOLDOWN", "0") != "0"
+_INCH_COOLDOWN_DAYS = int(os.environ.get("INCH_COOLDOWN_DAYS", str(MIN_INCH_DWELL_DAYS)))
+
+# ── Part 1: single-inch-majority locked inch-set (env LOCK_INCH_SET, default OFF) ──
+# The plant runs MOST machines on one inch (page 4 of the report); our ±2 band lets a machine
+# wander 3-4 inches (page 5). This assigns each GT machine (Unistage + Stage-2) a small locked
+# inch-SET via a MATHEMATICAL minimum-assignment covering optimisation: minimise the total
+# (machine,inch) assignments subject to per-inch capacity covering demand — so most machines
+# get exactly ONE inch and only where an inch's demand cannot be covered by whole machines does
+# a machine take a 2nd/3rd inch. The split EMERGES from the demand (no preset count), and it is
+# HYBRID-seeded from the plant building-running-machine data: a running machine whose real size
+# has demand this month is PINNED to that size (no wasted Day-1 CO); idle / demand-mismatched
+# machines are free and routed to residual demand. At runtime a machine may only build/CO to an
+# inch in its locked set → single-inch machines do ZERO diff-size COs by construction.
+# LOCK_INCH_SET=0 → current ±2-band behaviour (bit-for-bit). Pairs with PLANT_SEED for the
+# running-data pins; without running data (June/July) it degrades to pure demand-driven sets.
+_LOCK_INCH_SET = os.environ.get("LOCK_INCH_SET", "0") != "0"
+# demand floor (fraction of one machine's monthly capacity) for pinning a running machine to its
+# real size — below this the size is "no real demand" and the machine becomes free.
+_LOCK_PIN_DEMAND_FRAC = float(os.environ.get("LOCK_PIN_FRAC", "0.34"))  # ~5 days of a machine
+
+# ── Part 2: JIT inch-switch rule (env JIT_INCH, default OFF) ──────────────────────
+# The plant switches size JIT (median dwell ~7 h) — 95% of its size changes are excursions our
+# 5-day dwell blocks. This DROPS the dwell/cooldown and instead lets a machine change inch the
+# moment a curing press needs it, controlled by two demand-adaptive limiters so it does NOT
+# bounce to 293 diff-COs: (1) an URGENCY MARGIN — a diff-inch switch fires only when the target
+# inch's aggregate curing-draw deficit exceeds the CURRENT inch's residual deficit by
+# JIT_URGENCY_MARGIN (so a machine won't abandon a size that still needs it for a marginally
+# worse one — kills A→B→A thrash, self-adapts to any month's mix); and (2) a per-machine per-day
+# diff-CO BUDGET (hard backstop). Amortization: the target inch must have ≥ DIFF_CO_MIN_TARGET_UNITS
+# of sustained remaining demand to pay back the 88-180 min CO. JIT_INCH=0 → current dwell rule
+# (bit-for-bit). The plant-like single-inch CONCENTRATION emerges because JIT excursions are
+# short (no 5-day campaign), so a machine's dominant inch stays dominant.
+_JIT_INCH = True
+_JIT_URGENCY_MARGIN = int(os.environ.get("JIT_URGENCY_MARGIN", "150"))  # units; hysteresis
+_MAX_DIFF_CO_PER_MACHINE_PER_DAY = int(os.environ.get("MAX_DIFF_CO_PER_DAY", "2"))
+
+# Part 1: curing CO same-inch alignment (env CURING_INCH_ALIGN, default OFF). When on, b2c_pipeline
+# computes sku_inch BEFORE the Phase-0 curing scheduler and passes it in, so a press changing over
+# prefers a same-inch target — keeping each press on one inch so building feeds it without
+# different-size COs (mirrors the toggle of the same name in curing_consumption_dynamic.py).
+_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "0") != "0"
+
+# ── Part A: dynamic hybrid initial allocation (env INIT_HYBRID, default OFF) ───────
+# Seeds each GT machine's ANCHOR inch (which fixes its ±2 band) from the plant building-running
+# snapshot, but DEMAND-ADAPTIVELY: a running machine whose real size has demand THIS MONTH is
+# pinned to it (no wasted Day-1 CO); a machine whose real size lacks demand (or is idle) is
+# reassigned to the neediest reachable inch by the demand-weighted greedy. Fully dynamic per
+# demand file — the same May running data feeds June/July, where machines whose May size does not
+# fit the month's demand are re-anchored (this also verifies the dynamic re-allocation). Sets only
+# the anchor (soft), NOT a hard lock, so JIT can still flex within ±2. INIT_HYBRID=0 → current
+# (raw running-seed or INCH_ANCHOR_OPT).
+_INIT_ALLOC_HYBRID = True
+
+# Rule 2 — Stage-1 single inch/month (env S1_SINGLE_INCH). Each Stage-1 carcass machine is
+# locked to ONE inch for the whole month (zero different-size CO). The inch is pre-assigned
+# day-0 by the demand-optimal solver (Stage-2 carcass demand per inch), and Step-3b
+# eligibility is tightened to an EXACT inch match. ADOPTED default ON — measured KPI-neutral
+# (Stage-1 is carcass/utilization only; 0 cured-tyre cost, 0 rule violations, mould-audit
+# PASS all 3 months). S1_SINGLE_INCH=0 restores the band-only behaviour.
+_STAGE1_SINGLE_INCH = True
+
+# Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
+# Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
+# instead of letting the day-1 starvation-driven greedy pick each anchor. Ignores running-
+# machine state (decision). ADOPTED default ON alongside the strict rule — the demand-weighted
+# allocation dedicates machines to the high-demand 13"/15" so those inches don't starve under
+# the rule (measured: recovers July +8.4k vs emergent anchors under strict; net +12k/3-months).
+# INCH_ANCHOR_OPT=0 restores emergent day-1 anchoring.
+_INCH_ANCHOR_OPT = False
+
+# Diff-size-CO amortization gate (env DIFF_CO_GATE, default OFF). A machine may do a
+# DIFFERENT-inch CO only if (a) ≥ DIFF_CO_MIN_DWELL_DAYS since its last diff-size CO and
+# (b) the target inch has ≥ DIFF_CO_MIN_TARGET_UNITS sustained servable demand for it.
+# Blunt per-machine diff-CO frequency cap (env DIFF_CO_GATE, default OFF — SUPERSEDED).
+# Measured to only trade KPI for CO reduction (the diff-COs are productive coverage), so it
+# is NOT the right lever. The plant rule is instead "diff-CO once per 5 days OR when the inch's
+# demand is complete" (= _INCH_STRICT), and the KPI under that rule is an ALLOCATION problem
+# (13"/15" under-served) addressed by the anchor allocation. Kept off, for the record.
+_DIFF_CO_GATE = os.environ.get("DIFF_CO_GATE", "0") != "0"
+# Env overrides for the two gate thresholds (sweep without editing bc_config).
+if os.environ.get("DIFF_CO_TARGET"):
+    DIFF_CO_MIN_TARGET_UNITS = int(os.environ["DIFF_CO_TARGET"])
+if os.environ.get("DIFF_CO_DWELL"):
+    DIFF_CO_MIN_DWELL_DAYS = int(os.environ["DIFF_CO_DWELL"])
+# Anchor solver: GREEDY by default (env ANCHOR_EXACT=1 → exact MILP). MEASURED: the exact
+# MILP maximises a DEGENERATE static coverage objective (once an inch is covered, extra
+# machines add nothing → excess machines placed arbitrarily), so it LOSES to the greedy's
+# concentrate-on-demand heuristic under strict (3-mo net: greedy 1,954,791 vs exact
+# 1,935,916 vs emergent 1,942,695). Greedy kept as default; exact retained, off, for record.
+_ANCHOR_EXACT = os.environ.get("ANCHOR_EXACT", "0") != "0"
+# Lever 1 — draw-matched anchor allocation (env ANCHOR_PHASED, default OFF pending A/B).
+# The default coverage-maximising greedy strands the last (broadest) machines on tiny extreme
+# inches (17"/18", over-served 3-60x) while the scarce high-demand inches (15"/13"/16") sit at
+# cap/target ~1.11 — no slack, so any CO/mould-clean downtime momentarily starves their presses
+# (measured: ~half the strict-rule KPI cost is exactly this reachable starvation). The phased
+# solver WATER-FILLS by cap/target ratio instead: it equalises provisioning across DEMANDED
+# inches, giving 15"/13"/16" a flex buffer (~1.4-1.6x) funded by the extremes — whose small
+# demand is then covered by a band-neighbour (±2), needing no dedicated all-month anchor.
+_INCH_ANCHOR_PHASED = os.environ.get("ANCHOR_PHASED", "0") != "0"
+# Diagnostic: curing-aware ceiling on the anchor target (env ANCHOR_CURE_CAP, default ON).
+# =0 → no curing cap. MEASURED not binding on the tested months (moulds abundant); kept for A/B.
+_ANCHOR_CURE_CAP = os.environ.get("ANCHOR_CURE_CAP", "1") != "0"
+# counter for the pre-solve: [gt machines assigned, stage1 machines assigned]
+_INCH_OPT_DBG = [0, 0]
+
 # Machine groups for the flex brute-force (plant multi-inch ranking: VMI 4.6 >
 # BJ 2.4 ~ UNI 2.3 > IRM 1.5 inches/machine).
 _FLEX_GROUPS: dict[str, frozenset[str]] = {
@@ -586,6 +735,231 @@ def _resolve_flex_machines() -> frozenset:
     return _sel
 
 _INCH_FLEX_MACHINES: frozenset[str] = _resolve_flex_machines()
+
+
+def _curing_inch_ceiling(inch_skus: dict, sku_moulds: dict, cure_ct_map: dict,
+                         planning_days: int, n_presses: int) -> dict:
+    """Per-inch CURING ceiling: how much of an inch can be cured over the horizon, bounded
+    by mould-feasible presses. Each running press needs 2 eligible moulds, so an inch's max
+    simultaneous presses = min(n_presses, |eligible moulds for its SKUs| // 2) — this is what
+    makes 15″/13″ (few moulds) a low ceiling, the real July bottleneck. Returns {inch: units}.
+    Empty sku_moulds (mould gate off) → {} (no cap). A ceiling proxy (shared moulds over-count)."""
+    if not sku_moulds:
+        return {}
+    out: dict = {}
+    for i, skus in inch_skus.items():
+        moulds: set = set()
+        cts: list = []
+        for s in skus:
+            moulds |= set(sku_moulds.get(s, ()) or ())
+            cts.append(cure_ct_map.get(s, DEFAULT_CURING_CT))
+        presses = min(n_presses, len(moulds) // 2)
+        avg_ct = (sum(cts) / len(cts)) if cts else DEFAULT_CURING_CT
+        out[i] = presses * _cure_qty_per_shift(avg_ct) * 3 * planning_days
+    return out
+
+
+def _greedy_inch_assignment(machines, elig_inches: dict, cap: dict, inch_demand: dict) -> dict:
+    """Deterministic greedy generalized assignment (the MILP fallback). Each machine → its
+    highest-remaining-target eligible inch, most-constrained-first; its capacity is subtracted
+    from that inch's remaining target so later machines flow to still-under-served inches."""
+    remaining = {i: float(d) for i, d in inch_demand.items()}
+    result: dict = {}
+    order = sorted(machines,
+                   key=lambda m: (len(elig_inches.get(m, ()) or ()), -cap.get(m, 0.0), str(m)))
+    for m in order:
+        opts = sorted(i for i in (elig_inches.get(m, ()) or ()) if i)
+        if not opts:
+            continue
+        best = max(opts, key=lambda i: (remaining.get(i, 0.0), inch_demand.get(i, 0.0)))
+        result[m] = best
+        remaining[best] = remaining.get(best, 0.0) - cap.get(m, 0.0)
+    return result
+
+
+def _phased_inch_assignment(machines, elig_inches: dict, cap: dict, target: dict) -> dict:
+    """Lever 1 — draw-matched anchor allocation (water-filling by cap/target ratio).
+
+    Instead of maximising absolute coverage (which dumps the last broad machines on tiny
+    extreme inches they over-serve while the scarce high-demand inches keep zero slack), assign
+    each machine to the eligible DEMANDED inch whose cap/target ratio stays LOWEST after adding
+    it — equalising provisioning so 15"/13"/16" accumulate a flex buffer against CO/clean
+    downtime. A tiny inch (e.g. 18" = 840) has such a high post-add ratio that no machine ever
+    homes there; its small demand is served by a ±2 band-neighbour. Deterministic. Any machine
+    with no in-target eligible inch falls back to its lowest eligible inch (never dropped)."""
+    tgt = {i: max(1.0, float(v)) for i, v in target.items()}
+    # Start from the demand-priority base greedy (a good allocation), then BOUNDED-rebalance:
+    # move a machine off a grossly over-provisioned inch (ratio > HI) onto THIS MONTH's most
+    # under-provisioned inch (lowest ratio, < LO) that the machine is ELIGIBLE to reach. This is
+    # month-dynamic (it reads each month's ratios) and reachability-safe: if the starved inch is
+    # unreachable by any wasteful machine (e.g. 13" in June/July — the 17"/18" machines can't build
+    # it), no move happens and the base allocation is preserved (no regression). Full equalisation
+    # was too aggressive; this only ever redistributes genuine waste toward genuine scarcity.
+    result = dict(_greedy_inch_assignment(machines, elig_inches, cap, tgt))
+    HI    = float(os.environ.get("ANCHOR_HI", "1.8"))      # donor: over-provisioned above this
+    LO    = float(os.environ.get("ANCHOR_LO", "1.2"))      # recipient: only feed GENUINELY starved inches (<20% buffer)
+    SAFE  = float(os.environ.get("ANCHOR_SAFE", "1.3"))    # a real-demand donor must stay this provisioned after donating
+    SMALL = float(os.environ.get("ANCHOR_SMALL", "3000"))  # demand below this = band-coverable (may strip to 0)
+
+    def _assigned():
+        a = {i: 0.0 for i in tgt}
+        for _m, _i in result.items():
+            if _i in a:
+                a[_i] += cap.get(_m, 0.0)
+        return a
+
+    # Snapshot THIS MONTH's genuinely-starved inches (ratio < LO = under a 20% buffer). Only these
+    # trigger a rebalance; an inch merely "not lavish" (e.g. June 15" at 1.30) is left alone. This
+    # is what makes the lever a no-op on capacity-tight months whose scarce inch has no reachable
+    # surplus to draw from (June/July 13") — nothing regresses — while May's 15", starved next to
+    # a grossly wasteful 17"/18", gets drained into.
+    a0 = _assigned()
+    starved = sorted((i for i in tgt if tgt[i] > 1.0 and a0[i] / tgt[i] < LO),
+                     key=lambda i: (a0[i] / tgt[i], int(i) if str(i).isdigit() else 99))
+    for R in starved:
+        for _ in range(len(machines)):                # bounded per-recipient drain (deterministic)
+            a = _assigned()
+            rR = a[R] / tgt[R]
+            if rR >= HI:                              # recipient now well-buffered → done
+                break
+            # Donor = machine on a strictly richer, over-provisioned inch (>HI), eligible for R,
+            # that stays healthy after donating (new ratio ≥ SAFE) or whose demand is tiny enough
+            # for a ±2 band-neighbour to absorb (tgt < SMALL). Pull the most-wasteful first.
+            cands = []
+            for _m, D in result.items():
+                if D == R or R not in (elig_inches.get(_m, ()) or ()):
+                    continue
+                rD = a[D] / tgt[D]
+                if rD <= rR:                          # donor must be richer than the starved inch
+                    continue
+                newD = (a[D] - cap.get(_m, 0.0)) / tgt[D]
+                # Donate only genuine SURPLUS: the donor stays healthy (≥ SAFE) or its demand is
+                # tiny enough for a ±2 band-neighbour (tgt < SMALL). This is the guard that keeps
+                # capacity-tight months (June/July) untouched — no inch there survives donating.
+                if newD >= SAFE or tgt[D] < SMALL:
+                    cands.append((-rD, newD, str(_m), _m))
+            if not cands:
+                break
+            cands.sort()
+            result[cands[0][3]] = R
+    return result
+
+
+def _optimal_inch_assignment(machines, elig_inches: dict, cap: dict,
+                             inch_demand: dict, target: dict | None = None) -> dict:
+    """EXACT curing-aware static machine→inch assignment (MILP), greedy fallback.
+
+    Assigns each machine ONE anchor inch to MAXIMISE Σ_i min(target[i], supply[i]), where
+    supply[i] = Σ cap[m] over machines anchored at i and target[i] = min(demand, curing
+    ceiling) — so machines are never sent to an inch curing cannot absorb. `target` defaults
+    to inch_demand (pure demand-optimal). Deterministic; falls back to the greedy on any
+    solver failure or partial solution. Returns {machine: inch}.
+    """
+    tgt = {i: float(v) for i, v in (target if target is not None else inch_demand).items()}
+    if _INCH_ANCHOR_PHASED:                  # Lever 1 — draw-matched water-filling
+        return _phased_inch_assignment(machines, elig_inches, cap, tgt)
+    if not _ANCHOR_EXACT:                    # greedy is the shipped default (beats the MILP)
+        return _greedy_inch_assignment(machines, elig_inches, cap, tgt)
+    try:
+        import numpy as np
+        from scipy.optimize import milp, LinearConstraint, Bounds
+        ms = sorted(str(m) for m in machines)
+        pairs = [(m, i) for m in ms
+                 for i in sorted({str(x) for x in (elig_inches.get(m, ()) or ()) if x})]
+        if not pairs:
+            return {}
+        inches = sorted({i for _, i in pairs} | set(tgt.keys()))
+        nx, ni = len(pairs), len(inches)
+        ipos = {i: k for k, i in enumerate(inches)}
+        nvar = nx + ni                                   # x[m,i] binaries + covered[i]
+        c = np.zeros(nvar)
+        for i in inches:
+            c[nx + ipos[i]] = -1.0                       # maximise Σ covered
+        A_eq = np.zeros((len(ms), nvar))                 # each machine exactly one anchor
+        mrow = {m: r for r, m in enumerate(ms)}
+        for k, (pm, _pi) in enumerate(pairs):
+            A_eq[mrow[pm], k] = 1.0
+        A_ub = np.zeros((ni, nvar))                      # covered[i] − Σ cap·x[m,i] ≤ 0
+        for i in inches:
+            A_ub[ipos[i], nx + ipos[i]] = 1.0
+        for k, (pm, pi) in enumerate(pairs):
+            A_ub[ipos[pi], k] = -float(cap.get(pm, 0.0))
+        lb = np.zeros(nvar)
+        ub = np.ones(nvar)
+        for i in inches:
+            ub[nx + ipos[i]] = max(0.0, tgt.get(i, 0.0))
+        integ = np.zeros(nvar)
+        integ[:nx] = 1
+        res = milp(c, constraints=[LinearConstraint(A_eq, 1.0, 1.0),
+                                   LinearConstraint(A_ub, -np.inf, 0.0)],
+                   bounds=Bounds(lb, ub), integrality=integ)
+        if not getattr(res, "success", False) or res.x is None:
+            raise RuntimeError("milp failed")
+        out = {pm: pi for k, (pm, pi) in enumerate(pairs) if res.x[k] > 0.5}
+        miss = [m for m in ms if m not in out]
+        if miss:                                          # solver quirk → greedy for the rest
+            out.update(_greedy_inch_assignment(miss, elig_inches, cap, tgt))
+        return out
+    except Exception:
+        return _greedy_inch_assignment(machines, elig_inches, cap, tgt)
+
+
+def _min_assignment_inch_sets(machines, elig_inches: dict, cap: dict,
+                              target: dict, forced_inch: dict) -> dict:
+    """Part 1 — mathematical minimum-assignment covering: give each machine a small inch-SET
+    (mostly ONE) so per-inch capacity covers `target`, minimising the number of multi-inch
+    machines. Deterministic greedy that provably yields single-inch for every machine not needed
+    to cover a fractional inch remainder:
+
+      1. PIN forced machines (running machines whose real size has demand) to that inch.
+      2. Give every remaining machine its single most under-covered eligible inch.
+      3. Only if an inch is still short, add it as a 2nd inch to an ADJACENT-reachable machine
+         (|existing inch − needed inch| ≤ 2) with the most spare capacity — repeat until covered.
+
+    Returns {machine: set(inches)}. `forced_inch[m]` (optional) pins m's real running size."""
+    def _num(i):
+        try: return int(i)
+        except Exception: return 99
+    residual = {i: float(t) for i, t in target.items()}
+    locked = {str(m): set() for m in machines}
+    # 1. pin running machines whose real size has demand
+    for m in machines:
+        m = str(m); fi = forced_inch.get(m)
+        if fi and fi in (elig_inches.get(m, ()) or ()):
+            locked[m].add(fi)
+            residual[fi] = residual.get(fi, 0.0) - cap.get(m, 0.0)
+    # 2. each still-unassigned machine → its most under-covered eligible inch (most-constrained first)
+    order = sorted((str(m) for m in machines),
+                   key=lambda m: (len(elig_inches.get(m, ()) or ()), -cap.get(m, 0.0), m))
+    for m in order:
+        if locked[m]:
+            continue
+        opts = [i for i in (elig_inches.get(m, ()) or ()) if i in residual]
+        if not opts:
+            _any = sorted((i for i in (elig_inches.get(m, ()) or ()) if i), key=_num)
+            if _any:
+                locked[m].add(_any[0])
+            continue
+        best = max(opts, key=lambda i: (residual.get(i, 0.0), target.get(i, 0.0), -_num(i)))
+        locked[m].add(best)
+        residual[best] -= cap.get(m, 0.0)
+    # 3. cover any still-short inch by adding a 2nd/3rd inch to an adjacent-reachable machine
+    guard = 0
+    while guard < len(locked) * 3:
+        guard += 1
+        under = [i for i, r in residual.items() if r > 1.0]
+        if not under:
+            break
+        i = max(under, key=lambda z: residual[z])
+        cands = [m for m in locked
+                 if i in (elig_inches.get(m, ()) or ()) and i not in locked[m]
+                 and any(abs(_num(a) - _num(i)) <= _INCH_BAND_WIDTH for a in locked[m])]
+        if not cands:
+            break                                  # structurally uncoverable (not a lock artefact)
+        m = max(cands, key=lambda z: (cap.get(z, 0.0), z))
+        locked[m].add(i)
+        residual[i] -= cap.get(m, 0.0)
+    return {m: s for m, s in locked.items() if s}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -780,7 +1154,9 @@ def _inch_ok(to_inch: str, cur_inch: str, anchor: str, used: set) -> bool:
 
 
 def _inch_demand_done(machine: str, cur_inch: str, machine_skus: dict,
-                      sku_inch: dict, deficit_fn, buf, rate: float = 0.0) -> bool:
+                      sku_inch: dict, deficit_fn, buf, rate: float = 0.0,
+                      demand_remaining: dict | None = None,
+                      projected_gt: dict | None = None) -> bool:
     """Rule 1b — may this machine leave `cur_inch` for a different inch?
 
     True when no SKU at the machine's current inch still has a deficit it could
@@ -795,6 +1171,19 @@ def _inch_demand_done(machine: str, cur_inch: str, machine_skus: dict,
     counts as "inch finished".
     """
     if not _INCH_RULES_ENABLED or not cur_inch:
+        return True
+    # STRICT (Rule 1, INCH_STRICT): "done" = the inch's WHOLE servable demand is exhausted
+    # on this machine — every same-inch SKU has demand_remaining - projected_gt <= 0. This
+    # replaces the momentary buffer-filled deficit test below, so a machine stays single-inch
+    # through its dwell window (no temporary off-inch hop) and only CO's away when the inch is
+    # truly finished (or 5 days pass, enforced separately in _may_leave_inch).
+    if _INCH_STRICT and demand_remaining is not None:
+        _pg = projected_gt or {}
+        for s in machine_skus.get(machine, ()) or ():
+            if sku_inch.get(s, "") != cur_inch:
+                continue
+            if demand_remaining.get(s, 0.0) - _pg.get(s, 0.0) > 0:
+                return False
         return True
     # Threshold below which a leftover deficit is treated as "inch finished".
     # MEASURED RESULT: raising this to a full campaign made every month WORSE
@@ -1276,6 +1665,9 @@ def _assign_building_shift(
     day:                    int = 1,              # current plan day (for the 5-day dwell)
     machine_day_skus:       dict | None = None,   # {machine: set(SKUs built today)} — 4/day cap
     machine_plus3_used:     set | None = None,    # machines that spent their +3/-3 escape
+    machine_last_diff_co_day: dict | None = None, # {machine: last day it did a diff-size CO}
+    machine_locked_inches: dict | None = None,   # Part 1: {machine: set(allowed inches)} or None
+    machine_day_diff_co: dict | None = None,     # Part 2: {machine: #diff-size COs done today}
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -1297,9 +1689,17 @@ def _assign_building_shift(
     machine_inch_since  = machine_inch_since  if machine_inch_since  is not None else {}
     machine_day_skus    = machine_day_skus    if machine_day_skus    is not None else {}
     machine_plus3_used  = machine_plus3_used  if machine_plus3_used  is not None else set()
+    machine_last_diff_co_day = (machine_last_diff_co_day
+                                if machine_last_diff_co_day is not None else {})
+    machine_locked_inches = machine_locked_inches if machine_locked_inches is not None else {}
+    machine_day_diff_co = machine_day_diff_co if machine_day_diff_co is not None else {}
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
-        """Rule 2 (+/-2 band) for a candidate (machine, to_inch)."""
+        """Rule 2 (+/-2 band) for a candidate (machine, to_inch), PLUS the Part-1 locked
+        inch-set: when a machine has a locked set, it may only build/CO to an inch in it."""
+        _lset = machine_locked_inches.get(m)
+        if _lset and to_inch and to_inch not in _lset:
+            return False
         return _inch_ok(to_inch, cur_inch,
                         machine_anchor_inch.get(m, ""),
                         machine_used_inches.get(m, set()))
@@ -1319,12 +1719,59 @@ def _assign_building_shift(
         early), OR it has dwelled >= MIN_INCH_DWELL_DAYS on the current inch."""
         if not _INCH_RULES_ENABLED or not cur_inch:
             return True
-        if _inch_demand_done(m, cur_inch, machine_skus, sku_inch, defc, buf, rate):
+        if _JIT_INCH:
+            # Part 2: no dwell — a machine may leave its inch any time. Churn is controlled at the
+            # candidate level by _jit_diff_ok (urgency margin + per-day budget + amortization),
+            # not by a time gate. Leaving is always permitted here.
+            return True
+        if _inch_demand_done(m, cur_inch, machine_skus, sku_inch, defc, buf, rate,
+                             demand_remaining=demand_remaining, projected_gt=projected_gt):
             if os.environ.get("INCH_DEBUG"): _INCH_DBG[0] += 1     # deficit-done exits
             return True                                    # deficit-done → may leave early
-        _ok = (day - machine_inch_since.get(m, day)) >= MIN_INCH_DWELL_DAYS
+        if _INCH_COOLDOWN_RULE:
+            # "1 diff-size CO per machine per cooldown window" — clock runs from the machine's
+            # last DIFF-size CO (not from arrival on the current inch). A machine that has not
+            # changed size in ≥ cooldown days may change now; otherwise it is committed to its
+            # current inch (same-inch SKU switches remain free). Re-entry to a left size is thus
+            # only possible after the window (a return is itself a diff-CO).
+            _ok = (day - machine_last_diff_co_day.get(m, -10**9)) >= _INCH_COOLDOWN_DAYS
+        else:
+            _ok = (day - machine_inch_since.get(m, day)) >= MIN_INCH_DWELL_DAYS
         if os.environ.get("INCH_DEBUG"): _INCH_DBG[1 if _ok else 2] += 1  # dwell-pass / dwell-block
         return _ok
+
+    def _diff_co_ok(m: str, to_inch: str) -> bool:
+        """Diff-size-CO amortization gate: a machine may change to `to_inch` only if it has
+        NOT done a diff-size CO in the last DIFF_CO_MIN_DWELL_DAYS days AND the target inch
+        has ≥ DIFF_CO_MIN_TARGET_UNITS of sustained servable demand (real remaining demand,
+        not the momentary buffer) — so the 88-180 min CO is amortized by a real campaign,
+        not a bounce. Same-inch moves never reach here."""
+        if day - machine_last_diff_co_day.get(m, -10**9) < DIFF_CO_MIN_DWELL_DAYS:
+            return False
+        tgt = sum(max(0.0, demand_remaining.get(_s, 0.0) - projected_gt.get(_s, 0.0))
+                  for _s in machine_skus.get(m, ()) if sku_inch.get(_s, "") == to_inch)
+        return tgt >= DIFF_CO_MIN_TARGET_UNITS
+
+    def _jit_diff_ok(m: str, cur_inch: str, to_inch: str, buf: float) -> bool:
+        """Part 2 (JIT) churn control for a DIFF-inch candidate. Allows the switch only when it is
+        genuinely worth it, with no time-dwell:
+          - per-machine per-day diff-CO BUDGET not yet spent;
+          - URGENCY MARGIN: target inch's aggregate curing-draw deficit exceeds the machine's
+            CURRENT inch residual deficit by _JIT_URGENCY_MARGIN (demand-adaptive anti-bounce);
+          - AMORTIZATION: target inch has ≥ DIFF_CO_MIN_TARGET_UNITS of sustained remaining demand.
+        Same-inch moves never reach here."""
+        if not _JIT_INCH:
+            return True
+        if machine_day_diff_co.get(m, 0) >= _MAX_DIFF_CO_PER_MACHINE_PER_DAY:
+            return False
+        _skus = machine_skus.get(m, ())
+        _cur_urg = sum(_defc(_s, buf) for _s in _skus if sku_inch.get(_s, "") == cur_inch)
+        _tgt_urg = sum(_defc(_s, buf) for _s in _skus if sku_inch.get(_s, "") == to_inch)
+        if _tgt_urg <= _cur_urg + _JIT_URGENCY_MARGIN:
+            return False
+        _sustained = sum(max(0.0, demand_remaining.get(_s, 0.0) - projected_gt.get(_s, 0.0))
+                         for _s in _skus if sku_inch.get(_s, "") == to_inch)
+        return _sustained >= DIFF_CO_MIN_TARGET_UNITS
 
     def _max_cos(mach: str) -> int:
         # Flex machines get extra CO budget so they can take an off-inch
@@ -1465,6 +1912,12 @@ def _assign_building_shift(
                     if (_INCH_RULES_ENABLED and to_inch != cur_inch
                             and not _may_leave_inch(m, cur_inch, _defc, buf, rate)):
                         continue
+                    # ── Diff-size-CO amortization gate: block wasteful inch-hop churn ──
+                    if _DIFF_CO_GATE and to_inch != cur_inch and not _diff_co_ok(m, to_inch):
+                        continue
+                    # ── Part 2 JIT churn control: urgency margin + per-day budget + amortization ──
+                    if to_inch != cur_inch and not _jit_diff_ok(m, cur_inch, to_inch, buf):
+                        continue
                     if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
                             and to_inch != dom and not s["primary_done"]
                             and not _INCH_RULES_ENABLED):
@@ -1513,6 +1966,9 @@ def _assign_building_shift(
             m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = min(pairs, key=_key)
             s = stg[m]
             co_type = "same_size_CO" if to_inch == sku_inch.get(s["cur_sku"], "") else "diff_size_CO"
+            if co_type == "diff_size_CO":
+                machine_last_diff_co_day[m] = day
+                machine_day_diff_co[m] = machine_day_diff_co.get(m, 0) + 1   # Part 2 per-day budget
             s["campaigns"].append((sku, qty, co_type))
             projected_gt[sku] = projected_gt.get(sku, 0.0) + qty
             s["remaining"] -= (cost + mins)
@@ -1638,6 +2094,12 @@ def _assign_building_shift(
                         if (_INCH_RULES_ENABLED and to_inch != cur_inch
                                 and not _may_leave_inch(m, cur_inch, _defc, _buf_of(m), rate)):
                             continue
+                        # ── Diff-size-CO amortization gate (same as Phase B) ──
+                        if _DIFF_CO_GATE and to_inch != cur_inch and not _diff_co_ok(m, to_inch):
+                            continue
+                        # ── Part 2 JIT churn control (same as Phase B) ──
+                        if to_inch != cur_inch and not _jit_diff_ok(m, cur_inch, to_inch, _buf_of(m)):
+                            continue
                         # respect the flex/soft-lock off-dominant-inch gate (as Phase B)
                         if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
                                 and to_inch != dom and not s["primary_done"]
@@ -1677,6 +2139,9 @@ def _assign_building_shift(
                         break
                     co_type = ("start" if best == cur
                                else ("same_size_CO" if to_inch == cur_inch else "diff_size_CO"))
+                    if co_type == "diff_size_CO":
+                        machine_last_diff_co_day[m] = day
+                        machine_day_diff_co[m] = machine_day_diff_co.get(m, 0) + 1   # Part 2 budget
                     s["campaigns"].append((best, qty, co_type))
                     projected_gt[best] = projected_gt.get(best, 0.0) + qty
                     _fwd_added += qty
@@ -2074,8 +2539,8 @@ def _write_rolling_building_excel(
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
-    _NAVY  = "1F3864"; _WHITE = "FFFFFF"; _GREEN = "E2EFDA"
-    _AMBER = "FFF2CC"; _RED   = "FFE0E0"; _GREY  = "D3D3D3"
+    _NAVY  = "1F3864"; _WHITE = "FFFFFF"; _GREEN = "C6E0B4"
+    _AMBER = "FFE699"; _RED   = "FFE0E0"; _GREY  = "D3D3D3"
     _CO    = "FFC000"
 
     def _fill(h):   return PatternFill("solid", fgColor=h)
@@ -2313,7 +2778,7 @@ def _write_rolling_building_excel(
     # ── Sheet 7: Machine Utilization ──────────────────────────────────────────
     ws_util = wb.create_sheet("Machine Utilization")
 
-    _GREEN_U = "E2EFDA"; _AMBER_U = "FFF2CC"; _RED_U = "FFE0E0"
+    _GREEN_U = "C6E0B4"; _AMBER_U = "FFE699"; _RED_U = "FFE0E0"
 
     def _mgroup(m: str) -> str:
         if m in {"6001","6002","6003","6004","7001","7002","7003","7004"}: return "VMI"
@@ -2486,8 +2951,8 @@ def _write_rolling_curing_excel(
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    _GREEN = "C6EFCE"; _AMBER = "FFEB9C"; _RED   = "FFC7CE"; _LGREY = "D9D9D9"
-    _NAVY  = "1F3864"; _WHITE = "FFFFFF"; _BLUE  = "DCE6F1"; _LYELL = "FFF2CC"
+    _GREEN = "A9D08E"; _AMBER = "FFD966"; _RED   = "FFC7CE"; _LGREY = "D9D9D9"
+    _NAVY  = "1F3864"; _WHITE = "FFFFFF"; _BLUE  = "DCE6F1"; _LYELL = "FFE699"
     _DGREY = "F2F2F2"; _ORANGE= "FFC000"
 
     def _fill(h): return PatternFill("solid", fgColor=h)
@@ -2924,8 +3389,12 @@ def _inject_label_columns(xlsx_path: str, sku_desc: dict,
     when machine_names is given (the building workbook) — after every building
     Machine column insert a "<col> Name" column. Header-driven so it covers every
     sheet and tolerates the sheets whose header is not on row 1. Cosmetic-only:
-    on any error the workbook is left exactly as written."""
-    import openpyxl
+    on any error the workbook is left exactly as written. The inserted column copies
+    the SOURCE column's full styling (header fill/font, borders, alignment, number
+    format, column width) so the description reads like the SKU-code column and the
+    name reads like the machine-code column."""
+    import openpyxl, copy as _copy
+    from openpyxl.utils import get_column_letter
     _SKU_HDRS  = {"skucode", "from_sku", "target_sku", "new_sku", "sku_built"}
     _MACH_HDRS = {"machine"}
     _SENT = {"CHANGEOVER", "MOULD_CLEAN", "MOULD CLEAN", "C/O", "CO"}
@@ -2951,21 +3420,56 @@ def _inject_label_columns(xlsx_path: str, sku_desc: dict,
                 targets.append((c, "desc", ws.cell(hdr, c).value))
             elif machine_names is not None and h in _MACH_HDRS:
                 targets.append((c, "name", ws.cell(hdr, c).value))
+        # snapshot each column's width by header text — insert_cols does NOT shift
+        # column widths, so we re-apply them by name after all inserts are done.
+        orig_w = {}
+        for c in range(1, ws.max_column + 1):
+            h = str(ws.cell(hdr, c).value or "")
+            wdt = ws.column_dimensions[get_column_letter(c)].width
+            if h and wdt:
+                orig_w[h] = wdt
         # insert right-to-left so already-collected column indices stay valid
         for c, kind, orig in sorted(targets, key=lambda t: -t[0]):
             ws.insert_cols(c + 1)
-            ws.cell(hdr, c + 1,
-                    value=f"{orig} Description" if kind == "desc" else f"{orig} Name")
-            for r in range(hdr + 1, ws.max_row + 1):
-                code = ws.cell(r, c).value
-                if code is None or str(code).strip() == "":
-                    continue
-                key = str(code).strip()
-                if kind == "desc":
-                    val = key if key.upper() in _SENT else sku_desc.get(key, "NA")
-                else:
-                    val = machine_names.get(key, "NA")
-                ws.cell(r, c + 1, value=val)
+            new_hdr = f"{orig} Description" if kind == "desc" else f"{orig} Name"
+            # clone the source column's styling row-by-row, then write values
+            for r in range(1, ws.max_row + 1):
+                src, dst = ws.cell(r, c), ws.cell(r, c + 1)
+                dst.font          = _copy.copy(src.font)
+                dst.fill          = _copy.copy(src.fill)
+                dst.border        = _copy.copy(src.border)
+                dst.alignment     = _copy.copy(src.alignment)
+                dst.number_format = src.number_format
+                if r == hdr:
+                    dst.value = new_hdr
+                elif r > hdr:
+                    code = src.value
+                    if code is None or str(code).strip() == "":
+                        continue
+                    key = str(code).strip()
+                    if kind == "desc":
+                        dst.value = key if key.upper() in _SENT else sku_desc.get(key, "NA")
+                    else:
+                        dst.value = machine_names.get(key, "NA")
+        # re-apply widths by header — each label column inherits its source's width
+        for c in range(1, ws.max_column + 1):
+            h = str(ws.cell(hdr, c).value or "")
+            src_h = (h[:-len(" Description")] if h.endswith(" Description")
+                     else h[:-len(" Name")] if h.endswith(" Name") else h)
+            if src_h in orig_w:
+                ws.column_dimensions[get_column_letter(c)].width = orig_w[src_h]
+        # extend multi-column title merges (rows above the header) to the full new
+        # width so the title bar stays solid across the inserted columns
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row < hdr and mr.max_col > mr.min_col and mr.max_col < ws.max_column:
+                r0, c0, r1 = mr.min_row, mr.min_col, mr.max_row
+                try:
+                    ws.unmerge_cells(start_row=r0, start_column=c0,
+                                     end_row=r1, end_column=mr.max_col)
+                    ws.merge_cells(start_row=r0, start_column=c0,
+                                   end_row=r1, end_column=ws.max_column)
+                except Exception:
+                    pass
     try:
         wb.save(xlsx_path)
     except Exception:
@@ -3019,11 +3523,30 @@ def run_rolling_pipeline(
                   f"{len(_buildable_rate)} SKUs (5b guard)")
         except Exception as _e:
             print(f"  [Rolling] buildable_rate computation failed ({_e}); 5b guard disabled")
+    # Part 1: compute sku_inch EARLY (only when curing-align is on) so the Phase-0 CO scheduler
+    # can prefer same-inch targets. Gated → OFF path is zero-cost and bit-for-bit.
+    _early_sku_inch = None
+    if _CURING_INCH_ALIGN:
+        try:
+            from cbc_env import make_engine as _mk_si
+            from building_b2c import B2C_ETL as _BETL_si
+            _etl_si = _BETL_si(_mk_si())
+            _early_sku_inch = {str(k): str(v).strip().replace('"', "")
+                               for k, v in _etl_si.load_sku_sizes().items()}
+            for _, _row in _etl_si.load_machine_allowable().iterrows():
+                _s = str(_row["SKUCode"])
+                if (_s not in _early_sku_inch or not _early_sku_inch[_s]) and len(_s) >= 10:
+                    _early_sku_inch[_s] = _s[8:10]
+            print(f"  [Rolling] CURING_INCH_ALIGN ON — sku_inch for {len(_early_sku_inch)} SKUs")
+        except Exception as _e:
+            print(f"  [Rolling] early sku_inch (curing-align) failed ({_e}); align disabled")
+            _early_sku_inch = None
     cc_result = run_dynamic_consumption(
         demand_path=demand_path, output_path=CC_OUTPUT,
         plan_start=plan_start, planning_days=planning_days,
         max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
         buildable_rate=_buildable_rate,
+        sku_inch=_early_sku_inch,
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -3523,11 +4046,16 @@ def run_rolling_pipeline(
     # machine_used_inches: every inch the machine has run — an inch it has left
     #   can never be re-used (Rule 1a).
     machine_anchor_inch: dict[str, str] = {}
+    # Part 1 (LOCK_INCH_SET): each GT machine's locked inch-SET (mostly one). A machine may only
+    # build/CO to an inch in its set; empty/absent → unconstrained (±2 band). Computed below.
+    machine_locked_inches: dict[str, set] = {}
     machine_used_inches: dict[str, set] = {}
     # machine_inch_now / machine_inch_since: the machine's CURRENT inch and the day
     # that inch campaign began — the 5-day-dwell clock (Rule: min 5 days per size).
     machine_inch_now:   dict[str, str] = {}
     machine_inch_since: dict[str, int] = {}
+    # Last day each machine performed a diff-size CO (diff-CO amortization gate, DIFF_CO_GATE).
+    machine_last_diff_co_day: dict[str, int] = {}
     # Distinct SKUs each building machine has produced TODAY (reset per day, seeded with
     # the carryover SKU) — enforces the max-4-SKUs-per-machine-per-day plant rule.
     machine_day_skus:   dict[str, set] = {}
@@ -3536,6 +4064,9 @@ def run_rolling_pipeline(
     # Stage-1 carcass machines are scheduled in Step 3b, not in
     # _assign_building_shift, so they need their own current-inch tracker.
     s1_current_inch: dict[str, str] = {}
+    # Stage-1 single-inch lock (Rule 2, S1_SINGLE_INCH): {machine: its one month inch}.
+    # Empty when the toggle is off (Step-3b then falls back to the band gate).
+    s1_locked_inch: dict[str, str] = {}
 
     # Anchor the +/-2 band to the machine's REAL Day-0 inch whenever the plant
     # running state is known (machine_current_sku seeded above). Without this the
@@ -3555,6 +4086,212 @@ def run_rolling_pipeline(
                 s1_current_inch.setdefault(str(_m0), _i0)
         print(f"  [Rolling] Inch anchors seeded from Day-0 machine state: "
               f"{len(machine_anchor_inch)} machines")
+
+    # ── Demand-optimal machine→inch pre-solve (Rules C + 2, default OFF) ───────
+    # Assigns each machine one inch by matching capacity to per-inch demand, ignoring
+    # running-machine state (the TBMStage1/2 production-event tables are NOT used).
+    # AUTHORITATIVE: overrides any Day-0 seed above so running state never influences
+    # anchors under these toggles. See _optimal_inch_assignment.
+    if _INCH_ANCHOR_OPT:
+        _gt_machines = list(machine_skus.keys())
+        _gt_skus = set().union(*machine_skus.values()) if machine_skus else set()
+        _inch_dem_gt: dict[str, float] = defaultdict(float)
+        for _s in _gt_skus:
+            _i = sku_inch.get(_s, "")
+            if _i:
+                _inch_dem_gt[_i] += demand_dict.get(_s, 0.0)
+        _cap = {_m: _bld_qty_per_shift(_m) * 3 * planning_days for _m in _gt_machines}
+        _elig = {_m: {sku_inch.get(_s, "") for _s in machine_skus[_m] if sku_inch.get(_s, "")}
+                 for _m in _gt_machines}
+        # Curing-aware target: cap each inch by what curing can absorb (mould-feasible presses)
+        _inch_skus_gt: dict[str, list] = defaultdict(list)
+        for _s in _gt_skus:
+            _i = sku_inch.get(_s, "")
+            if _i:
+                _inch_skus_gt[_i].append(_s)
+        _ceil = _curing_inch_ceiling(_inch_skus_gt, _sku_moulds, cure_ct_map,
+                                     planning_days, len(press_state))
+        _tgt = ({_i: (min(_d, _ceil[_i]) if _i in _ceil else _d)
+                 for _i, _d in _inch_dem_gt.items()} if _ANCHOR_CURE_CAP else None)
+        _asg = _optimal_inch_assignment(_gt_machines, _elig, _cap, _inch_dem_gt, target=_tgt)
+        for _m, _i in _asg.items():
+            machine_anchor_inch[_m] = _i          # OVERRIDE (authoritative)
+            machine_inch_now[_m]    = _i
+            machine_inch_since[_m]  = 1
+            machine_used_inches.setdefault(_m, set()).add(_i)
+        _INCH_OPT_DBG[0] = len(_asg)
+        print(f"  [Rolling] INCH_ANCHOR_OPT: demand-optimal anchors for {len(_asg)} GT machines")
+        if os.environ.get("ANCHOR_DEBUG"):
+            from collections import Counter as _Ctr
+            _cnt = _Ctr(_asg.values())
+            _capby: dict[str, float] = defaultdict(float)
+            for _m, _i in _asg.items():
+                _capby[_i] += _cap.get(_m, 0.0)
+            print("  [ANCHOR_DEBUG] inch | demand | ceiling | target | #mach | anchored_cap | cap/target")
+            for _i in sorted(set(_inch_dem_gt) | set(_cnt), key=lambda z: -_inch_dem_gt.get(z, 0)):
+                _d = _inch_dem_gt.get(_i, 0.0); _c = _ceil.get(_i, float('inf'))
+                _t = (_tgt or _inch_dem_gt).get(_i, 0.0)
+                _cp = _capby.get(_i, 0.0)
+                print(f"    {_i:>3} | {_d:8.0f} | {_c if _c!=float('inf') else 0:8.0f} | {_t:8.0f} "
+                      f"| {_cnt.get(_i,0):3d} | {_cp:9.0f} | {_cp/_t if _t else 0:5.2f}")
+            print("  [ANCHOR_DEBUG] per-machine: anchor <- eligible inches (breadth)")
+            for _m in sorted(_asg, key=lambda z: (_asg[z], z)):
+                _ei = sorted(_elig.get(_m, set()), key=lambda z: int(z) if str(z).isdigit() else 99)
+                print(f"    {_m}: anchor={_asg[_m]:>3}  elig={_ei}")
+
+    # ── Part 1: single-inch-majority locked inch-SET (LOCK_INCH_SET) ──────────────
+    # Mathematical minimum-assignment covering: most GT machines get ONE inch, a few 2-3 (only
+    # where an inch's demand can't be covered by whole machines). HYBRID-seeded from the plant
+    # running-machine sizes (a running machine whose real size has demand is PINNED). Fully
+    # demand-dynamic (re-solved per month from demand_dict). Sets machine_locked_inches.
+    if _LOCK_INCH_SET:
+        _lg_machines = list(machine_skus.keys())
+        _lg_skus = set().union(*machine_skus.values()) if machine_skus else set()
+        _dem_by_inch: dict[str, float] = defaultdict(float)
+        _skus_by_inch: dict[str, list] = defaultdict(list)
+        for _s in _lg_skus:
+            _i = sku_inch.get(_s, "")
+            if _i:
+                _dem_by_inch[_i] += demand_dict.get(_s, 0.0)
+                _skus_by_inch[_i].append(_s)
+        _lcap = {_m: _bld_qty_per_shift(_m) * 3 * planning_days for _m in _lg_machines}
+        _lelig = {_m: {sku_inch.get(_s, "") for _s in machine_skus[_m] if sku_inch.get(_s, "")}
+                  for _m in _lg_machines}
+        _lceil = _curing_inch_ceiling(_skus_by_inch, _sku_moulds, cure_ct_map,
+                                      planning_days, len(press_state))
+        _ltgt = {_i: (min(_d, _lceil[_i]) if _i in _lceil else _d)
+                 for _i, _d in _dem_by_inch.items()}
+        # HYBRID pins: a running machine whose real running inch has demand ≥ floor keeps it.
+        _forced: dict[str, str] = {}
+        for _m in _lg_machines:
+            _ri = sku_inch.get(str(machine_current_sku.get(_m, "")), "")
+            if _ri and _ri in _lelig.get(_m, set()) \
+                    and _dem_by_inch.get(_ri, 0.0) >= _LOCK_PIN_DEMAND_FRAC * _lcap.get(_m, 0.0):
+                _forced[_m] = _ri
+        machine_locked_inches = _min_assignment_inch_sets(
+            _lg_machines, _lelig, _lcap, _ltgt, _forced)
+        # Anchor / inch clock = the machine's primary (pinned, else highest-demand) locked inch.
+        for _m, _iset in machine_locked_inches.items():
+            _primary = (_forced.get(_m)
+                        if _forced.get(_m) in _iset
+                        else max(_iset, key=lambda _i: (_dem_by_inch.get(_i, 0.0), _i)))
+            machine_anchor_inch[_m] = _primary
+            machine_inch_now[_m]    = _primary
+            machine_inch_since[_m]  = 1
+            machine_used_inches.setdefault(_m, set()).add(_primary)
+        _multi = sum(1 for _s in machine_locked_inches.values() if len(_s) > 1)
+        print(f"  [Rolling] LOCK_INCH_SET: {len(machine_locked_inches)} GT machines "
+              f"({len(machine_locked_inches)-_multi} single-inch, {_multi} multi-inch, "
+              f"{len(_forced)} pinned to real running size)")
+        if os.environ.get("LOCK_DEBUG"):
+            for _m in sorted(machine_locked_inches, key=lambda z: int(z) if str(z).isdigit() else 0):
+                _pin = " (pinned)" if _m in _forced else ""
+                _ss = ", ".join(sorted(machine_locked_inches[_m],
+                                       key=lambda z: int(z) if str(z).isdigit() else 99))
+                print(f"    {_m}: {{{_ss}}}{_pin}")
+            _under = {_i: _ltgt[_i] - sum(_lcap[_m] for _m in machine_locked_inches
+                                          if _i in machine_locked_inches[_m])
+                      for _i in _ltgt}
+            print("    [coverage] short inches:",
+                  {_i: round(_v) for _i, _v in _under.items() if _v > 1})
+
+    # ── Part A: dynamic hybrid initial allocation (INIT_HYBRID) ──────────────────
+    # Anchor = real running size where it has demand this month (pinned), else demand-optimal.
+    # Soft (sets anchor + ±2 band only); JIT flexes within it. Fully demand-dynamic.
+    if _INIT_ALLOC_HYBRID:
+        _hm = list(machine_skus.keys())
+        _hskus = set().union(*machine_skus.values()) if machine_skus else set()
+        _hdem: dict[str, float] = defaultdict(float)
+        _hby: dict[str, list] = defaultdict(list)
+        for _s in _hskus:
+            _i = sku_inch.get(_s, "")
+            if _i:
+                _hdem[_i] += demand_dict.get(_s, 0.0)
+                _hby[_i].append(_s)
+        _hcap = {_m: _bld_qty_per_shift(_m) * 3 * planning_days for _m in _hm}
+        _helig = {_m: {sku_inch.get(_s, "") for _s in machine_skus[_m] if sku_inch.get(_s, "")}
+                  for _m in _hm}
+        _hceil = _curing_inch_ceiling(_hby, _sku_moulds, cure_ct_map, planning_days, len(press_state))
+        _htgt = {_i: (min(_d, _hceil[_i]) if _i in _hceil else _d) for _i, _d in _hdem.items()}
+        # Demand-optimal, May-preferring assignment: process most-constrained machines first;
+        # keep a machine's real running inch ONLY while that inch still has UNMET target capacity
+        # (i.e. it is not already over-provisioned this month) — otherwise re-anchor it to the
+        # neediest reachable inch. This fires real reassignments when May sizes do not fit the
+        # month's demand (e.g. July 13″-heavy), which is the dynamic re-allocation.
+        def _num(i):
+            try: return int(i)
+            except Exception: return 99
+        _hresid = {_i: float(_t) for _i, _t in _htgt.items()}
+        _horder = sorted(_hm, key=lambda _m: (len(_helig.get(_m, ()) or ()), -_hcap.get(_m, 0.0), _m))
+        _hasg: dict[str, str] = {}
+        _hpin: list = []
+        _hreass: list = []
+        for _m in _horder:
+            _ri = sku_inch.get(str(machine_current_sku.get(_m, "")), "")
+            _el = _helig.get(_m, set())
+            if _ri and _ri in _el and _hresid.get(_ri, 0.0) > 0:
+                _chosen = _ri; _hpin.append(_m)         # May inch still needed → keep it
+            else:
+                _opts = [_i for _i in _el if _i in _hresid]
+                if _opts:
+                    _chosen = max(_opts, key=lambda _i: (_hresid.get(_i, 0.0),
+                                                         _hdem.get(_i, 0.0), -_num(_i)))
+                elif _el:
+                    _chosen = sorted(_el, key=_num)[0]
+                else:
+                    continue
+                (_hpin if _chosen == _ri else _hreass).append(_m)
+            _hasg[_m] = _chosen
+            _hresid[_chosen] = _hresid.get(_chosen, 0.0) - _hcap.get(_m, 0.0)
+        for _m, _i in _hasg.items():
+            machine_anchor_inch[_m] = _i
+            machine_inch_now[_m]    = _i
+            machine_inch_since[_m]  = 1
+            machine_used_inches.setdefault(_m, set()).add(_i)
+        print(f"  [Rolling] INIT_HYBRID: {len(_hasg)} GT anchors "
+              f"({len(_hpin)} kept real running size, {len(_hreass)} re-anchored to demand)")
+        if os.environ.get("LOCK_DEBUG"):
+            for _m in sorted(_hasg, key=lambda z: int(z) if str(z).isdigit() else 0):
+                _ri = sku_inch.get(str(machine_current_sku.get(_m, "")), "?")
+                _tag = "pinned" if _m in _hpin else f"reassigned (real {_ri}\")"
+                print(f"    {_m}: anchor={_hasg[_m]}\"  [{_tag}]")
+
+    if _STAGE1_SINGLE_INCH:
+        _s1_machines = sorted(_S1_MACHINES)
+        _s1_msku: dict[str, set] = defaultdict(set)          # Stage-1 machine → feedable SKUs
+        for _sku, _ms in s1_sku_to_machines.items():
+            for _m in _ms:
+                _s1_msku[_m].add(_sku)
+        _inch_dem_s1: dict[str, float] = defaultdict(float)  # Stage-2 carcass demand per inch
+        for _sku in s1_sku_to_machines:
+            _i = sku_inch.get(_sku, "")
+            if _i:
+                _inch_dem_s1[_i] += demand_dict.get(_sku, 0.0)
+        _cap_s1 = {_m: _bld_qty_per_shift(_m) * 3 * planning_days for _m in _s1_machines}
+        _elig_s1 = {_m: {sku_inch.get(_s, "") for _s in _s1_msku.get(_m, ()) if sku_inch.get(_s, "")}
+                    for _m in _s1_machines}
+        # Curing-aware target: Stage-2 carcass demand per inch capped by curing throughput
+        _inch_skus_s1: dict[str, list] = defaultdict(list)
+        for _sku in s1_sku_to_machines:
+            _i = sku_inch.get(_sku, "")
+            if _i:
+                _inch_skus_s1[_i].append(_sku)
+        _ceil_s1 = _curing_inch_ceiling(_inch_skus_s1, _sku_moulds, cure_ct_map,
+                                        planning_days, len(press_state))
+        _tgt_s1 = ({_i: (min(_d, _ceil_s1[_i]) if _i in _ceil_s1 else _d)
+                    for _i, _d in _inch_dem_s1.items()} if _ANCHOR_CURE_CAP else None)
+        _asg_s1 = _optimal_inch_assignment(_s1_machines, _elig_s1, _cap_s1, _inch_dem_s1,
+                                           target=_tgt_s1)
+        for _m, _i in _asg_s1.items():
+            s1_locked_inch[_m]      = _i
+            machine_anchor_inch[_m] = _i
+            s1_current_inch[_m]     = _i
+            machine_inch_now[_m]    = _i
+            machine_inch_since[_m]  = 1
+            machine_used_inches.setdefault(_m, set()).add(_i)
+        _INCH_OPT_DBG[1] = len(_asg_s1)
+        print(f"  [Rolling] S1_SINGLE_INCH: locked {len(_asg_s1)} Stage-1 machines to one inch "
+              f"({dict(sorted(_asg_s1.items()))})")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Data accumulators (matching output sheet formats)
@@ -3981,6 +4718,7 @@ def run_rolling_pipeline(
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
         machine_day_skus = {str(_m): ({str(_s)} if _s else set())
                             for _m, _s in machine_current_sku.items()}
+        machine_day_diff_co = {}                    # Part 2: reset per-day diff-CO budget counter
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
         if _ROLLING_HORIZON_CO_ENABLED:
@@ -4175,7 +4913,82 @@ def run_rolling_pipeline(
                 day=day,
                 machine_day_skus=machine_day_skus,
                 machine_plus3_used=machine_plus3_used,
+                machine_last_diff_co_day=machine_last_diff_co_day,
+                machine_locked_inches=machine_locked_inches,
+                machine_day_diff_co=machine_day_diff_co,
             )
+
+            # ── 2b. Idle-recoverability diagnostic (read-only, plan-neutral) ──
+            if _IDLE_DIAG_ON:
+                _SM = float(SHIFT_MINS)
+                # GT built THIS shift per SKU (non-Stage-1 only → real curable GT).
+                _built_shift: dict[str, float] = defaultdict(float)
+                _used_min: dict[str, float] = {}
+                for _m, _cps in shift_plan.items():
+                    _ct = _BLD_CT_SEC.get(str(_m), 120.0)
+                    _pi = sku_inch.get(machine_current_sku.get(_m, ""), "")
+                    _um = 0.0
+                    for _s, _q, _ct_type in _cps:
+                        if _ct_type not in ("start", "production"):
+                            _um += _co_cost(_m, _pi, sku_inch.get(_s, ""))
+                        _um += _q * _ct / 60.0
+                        _pi = sku_inch.get(_s, "")
+                        if _m not in _S1_MACHINES:
+                            _built_shift[_s] += _q
+                    _used_min[_m] = _um
+                # projected GT after this shift's building (entry inv + built this shift).
+                def _pg_after(_s):
+                    return gt_inventory.get(_s, 0.0) + _built_shift.get(_s, 0.0)
+                # Idle machines (>= a legal campaign of idle time left this shift).
+                _idle_machs = []
+                for _m in machine_skus:
+                    _um = _used_min.get(_m, 0.0)   # machines absent from shift_plan = fully idle
+                    _idle = max(0.0, _SM - _um)
+                    if _m in _S1_MACHINES:
+                        _IDLE_DIAG["s1_idle_min"] += _idle
+                        continue
+                    _IDLE_DIAG["gt_idle_min"] += _idle
+                    if _idle >= MIN_CAMPAIGN_MINS:
+                        _cps = shift_plan.get(_m)
+                        _end_inch = (sku_inch.get(_cps[-1][0], "") if _cps
+                                     else sku_inch.get(machine_current_sku.get(_m, ""), ""))
+                        _idle_machs.append((_m, _idle, _end_inch))
+                # Per-SKU: how many units the drawing press(es) will fail to cure this shift
+                # for lack of GT (the momentary shortfall), and is it reachable by an idle machine?
+                _rec_shifts = set(); _ceil_shifts = set()
+                for _s, _draw in shift_cure_demand.items():
+                    if _draw <= 0:
+                        continue
+                    _short = min(_draw, demand_remaining.get(_s, 0.0)) - _pg_after(_s)
+                    if _short <= 0:
+                        continue
+                    _to = sku_inch.get(_s, "")
+                    _hit = None
+                    for _m, _idle, _cur in _idle_machs:
+                        if _s not in machine_skus.get(_m, ()):
+                            continue
+                        if _to == _cur:
+                            _reach = True
+                        else:
+                            _anc = machine_anchor_inch.get(_m, "")
+                            _band = _inch_ok(_to, _cur, _anc, machine_used_inches.get(_m, set()))
+                            _dwell = ((day - machine_inch_since.get(_m, day)) >= MIN_INCH_DWELL_DAYS
+                                      or _inch_demand_done(_m, _cur, machine_skus, sku_inch,
+                                                           None, 0, demand_remaining=demand_remaining,
+                                                           projected_gt={k: _pg_after(k)
+                                                                         for k in machine_skus.get(_m, ())}))
+                            _reach = _band and _dwell
+                        if _reach:
+                            _hit = _m; break
+                    if _hit is not None:
+                        _IDLE_DIAG["rec_units"] += _short
+                        _IDLE_DIAG["rec_by_inch"][_to] = _IDLE_DIAG["rec_by_inch"].get(_to, 0.0) + _short
+                        _rec_shifts.add(_hit)
+                    else:
+                        _IDLE_DIAG["ceil_units"] += _short
+                        _IDLE_DIAG["ceil_by_inch"][_to] = _IDLE_DIAG["ceil_by_inch"].get(_to, 0.0) + _short
+                _IDLE_DIAG["rec_shifts"] += len(_rec_shifts)
+                _IDLE_DIAG["ceil_shifts"] += len(_ceil_shifts)
 
             # ── 3. Add GT to inventory; record building rows + CO events ───
             # StartTime/EndTime: per-machine wall-clock cursor within the shift.
@@ -4331,6 +5144,10 @@ def run_rolling_pipeline(
                 """
                 if not _INCH_RULES_ENABLED:
                     return True
+                # Rule 2 (S1_SINGLE_INCH): the machine is locked to ONE inch all month —
+                # eligible only for that exact inch's carcass (zero different-size CO).
+                if _STAGE1_SINGLE_INCH and _m in s1_locked_inch:
+                    return sku_inch.get(_sku, "") == s1_locked_inch[_m]
                 return _inch_ok(sku_inch.get(_sku, ""),
                                 s1_current_inch.get(_m, ""),
                                 machine_anchor_inch.get(_m, ""),
@@ -4867,6 +5684,20 @@ def run_rolling_pipeline(
     print("=" * 70)
     print(f"  Total GT built       : {total_built:>10,.0f}")
     print(f"  Total cured          : {total_cured:>10,.0f}")
+    if _IDLE_DIAG_ON:
+        _d = _IDLE_DIAG
+        _tot = _d["rec_units"] + _d["ceil_units"]
+        print("  " + "-" * 62)
+        print("  [IDLE_DIAG] momentary curing shortfall split (by reachability):")
+        print(f"    recoverable (reachable idle machine existed) : {_d['rec_units']:>10,.0f} units"
+              f"  ({_d['rec_units']/_tot*100 if _tot else 0:4.1f}%)")
+        print(f"    ceiling (no reachable machine — curing-limit) : {_d['ceil_units']:>10,.0f} units"
+              f"  ({_d['ceil_units']/_tot*100 if _tot else 0:4.1f}%)")
+        print(f"    GT-machine idle: {_d['gt_idle_min']:>12,.0f} min   Stage-1 idle: {_d['s1_idle_min']:,.0f} min")
+        _ri = sorted(_d["rec_by_inch"].items(), key=lambda z: -z[1])[:6]
+        _ci = sorted(_d["ceil_by_inch"].items(), key=lambda z: -z[1])[:6]
+        print(f"    recoverable by inch : " + "  ".join(f"{k}:{v:,.0f}" for k, v in _ri))
+        print(f"    ceiling by inch     : " + "  ".join(f"{k}:{v:,.0f}" for k, v in _ci))
     print(f"  GT written off       : {writeoff_total:>10,.0f}")
     print(f"  Starvation events    : {starvation_n:>10,}")
     print(f"  Curing COs (total)   : {_n_co_total:>10,}"

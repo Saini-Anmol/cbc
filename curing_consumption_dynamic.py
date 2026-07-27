@@ -108,6 +108,13 @@ _SURPLUS_RELEASE_ENABLED  = True
 # CO cap + global pairing + n-1 RI-protection decide how many presses actually move.)
 _SURPLUS_PER_SKU_PER_DAY  = int(os.environ.get("SURPLUS_PER_DAY", "2"))
 
+# Curing CO same-inch alignment (env CURING_INCH_ALIGN, default OFF). When on (and a sku_inch
+# map is supplied), a press changing over PREFERS a target SKU of the SAME inch as its current
+# SKU — a tiebreak placed AFTER urgency_class + constraint, so demand-critical (Class-A) and
+# sole-supplier needs are never sacrificed. Keeps each press on one inch across COs, so the
+# building side can feed it without different-size changeovers (esp. BJ/US single-inch machines).
+_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "0") != "0"
+
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
 _BLUE  = "D6E4F0"
@@ -198,6 +205,7 @@ class COScheduler:
         planning_days: int = PLANNING_DAYS,
         ratio_demand_map: dict | None = None,
         buildable_rate: dict | None = None,
+        sku_inch: dict | None = None,
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -218,6 +226,16 @@ class COScheduler:
         press_to_sku: dict[str, str] = {}
         for _, r in df_running_moulds.iterrows():
             press_to_sku[str(r["Machine"])] = str(r["SKUCode"])
+
+        # Same-inch alignment (Part 1): 0 if the CO target's inch matches the press's CURRENT
+        # SKU inch, else 1 — used as a low-priority tiebreak so a press keeps its inch across COs.
+        _sku_inch = sku_inch or {}
+        _align = _CURING_INCH_ALIGN and bool(_sku_inch)
+        def _same_inch(press: str, target: str) -> int:
+            if not _align:
+                return 0                                   # OFF → constant → no ordering change
+            cur = _sku_inch.get(str(press_to_sku.get(press, "")), "")
+            return 0 if (cur and _sku_inch.get(str(target), "") == cur) else 1
 
         ro_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-Out",     "SKUCode"])
         ri_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-In",      "SKUCode"])
@@ -432,6 +450,7 @@ class COScheduler:
                     best = min(_pairs, key=lambda pr: (
                         pr[3][0],                                   # urgency_class
                         min(_flex_p[pr[0]], _flex_t[pr[1]]),        # constraint
+                        _same_inch(pr[0], pr[1]),                   # prefer same inch (Part 1)
                         pr[3][1], pr[3][2],                         # -priority, after_days
                         ct_map.get(pr[1], _dct), pr[0], pr[1],      # deterministic tiebreak
                     ))
@@ -489,6 +508,7 @@ class COScheduler:
             _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
             candidates.sort(key=lambda x: (
                 x[0][0],                                           # Class A (0) before Class B (1)
+                _same_inch(x[1], x[3]),                            # prefer same inch (Part 1)
                 x[0][1], x[0][2],                                  # −priority, after_days (urgency first)
                 ct_map.get(x[3], _dct),                            # CT as tiebreaker (throughput)
                 len(press_to_demand_targets.get(x[1], [])),         # exclusive press first (fewer targets)
@@ -1389,6 +1409,7 @@ def run_dynamic_consumption(
     planning_days: int = PLANNING_DAYS,
     max_co_per_day: int = MAX_CO_PER_DAY,
     buildable_rate: dict | None = None,
+    sku_inch: dict | None = None,
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1541,6 +1562,7 @@ def run_dynamic_consumption(
         df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day,
         planning_days=planning_days,
         buildable_rate=buildable_rate,
+        sku_inch=sku_inch,
     )
 
     # Pass 2: 31-day simulation

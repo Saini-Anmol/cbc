@@ -51,7 +51,7 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
+RUNNING_MOULDS_TABLE = "june_Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -69,7 +69,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
@@ -131,6 +131,14 @@ MIN_INCH_DWELL_DAYS = 5
 # UNLESS the current size's demand it can serve is already completed on that machine
 # (deficit-done override, then it may change early). A machine may run one size all
 # month. Only enforced when _INCH_RULES_ENABLED (env INCH_RULES=1) in b2c_pipeline.py.
+
+# Diff-size-CO amortization gate (env DIFF_CO_GATE in b2c_pipeline.py). Kills wasteful
+# inch-hopping churn: a machine may do a DIFFERENT-inch CO only if (a) ≥ this many days
+# since its last diff-size CO, and (b) the target inch offers ≥ DIFF_CO_MIN_TARGET_UNITS
+# of sustained servable demand for it (amortizes the 88-180 min cost). Same-inch COs stay
+# free. Tuned to drive diff-size COs from ~293 toward <60 while holding/raising KPI.
+DIFF_CO_MIN_DWELL_DAYS  = 5       # min days between diff-size COs per machine (adopted: 5)
+DIFF_CO_MIN_TARGET_UNITS = 300    # min sustained target-inch demand to justify a diff CO
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. BUILDING SCHEDULER  →  building_b2c.py  +  building.py Config
