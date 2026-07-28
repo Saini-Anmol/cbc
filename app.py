@@ -31,7 +31,6 @@ from flask import Blueprint, Flask, jsonify, request, send_file
 
 import connection as conn
 from main import PLAN_OUTPUT_DIR, run_plan
-
 MODE = "planning"
 PREFIX = "/app/v1/jkt/planning-scheduling"
 MAX_PLAN_ID_LEN = 100      # matches plan_id VARCHAR(100) in every DB table
@@ -88,6 +87,8 @@ def download_plan(plan_id: str, kind: str):
     return send_file(path, as_attachment=True,
                      download_name=os.path.basename(path))
 
+# Complete route- planning//app/v1/jkt/planning-scheduling/plan/generate-ctp-pcr-plan 
+# Complete route- planning//app/v1/jkt/planning-scheduling/plan/generate-ctp-tbr-plan 
 
 @bp.route("/plan/generate-plan", methods=["POST"])
 def generate_plan():

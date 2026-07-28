@@ -64,6 +64,9 @@ from bc_config import (
     MOULD_CLEAN_MINS,
     CURING_CO_CHANGEOVER_MINS,
     MAX_CHANGEOVERS_PER_DAY,
+    VMI_JIT_MARGIN,
+    VMI_MAX_DIFF_CO_PER_DAY,
+    RT_SAME_INCH,
     MIN_CAMPAIGN_MINS,
     MIN_CAMPAIGN_UNITS,
     MIN_INCH_DWELL_DAYS,
@@ -173,6 +176,22 @@ _IDLE_DIAG = {
 # real curing-driven deficit — see _assign_building_shift.
 _ROUND_TRIP_BUFFER_ENABLED = True
 
+# Round-trip partner SAME-INCH preference (env RT_SAME_INCH). The round-trip buffer sizes itself to
+# a rotation partner; today it picks the HIGHEST-DEFICIT partner, which may be a different inch → an
+# expensive 120-min diff round-trip that oversizes the buffer (front-loading). ON prefers a SAME-INCH
+# partner (a ~20-min same_size_CO, no building diff-CO, consistent with Phase-B same-inch-first) →
+# smaller, more accurate buffer. Measured: big win on low-demand months (May +15k, starv down, VMI
+# 11→8) but a HARD same-inch restriction HURTS high-demand July (−14k) — July's imbalanced demand
+# genuinely needs cross-inch rotations. So it is DEFICIT-AWARE: prefer the same-inch partner only when
+# its deficit ≥ RT_SAME_INCH_FRAC × the best (any-inch) partner deficit; else fall back to the biggest
+# deficit even if off-inch (July keeps its flexibility). OFF → deficit-first partner, bit-for-bit.
+# DEFAULT OFF. Month-dependent: hard same-inch (FRAC=0) is +14,964 on the low-demand month (May,
+# VMI 11→8 = plant, starvation down) but −14k on high-demand July (needs cross-inch rotations); the
+# deficit-aware FRAC>0 gate cannot keep May's gain without July's loss. So it is a LOW-DEMAND-MONTH
+# lever (set RT_SAME_INCH=1 for May-like months, leave OFF for July). FRAC default 0 = hard restrict.
+_RT_SAME_INCH = os.environ.get("RT_SAME_INCH", "1" if RT_SAME_INCH else "0") != "0"  # bc_config per-month
+_RT_SAME_INCH_FRAC = float(os.environ.get("RT_SAME_INCH_FRAC", "0"))
+
 # Building-side RI-first-then-ratio: NRI (press_count<=0) candidates ranked by
 # static demand[sku]/machine_total_demand[machine] instead of raw deficit; RI
 # candidates (any live press) keep raw-deficit ranking unchanged and always
@@ -268,6 +287,16 @@ _FWD_RISK_SHIFTS = True
 # pre-builds a SKU beyond this many shifts of its live cure-draw (so it cannot age
 # out to writeoff within the shelf window).
 GT_SHELF_LIFE_SHIFTS = GT_SHELF_LIFE_DAYS * 3
+
+# Build-to-draw PACING (env PACING, default OFF). The plant builds FLAT and same-day: each
+# stage builds only ~what the next stage draws that day (daily-GT CV 5-6%), never racing 9
+# shifts ahead. When ON, the Phase-C forward-buffer is BOUNDED to PACING_SHIFTS (1-2) instead
+# of the full GT_SHELF_LIFE_SHIFTS (9), so daily building ≈ same-day draw + the flat Phase-A/B
+# buffer → the plant's flat curve, recovering late-month press starvation that front-loading
+# causes. Trades the forward-buffer's KPI accelerator for flatness; evaluate WITH SIZE_BAL.
+# OFF → forward-buffer horizon unchanged (9 shifts), bit-for-bit.
+_PACING_ENABLED = os.environ.get("PACING", "0") != "0"
+PACING_SHIFTS   = int(os.environ.get("PACING_SHIFTS", "2"))
 
 # IDLE-MACHINE → HIGHEST-UNMET-DEMAND targeting (ADOPTED, default ON). The forward
 # buffer above (Phase C) fills idle building capacity toward the NEAREST-TO-STARVE SKU.
@@ -633,7 +662,21 @@ _MAX_DIFF_CO_PER_MACHINE_PER_DAY = int(os.environ.get("MAX_DIFF_CO_PER_DAY", "2"
 # computes sku_inch BEFORE the Phase-0 curing scheduler and passes it in, so a press changing over
 # prefers a same-inch target — keeping each press on one inch so building feeds it without
 # different-size COs (mirrors the toggle of the same name in curing_consumption_dynamic.py).
-_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "0") != "0"
+_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "1") != "0"  # ADOPTED co-plan config (July): ON
+
+# Part 2: per-group building inch policy (env GROUP_INCH_POLICY, default OFF). Matches the plant's
+# per-group changeover pattern (report p.4): BJ + UNISTAGE(US) machines are HARD single-inch
+# (0 different-size CO) — locked to their hybrid/real anchor inch via machine_locked_inches;
+# VMI is left on JIT but TIGHTER (see VMI_JIT_MARGIN below) so it does few diff-COs (the plant's
+# ~3 ±3 jumps); Stage-2 stays fully flexible (JIT). Paired with CURING_INCH_ALIGN so the locked
+# BJ/US presses are drawn on-inch and never starve.
+_GROUP_INCH_POLICY = os.environ.get("GROUP_INCH_POLICY", "1") != "0"  # ADOPTED co-plan config (July): ON
+# VMI-specific JIT tightness (only applied under GROUP_INCH_POLICY): a higher urgency margin and
+# lower per-day diff-CO budget than the global JIT, so VMI churns less. Default = global values.
+# ADOPTED July co-plan config: 250 / 1 (the "Balanced" operating point → 680,106 cured, VMI 27 diff-COs).
+# For May/June use 300 / 1 (env VMI_JIT_MARGIN=300).
+_VMI_JIT_MARGIN = int(os.environ.get("VMI_JIT_MARGIN", str(VMI_JIT_MARGIN)))              # bc_config single source
+_VMI_MAX_DIFF_CO_PER_DAY = int(os.environ.get("VMI_MAX_DIFF_CO_PER_DAY", str(VMI_MAX_DIFF_CO_PER_DAY)))
 
 # ── Part A: dynamic hybrid initial allocation (env INIT_HYBRID, default OFF) ───────
 # Seeds each GT machine's ANCHOR inch (which fixes its ±2 band) from the plant building-running
@@ -1020,6 +1063,72 @@ def _compute_buildable_rate(engine, demand_path: str) -> dict:
         for s in skus:
             buildable[s] = buildable.get(s, 0.0) + m_day       # full throughput, not apportioned
     return buildable
+
+
+def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int = 31) -> dict:
+    """Co-planning pre-solve (Part A+B). Computes the demand-optimal single-inch allocation for the
+    GT machines, then derives:
+      - bjus_lock[machine]        : the single locked inch for each BJ/UNISTAGE(US) machine;
+      - building_inch_capacity[i] : GT/day the building side supplies inch i under that allocation
+                                    (= Σ GT/day of GT machines anchored to i) — used by the curing
+                                    scheduler to migrate the press draw toward what building supplies;
+      - buildable[sku]            : LOCK-AWARE per-SKU building GT/day (a locked BJ/US machine
+                                    contributes ONLY to its locked-inch SKUs) for the 5b guard.
+    Reuses _greedy_inch_assignment + _bld_qty_per_shift. Independent of curing state (uses demand +
+    allowable + sku_inch only), so it can run BEFORE the Phase-0 curing scheduler."""
+    import ast
+    from building_b2c import B2C_ETL as _BETL
+    ddf  = pd.read_excel(demand_path)
+    scol = next((c for c in ddf.columns if "SKU" in str(c)), ddf.columns[0])
+    qcol = next((c for c in ddf.columns
+                 if any(x in str(c) for x in ("Requirement", "Demand", "Qty", "Quantity"))),
+                ddf.columns[1])
+    _dq = ddf[[scol, qcol]].copy()
+    _dq[scol] = _dq[scol].astype(str).str.strip()
+    _dq[qcol] = pd.to_numeric(_dq[qcol], errors="coerce")
+    _dq = _dq.dropna(subset=[qcol])
+    demand = _dq.groupby(scol)[qcol].sum().to_dict()
+    df_allow = _BETL(engine).load_machine_allowable()
+    machine_skus: dict[str, set] = {}
+    for _, r in df_allow.iterrows():
+        sku = str(r["SKUCode"]).strip()
+        ms  = r.get("Machines", [])
+        if isinstance(ms, str):
+            try: ms = ast.literal_eval(ms)
+            except Exception: ms = []
+        for m in ms:
+            m = str(m).strip()
+            if _MACHINE_GROUP.get(m, "") == "STAGE1":
+                continue
+            machine_skus.setdefault(m, set()).add(sku)
+    gt = sorted(machine_skus)
+    inch_dem: dict[str, float] = defaultdict(float)
+    for s in set().union(*machine_skus.values()) if machine_skus else set():
+        i = sku_inch.get(str(s), "")
+        if i:
+            inch_dem[i] += demand.get(s, 0.0)
+    elig = {m: {sku_inch.get(str(s), "") for s in machine_skus[m] if sku_inch.get(str(s), "")}
+            for m in gt}
+    # anchor uses MONTHLY cap (to match monthly demand); building_inch_capacity is GT/DAY.
+    cap_month = {m: float(_bld_qty_per_shift(m) * 3 * planning_days) for m in gt}
+    cap_day   = {m: float(_bld_qty_per_shift(m) * 3) for m in gt}
+    anchor = _greedy_inch_assignment(gt, elig, cap_month, dict(inch_dem))
+    inch_cap: dict[str, float] = defaultdict(float)
+    for m, i in anchor.items():
+        inch_cap[i] += cap_day.get(m, 0.0)
+    # Only US (UNISTAGE) is HARD-locked (max 1 Day-1 setup CO). BJ is left flexible (soft, tight
+    # JIT → 2-3 COs/month) so it keeps its ±2 band and the KPI recovers.
+    bjus_lock = {m: anchor[m] for m in gt
+                 if _MACHINE_GROUP.get(m, "") == "UNISTAGE" and m in anchor}
+    buildable: dict[str, float] = {}
+    for m, skus in machine_skus.items():
+        _locked = bjus_lock.get(m)                                  # only BJ/US are locked
+        m_day = _bld_qty_per_shift(m) * 3
+        for s in skus:
+            if _locked is not None and sku_inch.get(str(s), "") != _locked:
+                continue                                            # locked machine can't build off-inch
+            buildable[s] = buildable.get(s, 0.0) + m_day
+    return {"bjus_lock": bjus_lock, "building_inch_capacity": dict(inch_cap), "buildable": buildable}
 
 
 def _shift_start_dt(date_str: str, shift: str) -> "datetime":
@@ -1762,12 +1871,18 @@ def _assign_building_shift(
         Same-inch moves never reach here."""
         if not _JIT_INCH:
             return True
-        if machine_day_diff_co.get(m, 0) >= _MAX_DIFF_CO_PER_MACHINE_PER_DAY:
+        # Part 2: BJ + VMI use a tighter margin/budget under the group policy (few diff-COs, keep
+        # the ±2 band). US is hard-locked (0). Stage-2 stays on the normal JIT (flexible).
+        if _GROUP_INCH_POLICY and _MACHINE_GROUP.get(str(m), "") in ("BJ", "VMI"):
+            _budget, _margin = _VMI_MAX_DIFF_CO_PER_DAY, _VMI_JIT_MARGIN
+        else:
+            _budget, _margin = _MAX_DIFF_CO_PER_MACHINE_PER_DAY, _JIT_URGENCY_MARGIN
+        if machine_day_diff_co.get(m, 0) >= _budget:
             return False
         _skus = machine_skus.get(m, ())
         _cur_urg = sum(_defc(_s, buf) for _s in _skus if sku_inch.get(_s, "") == cur_inch)
         _tgt_urg = sum(_defc(_s, buf) for _s in _skus if sku_inch.get(_s, "") == to_inch)
-        if _tgt_urg <= _cur_urg + _JIT_URGENCY_MARGIN:
+        if _tgt_urg <= _cur_urg + _margin:
             return False
         _sustained = sum(max(0.0, demand_remaining.get(_s, 0.0) - projected_gt.get(_s, 0.0))
                          for _s in _skus if sku_inch.get(_s, "") == to_inch)
@@ -1851,6 +1966,11 @@ def _assign_building_shift(
             if _ROUND_TRIP_BUFFER_ENABLED and cur and len(eligible) > 1:
                 pc = [x for x in eligible if x != cur
                       and demand_remaining.get(x, 0.0) > 0 and _defc(x, buf) > 0]
+                if pc and _RT_SAME_INCH:                          # prefer a same-inch rotation partner
+                    _si_pc = [x for x in pc if sku_inch.get(x, "") == cur_inch]
+                    if _si_pc and (max(_defc(x, buf) for x in _si_pc)
+                                   >= _RT_SAME_INCH_FRAC * max(_defc(x, buf) for x in pc)):
+                        pc = _si_pc                               # same-inch partner is nearly as needy
                 if pc:
                     if m in _INCH_FLEX_MACHINES:
                         partner = max(pc, key=lambda x: (
@@ -2105,7 +2225,11 @@ def _assign_building_shift(
                                 and to_inch != dom and not s["primary_done"]
                                 and not _INCH_RULES_ENABLED):
                             continue
-                        target = min(dr, draw * GT_SHELF_LIFE_SHIFTS)
+                        # Build-to-draw pacing: bound the forward horizon to PACING_SHIFTS (flat,
+                        # plant-like same-day pull) instead of the full 9-shift shelf window. OFF → 9.
+                        _fwd_shifts = (min(GT_SHELF_LIFE_SHIFTS, PACING_SHIFTS)
+                                       if _PACING_ENABLED else GT_SHELF_LIFE_SHIFTS)
+                        target = min(dr, draw * _fwd_shifts)
                         room = target - projected_gt.get(sku, 0.0)
                         if room <= 0:
                             continue
@@ -2285,6 +2409,11 @@ def _assign_building_shift(
                 and demand_remaining.get(s, 0.0) > 0
                 and _deficit(s) > 0
             ]
+            if partner_candidates and _RT_SAME_INCH:             # prefer a same-inch rotation partner
+                _si_pc = [s for s in partner_candidates if sku_inch.get(s, "") == cur_inch]
+                if _si_pc and (max(_deficit(s) for s in _si_pc)
+                               >= _RT_SAME_INCH_FRAC * max(_deficit(s) for s in partner_candidates)):
+                    partner_candidates = _si_pc                  # same-inch partner is nearly as needy
             if partner_candidates:
                 if machine in _INCH_FLEX_MACHINES:
                     # Flex machines may rotate to an OFF-inch partner (expensive
@@ -3526,7 +3655,7 @@ def run_rolling_pipeline(
     # Part 1: compute sku_inch EARLY (only when curing-align is on) so the Phase-0 CO scheduler
     # can prefer same-inch targets. Gated → OFF path is zero-cost and bit-for-bit.
     _early_sku_inch = None
-    if _CURING_INCH_ALIGN:
+    if _CURING_INCH_ALIGN or _GROUP_INCH_POLICY:
         try:
             from cbc_env import make_engine as _mk_si
             from building_b2c import B2C_ETL as _BETL_si
@@ -3537,16 +3666,32 @@ def run_rolling_pipeline(
                 _s = str(_row["SKUCode"])
                 if (_s not in _early_sku_inch or not _early_sku_inch[_s]) and len(_s) >= 10:
                     _early_sku_inch[_s] = _s[8:10]
-            print(f"  [Rolling] CURING_INCH_ALIGN ON — sku_inch for {len(_early_sku_inch)} SKUs")
+            print(f"  [Rolling] early sku_inch for {len(_early_sku_inch)} SKUs")
         except Exception as _e:
-            print(f"  [Rolling] early sku_inch (curing-align) failed ({_e}); align disabled")
+            print(f"  [Rolling] early sku_inch failed ({_e})")
             _early_sku_inch = None
+    # Co-planning pre-solve (Part A+B): BJ/US locks + building_inch_capacity + LOCK-AWARE
+    # buildable_rate, computed BEFORE curing so the Phase-0 scheduler can supply-match its draw.
+    _coplan_lock: dict = {}
+    _building_inch_capacity: dict | None = None
+    if _GROUP_INCH_POLICY and _early_sku_inch:
+        try:
+            from cbc_env import make_engine as _mk_cp
+            _cp = _co_plan_supply(_mk_cp(), demand_path, _early_sku_inch, planning_days)
+            _coplan_lock = _cp["bjus_lock"]
+            _building_inch_capacity = _cp["building_inch_capacity"]
+            _buildable_rate = _cp["buildable"]      # override with the LOCK-AWARE rate
+            print(f"  [Rolling] CO-PLAN: {len(_coplan_lock)} BJ/US locks; building_inch_capacity "
+                  f"{ {k: round(v) for k, v in sorted(_building_inch_capacity.items())} }")
+        except Exception as _e:
+            print(f"  [Rolling] co-plan supply failed ({_e})")
     cc_result = run_dynamic_consumption(
         demand_path=demand_path, output_path=CC_OUTPUT,
         plan_start=plan_start, planning_days=planning_days,
         max_co_per_day=MAX_CHANGEOVERS_PER_DAY,
         buildable_rate=_buildable_rate,
         sku_inch=_early_sku_inch,
+        building_inch_capacity=_building_inch_capacity,
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -4255,6 +4400,33 @@ def run_rolling_pipeline(
                 _ri = sku_inch.get(str(machine_current_sku.get(_m, "")), "?")
                 _tag = "pinned" if _m in _hpin else f"reassigned (real {_ri}\")"
                 print(f"    {_m}: anchor={_hasg[_m]}\"  [{_tag}]")
+
+    # ── Part 2: per-group inch policy — HARD single-inch on BJ + UNISTAGE(US) ─────
+    # Lock each BJ / UNISTAGE machine to its anchor inch → the _inch_gate lock check forces
+    # ZERO different-size CO on those groups (the plant pattern). VMI stays on JIT (tightened
+    # separately); Stage-2 stays flexible. Requires an anchor (from INIT_HYBRID or the seed).
+    if _GROUP_INCH_POLICY:
+        # Co-planning consistency: use the SAME BJ/US locks the curing scheduler was told about
+        # (_coplan_lock, computed pre-curing from demand-optimal allocation). Curing supply-matched
+        # its draw to exactly this allocation, so building must lock to it → the two agree and the
+        # locked machines stay fed. Fall back to the demand-anchor if the co-plan didn't run.
+        _bjus = sorted(m for m in machine_skus
+                       if _MACHINE_GROUP.get(str(m), "") == "UNISTAGE")   # HARD-lock US only
+        _bj_asg = dict(_coplan_lock) if _coplan_lock else {}
+        _locked_grp = 0
+        for _m in _bjus:
+            _li = _bj_asg.get(str(_m)) or machine_anchor_inch.get(str(_m)) or machine_inch_now.get(str(_m))
+            if _li:
+                machine_locked_inches[str(_m)] = {_li}
+                machine_anchor_inch[str(_m)] = _li      # keep anchor/band consistent with the lock
+                machine_inch_now[str(_m)]    = _li
+                machine_used_inches.setdefault(str(_m), set()).add(_li)
+                _locked_grp += 1
+        print(f"  [Rolling] GROUP_INCH_POLICY: hard single-inch on {_locked_grp} US machines (0 ongoing "
+              f"diff-CO); BJ+VMI tight JIT margin={_VMI_JIT_MARGIN}/budget={_VMI_MAX_DIFF_CO_PER_DAY}; "
+              f"Stage-2 flexible")
+        if os.environ.get("LOCK_DEBUG"):
+            print(f"    BJ/US locks: {dict(sorted((m, next(iter(machine_locked_inches[m]))) for m in _bjus if m in machine_locked_inches))}")
 
     if _STAGE1_SINGLE_INCH:
         _s1_machines = sorted(_S1_MACHINES)

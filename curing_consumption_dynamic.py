@@ -113,7 +113,35 @@ _SURPLUS_PER_SKU_PER_DAY  = int(os.environ.get("SURPLUS_PER_DAY", "2"))
 # SKU — a tiebreak placed AFTER urgency_class + constraint, so demand-critical (Class-A) and
 # sole-supplier needs are never sacrificed. Keeps each press on one inch across COs, so the
 # building side can feed it without different-size changeovers (esp. BJ/US single-inch machines).
-_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "0") != "0"
+_CURING_INCH_ALIGN = os.environ.get("CURING_INCH_ALIGN", "1") != "0"   # ADOPTED: default ON (match b2c_pipeline)
+
+# Size-balanced Phase-0 allocation (env SIZE_BAL, default OFF). Promotes the same-inch supply
+# signal from a soft tiebreak (CO_SUPPLY_MATCH) to a HARD per-inch cap: a curing press only CO's
+# to an inch that building can still SUPPLY (building_inch_capacity[inch] − live per-inch draw > 0).
+# Over-cap targets are removed from the candidate set BEFORE urgency ranking (the cap dominates
+# urgency — firing a press onto an inch building can't feed produces a RUNNING-but-starved press
+# and steals building from inches it can feed; that "coverage" is illusory — the plant deliberately
+# under-draws building-limited 15"). Day-0 presses inherited on an over-supplied inch are migrated
+# off it toward under-supplied inches building can feed. Independent of CO_SUPPLY_MATCH (that env
+# still governs only the legacy soft tiebreak). OFF → today's plan bit-for-bit.
+_SIZE_BALANCED_ALLOC = os.environ.get("SIZE_BAL", "1") != "0"   # ADOPTED (hard filter): default ON
+
+# Sub-lever of SIZE_BAL: proactively MIGRATE presses inherited on an over-cap inch toward
+# under-supplied inches (vs only BLOCKING new over-cap fires). MEASURED WORSE on all 3 months
+# (May -6.5k, July -8.1k, starvation up) — each migration is a curing CO (a lost press-shift +
+# mould reset), and churning the inherited Day-0 state costs more than the rebalance gains.
+# Default OFF (rejected experiment, kept for the record). SIZE_BAL alone = hard filter only.
+_SIZE_BAL_MIGRATE = os.environ.get("SIZE_BAL_MIGRATE", "0") != "0"
+
+# Same-inch-FIRST priority (env SAME_INCH_FIRST). Today a freed press's CO target is ranked by
+# urgency FIRST and same-inch only 4th, so it still pulls presses across inches (forcing building
+# diff-size COs). ON promotes same-inch ABOVE urgency so a press prefers a target on its OWN inch
+# (building feeds it with no diff-size CO) — urgent cross-inch SKUs are served by presses already
+# on that inch (plant behaviour). SAME_INCH_RANK: "safe" = Class-A (can't-meet-demand) still fires
+# first, same-inch 2nd (protects critical cross-inch demand); "top" = same-inch beats everything.
+# SIZE_BAL hard pre-filter stays on top regardless. OFF → current order (same-inch 4th), bit-for-bit.
+_SAME_INCH_FIRST = os.environ.get("SAME_INCH_FIRST", "0") != "0"
+_SAME_INCH_RANK  = os.environ.get("SAME_INCH_RANK", "safe")   # "safe" | "top"
 
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
@@ -206,6 +234,7 @@ class COScheduler:
         ratio_demand_map: dict | None = None,
         buildable_rate: dict | None = None,
         sku_inch: dict | None = None,
+        building_inch_capacity: dict | None = None,
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -237,6 +266,39 @@ class COScheduler:
             cur = _sku_inch.get(str(press_to_sku.get(press, "")), "")
             return 0 if (cur and _sku_inch.get(str(target), "") == cur) else 1
 
+        # Supply-matched draw (Part C): pull the press DRAW toward inches the building side can
+        # SUPPLY (building_inch_capacity), so locked BJ/US machines stay fed and never idle. Live
+        # per-inch consumption is derived from press_count (updated as COs fire). A CO target whose
+        # inch still has building headroom sorts before one whose inch is already over-drawn.
+        _bic = building_inch_capacity or {}
+        # Supply-migration term measured a slight net NEGATIVE (it over-diverts the draw); default
+        # OFF. The KPI recovery comes from the lock-aware buildable_rate + the demand-optimal lock.
+        _supply_on = bool(_bic) and bool(_sku_inch) and os.environ.get("CO_SUPPLY_MATCH", "0") != "0"
+        def _inch_consumption() -> dict:
+            _c: dict = {}
+            for _s, _n in press_count.items():
+                if _n > 0:
+                    _i = _sku_inch.get(str(_s), "")
+                    if _i:
+                        _c[_i] = _c.get(_i, 0.0) + _n * _qty_per_press_per_day(
+                            ct_map.get(str(_s), ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+            return _c
+        def _supply_pref(target: str, cons: dict) -> int:
+            if not _supply_on:
+                return 0                                   # OFF → constant → no ordering change
+            _i = _sku_inch.get(str(target), "")
+            return 0 if (_bic.get(_i, 0.0) - cons.get(_i, 0.0)) > 0 else 1   # 0 = building has headroom
+
+        # Size-balanced HARD cap (SIZE_BAL). _over_cap(target, cons) is True when the target's inch
+        # has NO building headroom left (live per-inch draw ≥ building_inch_capacity[inch]). Computed
+        # unconditionally; callers apply it only when _size_bal is on. Same predicate as _supply_pref,
+        # but a hard filter rather than a tiebreak — and gated by SIZE_BAL, not CO_SUPPLY_MATCH.
+        _size_bal = _SIZE_BALANCED_ALLOC and bool(_bic) and bool(_sku_inch)
+        _size_bal_migrate = _size_bal and _SIZE_BAL_MIGRATE   # rejected sub-lever, default OFF
+        def _over_cap(target: str, cons: dict) -> bool:
+            _i = _sku_inch.get(str(target), "")
+            return (_bic.get(_i, 0.0) - cons.get(_i, 0.0)) <= 0
+
         ro_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-Out",     "SKUCode"])
         ri_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-In",      "SKUCode"])
         nri_skus = set(df_day0.loc[df_day0["Category"] == "Non-Runner-In",  "SKUCode"])
@@ -244,6 +306,14 @@ class COScheduler:
         all_demand_skus = set(df_demand["SKUCode"].str.strip())
         demand_map   = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Quantity"]))
         priority_map = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Priority"]))
+
+        # Per-inch total demand (SIZE_BAL) — sizes the Day-0 over-cap migration only.
+        inch_demand: dict[str, float] = {}
+        if _size_bal:
+            for _s, _q in demand_map.items():
+                _i = _sku_inch.get(str(_s), "")
+                if _i:
+                    inch_demand[_i] = inch_demand.get(_i, 0.0) + float(_q)
 
         # ── Build press → ALL compatible demand SKUs (NRI + RI) ─────────────
         # Fixes bug where RO presses were only matched against NRI targets.
@@ -383,6 +453,50 @@ class COScheduler:
                         newly_free.append(p)
                         surplus_free.add(p)
 
+            # ── Size-balanced over-cap press MIGRATION (SIZE_BAL) ────────────────
+            # SIZE_BAL blocks NEW over-cap changeovers, but presses INHERITED on an
+            # over-supplied inch (e.g. July starting on June's 15"-heavy Day-0 state)
+            # would sit there until demand-done. Proactively free them toward inches
+            # building can feed: for each over-cap inch, release presses (preferring
+            # those whose SKU has the most under-cap buildable alternatives) until the
+            # inch is back to building capacity — but NEVER drain an inch whose over-cap
+            # is real coverable demand (n-1 RI-protection). Freed presses flow through
+            # the same capped global-pairing loop → throttled to MAX_CHANGEOVERS_PER_DAY,
+            # spread across days. Migration only OFFERS presses; the hard filter routes
+            # each to an under-cap inch, or it stays put if none is better.
+            overcap_free: set = set()
+            if _size_bal_migrate:
+                _cons0 = _inch_consumption()
+                _dct0 = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+                def _n_alt(p: str) -> int:
+                    return sum(1 for t in press_to_demand_targets.get(p, [])
+                               if updated_demand.get(t, 0) > 0 and not _over_cap(t, _cons0))
+                for _i in sorted(_cons0):
+                    _excess = _cons0[_i] - _bic.get(_i, 0.0)
+                    if _excess <= 0:
+                        continue
+                    _on_inch = [p for p in sorted(demand_running_presses)
+                                if _sku_inch.get(str(press_to_sku.get(p, "")), "") == _i
+                                and p not in newly_free and p not in overcap_free]
+                    _on_inch.sort(key=lambda p: (-_n_alt(p), str(p)))
+                    _released = 0.0
+                    for p in _on_inch:
+                        if _released >= _excess:
+                            break
+                        if _n_alt(p) == 0:
+                            continue                     # nowhere better → leave it put
+                        _old = press_to_sku.get(p, "")
+                        if _old in ri_skus:              # n-1 RI-protection on the donor inch
+                            _nold   = press_count.get(_old, 0) - 1
+                            _remold = updated_demand.get(_old, 0.0)
+                            if _remold > 0 and _nold > 0:
+                                _rold = _qty_per_press_per_day(ct_map.get(_old, _dct0))
+                                if _rold > 0 and _remold / (_nold * _rold) > horizon_left:
+                                    continue             # real demand needs this press
+                        newly_free.append(p)
+                        overcap_free.add(p)
+                        _released += _qty_per_press_per_day(ct_map.get(_old, _dct0))
+
             if not newly_free:
                 continue
 
@@ -446,14 +560,40 @@ class COScheduler:
                             _flex_t[target] = _flex_t.get(target, 0) + 1
                     if not _pairs:
                         break
-                    # Global key: urgency class → constraint (min flex) → need → tiebreaks
-                    best = min(_pairs, key=lambda pr: (
-                        pr[3][0],                                   # urgency_class
-                        min(_flex_p[pr[0]], _flex_t[pr[1]]),        # constraint
-                        _same_inch(pr[0], pr[1]),                   # prefer same inch (Part 1)
-                        pr[3][1], pr[3][2],                         # -priority, after_days
-                        ct_map.get(pr[1], _dct), pr[0], pr[1],      # deterministic tiebreak
-                    ))
+                    _cons_now = _inch_consumption() if (_supply_on or _size_bal) else {}
+                    # Size-balanced HARD pre-filter (SIZE_BAL): keep only pairs whose target inch still
+                    # has building headroom — the cap DOMINATES urgency (an over-cap fire is a
+                    # RUNNING-but-starved press that steals building from inches it CAN feed; that
+                    # coverage is illusory). If nothing is under-cap this iteration, only a FREED press
+                    # (demand-done / surplus / RO — produces nothing where it sits) may still move, and
+                    # only onto a buildable inch (_bic[i] > 0); else stop firing (draw stays ≤ supply,
+                    # the plant's deliberate under-draw of building-limited inches).
+                    _cand = _pairs
+                    if _size_bal:
+                        _under = [pr for pr in _pairs if not _over_cap(pr[1], _cons_now)]
+                        if _under:
+                            _cand = _under
+                        else:
+                            _freed = demand_done_free | surplus_free | pending_ro_presses
+                            _cand = [pr for pr in _pairs
+                                     if pr[0] in _freed
+                                     and _bic.get(_sku_inch.get(str(pr[1]), ""), 0.0) > 0]
+                            if not _cand:
+                                break
+                    # Global key: urgency class → constraint → BUILDING SUPPLY → same-inch → need → ties
+                    def _cokey(pr):
+                        _cls = pr[3][0]                             # urgency_class (0=Class-A,1=Class-B)
+                        _con = min(_flex_p[pr[0]], _flex_t[pr[1]])  # constraint
+                        _sup = _supply_pref(pr[1], _cons_now)       # building supply headroom
+                        _si  = _same_inch(pr[0], pr[1])             # 0 = same inch as press
+                        _tail = (pr[3][1], pr[3][2],                # -priority, after_days
+                                 ct_map.get(pr[1], _dct), pr[0], pr[1])
+                        if _SAME_INCH_FIRST and _SAME_INCH_RANK == "top":
+                            return (_si, _cls, _con, _sup, *_tail)  # same-inch beats everything
+                        if _SAME_INCH_FIRST:
+                            return (_cls, _si, _con, _sup, *_tail)  # "safe": Class-A first, then same-inch
+                        return (_cls, _con, _sup, _si, *_tail)      # OFF: current order (same-inch 4th)
+                    best = min(_cand, key=_cokey)
                     p, new_sku, old_sku, _ = best
                     co_events.append(
                         {"day": day, "press": p, "old_sku": old_sku, "new_sku": new_sku})
@@ -506,14 +646,19 @@ class COScheduler:
                     candidates.append((key, p, old_sku, target))
 
             _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
-            candidates.sort(key=lambda x: (
-                x[0][0],                                           # Class A (0) before Class B (1)
-                _same_inch(x[1], x[3]),                            # prefer same inch (Part 1)
-                x[0][1], x[0][2],                                  # −priority, after_days (urgency first)
-                ct_map.get(x[3], _dct),                            # CT as tiebreaker (throughput)
-                len(press_to_demand_targets.get(x[1], [])),         # exclusive press first (fewer targets)
-                x[1], x[3],                                        # press, target SKU — final deterministic tiebreak
-            ))
+            _cons_fb = _inch_consumption() if _supply_on else {}
+            def _fbkey(x):
+                _cls = x[0][0]                                     # Class A (0) before Class B (1)
+                _sup = _supply_pref(x[3], _cons_fb)               # building supply headroom
+                _si  = _same_inch(x[1], x[3])                     # 0 = same inch
+                _tail = (x[0][1], x[0][2], ct_map.get(x[3], _dct),
+                         len(press_to_demand_targets.get(x[1], [])), x[1], x[3])
+                if _SAME_INCH_FIRST and _SAME_INCH_RANK == "top":
+                    return (_si, _cls, _sup, *_tail)
+                if _SAME_INCH_FIRST:
+                    return (_cls, _si, _sup, *_tail)              # "safe": Class-A first, then same-inch
+                return (_cls, _sup, _si, *_tail)                  # OFF: current order
+            candidates.sort(key=_fbkey)
 
             assigned: set = set()
             for key, p, old_sku, new_sku in candidates:
@@ -1410,6 +1555,7 @@ def run_dynamic_consumption(
     max_co_per_day: int = MAX_CO_PER_DAY,
     buildable_rate: dict | None = None,
     sku_inch: dict | None = None,
+    building_inch_capacity: dict | None = None,
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1563,6 +1709,7 @@ def run_dynamic_consumption(
         planning_days=planning_days,
         buildable_rate=buildable_rate,
         sku_inch=sku_inch,
+        building_inch_capacity=building_inch_capacity,
     )
 
     # Pass 2: 31-day simulation

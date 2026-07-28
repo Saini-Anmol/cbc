@@ -82,6 +82,27 @@ MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hur
 # 14 → ~650k target: activates more NRI COs (TTMX0/MSXT0/TUHL0/HURL0 gain ~20k units).
 #      Also gives FXPC0 more presses via Runner-Out → FXPC0 CO conversion.
 
+# VMI/BJ different-size CO tightness under GROUP_INCH_POLICY (the adopted co-plan config).
+# VMI_JIT_MARGIN: a VMI/BJ machine changes to a DIFFERENT inch only when the off-inch target is
+#   this many units MORE starving than staying — higher = fewer diff-size COs (plant runs ~8 VMI/mo).
+# VMI_MAX_DIFF_CO_PER_DAY: per-machine per-day different-size CO budget for VMI/BJ.
+# SINGLE cross-month optimum = 250 (swept {250,275,300,325} on May/June/July with SIZE_BAL on):
+#   highest total cured (1,987,725) AND lowest total starvation (4,478). July cliffs above 250
+#   (683,560 → 668,073 at 275, no diff-CO benefit), which dominates the aggregate; June also prefers
+#   250 (638,216) under SIZE_BAL. One value beats the old per-month 300/300/250 split by +2.4k.
+#   Env VMI_JIT_MARGIN / VMI_MAX_DIFF_CO_PER_DAY override for A/B.
+VMI_JIT_MARGIN = 250
+VMI_MAX_DIFF_CO_PER_DAY = 1
+
+# Round-trip buffer partner = SAME inch size (prefer a same-size CO for the rotation). PER-MONTH knob:
+#   True on low-demand months (May: +14,964 cured, VMI diff-CO 11→8 = plant, starvation down, mould-PASS)
+#   — balanced demand rotates within-inch, so a same-inch partner sizes the buffer correctly.
+#   False on high-demand July (−14,409): its imbalanced 15"-heavy demand genuinely needs cross-inch
+#   rotations, so restricting the round-trip partner to same-inch undersizes the buffer and starves it.
+#   The current committed month is July → False. Set True when running a May-like month.
+#   Env RT_SAME_INCH overrides. (RT_SAME_INCH_FRAC>0 relaxes the restriction — measured worse, keep 0.)
+RT_SAME_INCH = False
+
 CO_CLASS_B_THRESHOLD = 0.8
 # Class A threshold for curing CO urgency scoring.
 # A CO candidate is Class A (critical) when: current_days > horizon_left × threshold
