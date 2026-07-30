@@ -192,6 +192,43 @@ _ROUND_TRIP_BUFFER_ENABLED = True
 _RT_SAME_INCH = os.environ.get("RT_SAME_INCH", "1" if RT_SAME_INCH else "0") != "0"  # bc_config per-month
 _RT_SAME_INCH_FRAC = float(os.environ.get("RT_SAME_INCH_FRAC", "0"))
 
+# T2 — departure-gated round-trip buffer (env RT_IMMINENT, default OFF). Today the wide round-trip
+# cushion (eff_buf) is held EVERY shift the SKU is current → front-loads even machines that never
+# rotate. ON: Phase A builds only the FLAT buffer; the eff_buf cushion becomes a GATE — a machine may
+# CO away from its current SKU only once that SKU holds eff_buf (else it tops the current SKU up toward
+# eff_buf and DEFERS the rotation to a later shift). So the wide cushion is paid only by machines that
+# actually rotate → less front-load. OFF → Phase A builds to eff_buf, no gate (bit-for-bit).
+_RT_IMMINENT = os.environ.get("RT_IMMINENT", "0") != "0"
+
+# T1 — SKU-B-aware round-trip sizing (env RT_PARTNER_RT, default OFF). Today A's away-cushion assumes
+# the partner B builds only to its FLAT buffer. ON: the partner-dwell term uses B's OWN round-trip
+# buffer (one level deep — B rotates back to A with A's dwell forced flat, no recursion), so A's
+# cushion reflects B needing a full campaign. Widens eff_buf (opposes T2). OFF → flat, bit-for-bit.
+_RT_PARTNER_RT = os.environ.get("RT_PARTNER_RT", "0") != "0"
+
+# Secondary-SKU priority ordering for the live global-assign Phase-B (machine,SKU)
+# pairing key (env BLD_SEC_ORDER, default "baseline" = committed key bit-for-bit).
+# Same-size (inch_penalty) ALWAYS stays first; only the middle factors are permuted;
+# tail is always (cost, m, sku) for a deterministic total order. Factors:
+#   SAME  = inch_penalty (0 same-size CO, 1 diff-size)           — fixed first
+#   URG   = 0 if _urgency_score>0 (demand uncoverable in horizon) else 1  (Class-A first)
+#   STARV = 0 if a press draws this SKU now with GT < 1 shift of draw else 1 (about-to-starve first)
+#   DEFC  = -_defc(sku, buf)  (larger this-shift GT deficit first)
+# Variants: baseline | UD | USD | SUD | SD | DSU | INS_S (promote STARV into the
+# committed tier/primary/constraint key without dropping the load-balancing terms).
+_BLD_SEC_ORDER = os.environ.get("BLD_SEC_ORDER", "baseline")
+
+# Idle-machine monthly-gap fill (env IDLE_GAP_FILL, default OFF). Phase-C forward-buffer
+# already targets min(demand_remaining, draw × 9-shift shelf), but the starvation-risk gate
+# only fires when a SKU is about to run dry THIS shift — so an idle eligible machine sits idle
+# next to a SKU whose CUMULATIVE monthly demand is unmet but is kept just-fed by others (the
+# 7502 case). This relaxes that gate for BUILDING-LIMITED SKUs only (_urgency_score==0 → curing
+# can still cover the demand in the horizon → extra GT will be cured), so idle machines pre-build
+# toward the shelf-capped monthly gap. Fully relaxing the gate for ALL SKUs was measured worse
+# (IDLE_UNMET_KEEP_GATE=0: May −6,180/July −12,698 — GT-cap clog); the building-limited restriction
+# is the discriminator. Target/shelf/7k-cap/inch-rules/CO-caps/ranking unchanged. OFF → bit-for-bit.
+_IDLE_GAP_FILL = os.environ.get("IDLE_GAP_FILL", "0") != "0"
+
 # Building-side RI-first-then-ratio: NRI (press_count<=0) candidates ranked by
 # static demand[sku]/machine_total_demand[machine] instead of raw deficit; RI
 # candidates (any live press) keep raw-deficit ranking unchanged and always
@@ -221,7 +258,9 @@ _RI_RATIO_GLOBAL  = os.environ.get("RI_RATIO_GLOBAL") == "1"
 _SEED_FROM_PLANT_RUNNING = True
 # Per-month building running-machine snapshot: env PLANT_RUNNING_FILE overrides (June/July use
 # their own near-8AM snapshots built from the stage1+stage2 running data). Default = May.
-_PLANT_RUNNING_FILE = "data/running_prod/building_running_machines_july_near8AM.xlsx"
+_PLANT_RUNNING_FILE = os.environ.get(
+    "PLANT_RUNNING_FILE",
+    "data/running_prod/building_running_machines_july_near8AM.xlsx")
 
 # EXPERIMENT: captive-first ordering. A captive building machine (eligible for
 # exactly ONE SKU, e.g. 7301 -> only LSTL0) sits idle whenever flexible machines
@@ -1979,8 +2018,14 @@ def _assign_building_shift(
                     else:
                         partner = max(pc, key=lambda x: (_defc(x, buf), x))
                     p_inch = sku_inch.get(partner, "")
+                    if _RT_PARTNER_RT and rate > 0:       # T1: size B's dwell to B's OWN round-trip
+                        _a_dwell = max(MIN_CAMPAIGN_MINS, _defc(cur, buf) / rate)
+                        _b_rt = _co_cost(m, p_inch, cur_inch) + _a_dwell + _co_cost(m, cur_inch, p_inch)
+                        _p_buf = max(buf, _b_rt / SHIFT_MINS)
+                    else:
+                        _p_buf = buf
                     p_dwell = max(MIN_CAMPAIGN_MINS,
-                                  _defc(partner, buf) / rate if rate > 0 else MIN_CAMPAIGN_MINS)
+                                  _defc(partner, _p_buf) / rate if rate > 0 else MIN_CAMPAIGN_MINS)
                     rt = _co_cost(m, cur_inch, p_inch) + p_dwell + _co_cost(m, p_inch, cur_inch)
                     eff_buf = max(buf, rt / SHIFT_MINS)
             flex_reclaim = (m in _INCH_FLEX_MACHINES and cur_inch != dom
@@ -1991,8 +2036,10 @@ def _assign_building_shift(
             # flat-out and never idles while its SKU has unmet demand.
             _cap_max = (_CAPTIVE_MAX_ENABLED and len(eligible) == 1
                         and _MACHINE_GROUP.get(m, "") != "STAGE1")
+            s["eff_buf"] = eff_buf                        # T2: stored for the Phase-B rotation gate
+            _base_buf = buf if _RT_IMMINENT else eff_buf  # T2: Phase A builds only flat when RT_IMMINENT
             _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0))
-                     if _cap_max else _defc(cur, eff_buf))
+                     if _cap_max else _defc(cur, _base_buf))
             if cur in eligible and _room > 0 and not flex_reclaim:
                 mins = min(s["remaining"], _room / rate if rate > 0 else s["remaining"])
                 qty = int(mins * rate)
@@ -2000,7 +2047,7 @@ def _assign_building_shift(
                     s["campaigns"].append((cur, qty, "start"))
                     projected_gt[cur] = projected_gt.get(cur, 0.0) + qty
                     s["remaining"] -= mins
-                s["primary_done"] = _defc(cur, eff_buf) <= 0
+                s["primary_done"] = _defc(cur, _base_buf) <= 0
 
         # ── Phase B: global pair-scoring greedy for remaining capacity ──
         _guard = 0
@@ -2076,6 +2123,27 @@ def _assign_building_shift(
             def _key(p):
                 m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = p
                 constraint = min(flex_m[m], flex_s[sku])
+                if _BLD_SEC_ORDER != "baseline":
+                    # Explicit four-factor ordering (same-size first, cost/m/sku tail).
+                    _draw = shift_cure_demand.get(sku, 0.0)
+                    STARV = 0 if (_draw > 0 and projected_gt.get(sku, 0.0) < _draw) else 1
+                    URG   = 0 if _urgency_score(sku, demand_remaining, press_count,
+                                                cure_ct_map, days_left) > 0 else 1
+                    DEFC  = -_defc(sku, _buf_of(m))
+                    _tail = (cost, m, sku)
+                    if _BLD_SEC_ORDER == "UD":
+                        return (inch_penalty, URG, DEFC) + _tail
+                    if _BLD_SEC_ORDER == "USD":
+                        return (inch_penalty, URG, STARV, DEFC) + _tail
+                    if _BLD_SEC_ORDER == "SUD":
+                        return (inch_penalty, STARV, URG, DEFC) + _tail
+                    if _BLD_SEC_ORDER == "SD":
+                        return (inch_penalty, STARV, DEFC) + _tail
+                    if _BLD_SEC_ORDER == "DSU":
+                        return (inch_penalty, DEFC, STARV, URG) + _tail
+                    if _BLD_SEC_ORDER == "INS_S":   # promote STARV, keep committed load-balancing tail
+                        return (inch_penalty, STARV, tier, primary, constraint, cost, m, sku)
+                    # unknown code → fall through to committed baseline
                 if _GLOBAL_CONSTRAINT_MODE == "below":
                     return (inch_penalty, tier, primary, constraint, cost, m, sku)
                 elif _GLOBAL_CONSTRAINT_MODE == "captive":
@@ -2085,6 +2153,22 @@ def _assign_building_shift(
 
             m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = min(pairs, key=_key)
             s = stg[m]
+            # T2 departure gate: before rotating away from cur, ensure cur holds its round-trip cushion
+            # (eff_buf). If short by ≥ a campaign, top cur up toward eff_buf and DEFER the rotation
+            # (re-evaluate next iteration); a sub-campaign shortfall is "close enough" → allow rotation.
+            if _RT_IMMINENT:
+                _curm = s["cur_sku"]
+                if _curm and _curm != sku:
+                    _curdef = _defc(_curm, s.get("eff_buf", _buf_of(m)))
+                    if _curdef > 0:
+                        _r = s["rate"]
+                        _tmins = min(s["remaining"], _curdef / _r if _r > 0 else 0.0)
+                        _tqty = int(_tmins * _r)
+                        if _tmins >= MIN_CAMPAIGN_MINS and _tqty > 0:
+                            s["campaigns"].append((_curm, _tqty, "start"))
+                            projected_gt[_curm] = projected_gt.get(_curm, 0.0) + _tqty
+                            s["remaining"] -= _tmins
+                            continue                 # cur topped up → re-evaluate (defer rotation)
             co_type = "same_size_CO" if to_inch == sku_inch.get(s["cur_sku"], "") else "diff_size_CO"
             if co_type == "diff_size_CO":
                 machine_last_diff_co_day[m] = day
@@ -2189,7 +2273,17 @@ def _assign_building_shift(
                         # starve, so pre-building them would only front-load early month.
                         # IDLE_UNMET relaxes this: aim idle capacity at the biggest unmet
                         # gaps up to the shelf-safe target regardless of current on-hand.
-                        if ((not _IDLE_UNMET_ENABLED or _IDLE_UNMET_KEEP_GATE)
+                        # IDLE_GAP_FILL bypasses the gate for BUILDING-LIMITED SKUs only
+                        # (_urgency_score==0 → curing can still cover the demand in the
+                        # horizon, so the shelf-capped extra GT will be cured, not clogged):
+                        # an idle machine builds toward the cumulative monthly gap even when
+                        # the SKU is not about to starve THIS shift (the 7502 case).
+                        _bld_limited = (_IDLE_GAP_FILL
+                                        and demand_remaining.get(sku, 0.0) > 0
+                                        and _urgency_score(sku, demand_remaining, press_count,
+                                                           cure_ct_map, days_left) == 0)
+                        if (not _bld_limited
+                                and (not _IDLE_UNMET_ENABLED or _IDLE_UNMET_KEEP_GATE)
                                 and _FWD_RISK_SHIFTS > 0
                                 and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
                             continue
@@ -4881,6 +4975,32 @@ def run_rolling_pipeline(
         daily_co_count[day] = len(final)
         return final
 
+    # Env-gated Day-0 diagnostic (OFF by default; no effect on scheduling). Captures
+    # the Day-0 building primary seed, Day-0 curing press SKUs, building eligibility,
+    # and demand so the primary/secondary/never-built cross-tab can be computed offline.
+    _day0_dump_path = os.environ.get("DAY0_DUMP", "")
+    if _day0_dump_path:
+        import json as _json
+        _cure_day0 = {str(p): st["sku"] for p, st in press_state.items()}
+        _pc0: dict = {}
+        for _st in press_state.values():
+            _pc0[_st["sku"]] = _pc0.get(_st["sku"], 0) + 1
+        _dd = {
+            "bld_day0_primary": {str(m): s for m, s in machine_current_sku.items()},
+            "cure_day0":        _cure_day0,
+            "press_count_day0": _pc0,
+            "machine_eligible": {str(m): sorted(str(s) for s in ss)
+                                 for m, ss in machine_skus.items()},
+            "demand":           {str(s): float(q) for s, q in demand_dict.items()},
+            "sku_inch":         {str(s): sku_inch.get(s, "") for s in demand_dict},
+            "s1_sku_to_machines": {str(s): sorted(str(x) for x in ms)
+                                   for s, ms in s1_sku_to_machines.items()},
+            "s1_locked_inch":   {str(m): i for m, i in s1_locked_inch.items()},
+        }
+        with open(_day0_dump_path, "w") as _f:
+            _json.dump(_dd, _f)
+        print(f"  [DAY0_DUMP] wrote Day-0 state → {_day0_dump_path}")
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
@@ -5840,6 +5960,28 @@ def run_rolling_pipeline(
         if r.get("_status") == "RUNNING" and r.get("GT_Inventory", 1) == 0
         and r.get("Qty", 0) == 0 and (r.get("_demand_left") or 0) > 0
     )
+
+    # Env-gated diagnostic (OFF by default; no effect on scheduling). Dumps every
+    # starvation event to a CSV so it can be categorized by SKU/inch/press.
+    _starv_dump_path = os.environ.get("STARV_DUMP", "")
+    if _starv_dump_path:
+        import csv as _csv
+        _srows = [
+            r for r in cure_shift_rows
+            if r.get("_status") == "RUNNING" and r.get("GT_Inventory", 1) == 0
+            and r.get("Qty", 0) == 0 and (r.get("_demand_left") or 0) > 0
+        ]
+        with open(_starv_dump_path, "w", newline="") as _f:
+            _w = _csv.writer(_f)
+            _w.writerow(["Date", "Shift", "Press", "SKUCode", "Inch",
+                         "GT_Inventory", "Demand_Left"])
+            for r in _srows:
+                _sku = r.get("SKUCode", "")
+                _w.writerow([r.get("Date", ""), r.get("Shift", ""),
+                             r.get("Machine", ""), _sku,
+                             sku_inch.get(_sku, _sku[8:10] if len(_sku) >= 10 else ""),
+                             r.get("GT_Inventory", 0), r.get("_demand_left", 0)])
+        print(f"  [STARV_DUMP] wrote {len(_srows)} starvation events → {_starv_dump_path}")
 
     # Curing CO breakdown (planned schedule + reactive dynamic) and mould cleans.
     _n_co_planned = sum(1 for e in cure_co_events if e.get("CO_Type") == "Planned")

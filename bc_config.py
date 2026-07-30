@@ -29,7 +29,7 @@ import cbc_env
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -39,19 +39,20 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
 # Every consumer (curing_consumption.py Phase 0, curing_b2c.py press state +
 # mould tracker) imports this — never hardcode the table name anywhere else.
 # Change ONLY this line each planning cycle:
+#   august plan → "june_Daily_Running_Moulds"     (no July snapshot exists; user chose June)
 #   july plan  → "june_Daily_Running_Moulds"      (26-Jun snapshot, 169 presses)
 #   june plan  → "testing_Daily_Running_Moulds"   (27-May snapshot, 165 presses)
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "june_Daily_Running_Moulds"
+RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -69,7 +70,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
