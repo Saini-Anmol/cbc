@@ -41,6 +41,18 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 
 DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
 
+# ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
+# When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
+# from this CSV — a machine can build different SKUs at different speeds (e.g. VMI
+# builds small tyres faster than large). The file is authoritative for CT ONLY:
+#   • allowability still comes from Master_Building_Allowable_Machines (DB);
+#   • any (SKU, machine) pair missing from the file falls back to the per-machine
+#     fixed CT in b2c_pipeline._BLD_CT_SEC (never a blind default).
+# Toggle OFF (or env BLD_CT_FILE=0) reproduces the fixed-per-machine-CT plan
+# bit-for-bit. See b2c_pipeline._bld_ct_sec / _load_bld_ct_file.
+BLD_CT_FILE_ENABLED = True
+BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.csv")
+
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
 # Every consumer (curing_consumption.py Phase 0, curing_b2c.py press state +
@@ -70,7 +82,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)

@@ -92,6 +92,7 @@ from bc_config import (
     BUILDING_OUTPUT    as BUILD_OUTPUT,
     CURING_B2C_OUTPUT  as CURING_OUTPUT,
 )
+import bc_config as _bc_cfg
 
 # Optional env override for the daily curing-CO cap — lets us sweep it (e.g. 8-13)
 # without editing bc_config. Unset ⇒ the committed bc_config value.
@@ -550,6 +551,66 @@ _BLD_CT_SEC: dict[str, float] = {
     "8002":113,   "8003":113,   "8101":230,
 }
 
+# ── Per-(SKU × machine) building CT (sec/unit) — LIVE, toggle-gated ───────────
+# Loaded from bc_config.BLD_CT_FILE (data/input/Cycle_time_Building.csv). Gives a
+# distinct CT for a machine depending on WHICH SKU it builds (e.g. VMI builds a
+# small 12"-14" tyre in ~43s but a large 15" in 51-74s). The file is the source
+# of truth for CT ONLY — allowability stays from the DB allowable matrix, and any
+# (SKU, machine) pair absent from the file falls back to the per-machine fixed
+# _BLD_CT_SEC above. Env BLD_CT_FILE=0 (or bc_config.BLD_CT_FILE_ENABLED=False)
+# disables the lookup → every _bld_ct_sec()/_bld_qty_per_shift() call reproduces
+# the fixed-per-machine plan bit-for-bit.
+_BLD_CT_FILE_ENABLED = (
+    getattr(_bc_cfg, "BLD_CT_FILE_ENABLED", False)
+    and os.environ.get("BLD_CT_FILE", "1") != "0"
+)
+_BLD_CT_SKU_MACH: dict[tuple[str, str], float] = {}
+
+def _load_bld_ct_file() -> None:
+    """Populate _BLD_CT_SKU_MACH from the per-(SKU,machine) CT CSV. Silent no-op if
+    the toggle is off or the file is missing/unreadable (falls back to _BLD_CT_SEC)."""
+    if not _BLD_CT_FILE_ENABLED:
+        return
+    path = getattr(_bc_cfg, "BLD_CT_FILE", "")
+    if not path or not os.path.exists(path):
+        print(f"  [BLD_CT] file not found ({path}); using fixed per-machine CT")
+        return
+    try:
+        _df = pd.read_csv(path, dtype=str)
+    except Exception as _e:
+        print(f"  [BLD_CT] read failed ({_e}); using fixed per-machine CT")
+        return
+    _mach_cols = [c for c in _df.columns[2:] if str(c) in _BLD_CT_SEC]
+    _n = 0
+    for _, _row in _df.iterrows():
+        _sku = str(_row.get("SKU Code", "")).strip()
+        if not _sku:
+            continue
+        for _m in _mach_cols:
+            _v = _row.get(_m)
+            if pd.notna(_v) and str(_v).strip() != "":
+                try:
+                    _BLD_CT_SKU_MACH[(_sku, str(_m))] = float(_v)
+                    _n += 1
+                except (TypeError, ValueError):
+                    pass
+    print(f"  [BLD_CT] loaded {_n} per-(SKU,machine) CTs "
+          f"for {len({k[0] for k in _BLD_CT_SKU_MACH})} SKUs from {os.path.basename(path)}")
+
+_load_bld_ct_file()
+
+def _bld_ct_sec(machine, sku=None) -> float:
+    """Building cycle time (sec/unit) for `machine`, optionally specialised to `sku`.
+    Per-(SKU,machine) value when the CT file is loaded AND the pair is present; else
+    the per-machine fixed _BLD_CT_SEC; else 120.0. When the toggle is off, `sku` is
+    ignored → identical to the historical _BLD_CT_SEC.get(machine) behaviour."""
+    m = str(machine)
+    if sku is not None and _BLD_CT_SKU_MACH:
+        _v = _BLD_CT_SKU_MACH.get((str(sku), m))
+        if _v is not None:
+            return _v
+    return _BLD_CT_SEC.get(m, 120.0)
+
 DEFAULT_CURING_CT = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
 CURING_CAVITIES   = 2
 
@@ -735,6 +796,19 @@ _INIT_ALLOC_HYBRID = True
 # (Stage-1 is carcass/utilization only; 0 cured-tyre cost, 0 rule violations, mould-audit
 # PASS all 3 months). S1_SINGLE_INCH=0 restores the band-only behaviour.
 _STAGE1_SINGLE_INCH = True
+
+# Correct Stage-1 carcass schedule (env STAGE1_CARCASS_PASS, default ON). Replaces the
+# tracking-only Step-3b carcass rows — which UNDERCOUNT because they log one Stage-1 machine
+# per SKU per shift (July: 145k recorded vs 180k Stage-2 GT) — with a full 1:1 carcass
+# allocation computed by an exact time-windowed max-flow AFTER the plan is built: carcass a
+# machine makes in shift τ may feed Stage-2 in shifts τ..τ+STAGE1_CARCASS_LEAD (a 1-2 shift
+# pre-build, ≤1-day aging). Emits a FEASIBILITY flag if any shift/inch cannot be fed (e.g. an
+# inch with Stage-2 demand but no eligible Stage-1 machine) — so an infeasible plan is caught
+# instead of silently assumed. Carcass does NOT gate GT, so this is correct utilization/qty/
+# time accounting only — ZERO effect on cured/starvation. STAGE1_CARCASS_PASS=0 restores the
+# old tracking rows. STAGE1_CARCASS_LEAD (default 2) = max shifts of carcass pre-build.
+_STAGE1_CARCASS_PASS = os.environ.get("STAGE1_CARCASS_PASS", "1") != "0"
+_STAGE1_CARCASS_LEAD = int(os.environ.get("STAGE1_CARCASS_LEAD", "2"))
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1048,8 +1122,8 @@ def _min_assignment_inch_sets(machines, elig_inches: dict, cap: dict,
 # ROLLING PIPELINE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _bld_qty_per_shift(machine: str) -> int:
-    ct_min = _BLD_CT_SEC.get(str(machine), 120.0) / 60.0
+def _bld_qty_per_shift(machine: str, sku=None) -> int:
+    ct_min = _bld_ct_sec(machine, sku) / 60.0
     return int(SHIFT_MINS / ct_min)
 
 
@@ -1189,6 +1263,182 @@ def _shift_start_dt(date_str: str, shift: str) -> "datetime":
 def _fmt_dt(dt: "datetime") -> str:
     """Format a building-schedule row timestamp for the output sheet."""
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
+                             planning_days: int, lead: int = 2) -> tuple:
+    """Post-plan Stage-1 carcass scheduler — replaces the tracking-only Step-3b rows.
+
+    Allocates the FULL 1:1 carcass for every Stage-2 GT unit to eligible Stage-1 machines,
+    respecting each machine's per-shift capacity, via an EXACT time-windowed max-flow: carcass
+    built by machine m in shift τ can feed Stage-2 built in shifts τ..τ+lead (a 1-2 shift
+    pre-build, ≤1-day aging). Stage-1 does NOT gate GT (this never touches gt_inventory/cured),
+    so it is correct utilization/qty/time accounting plus a feasibility check.
+
+    Returns (carcass_rows, report). report flags any carcass that cannot be supplied within the
+    aging window and any SKU with no eligible Stage-1 machine (a real floor-infeasibility).
+    """
+    import numpy as np
+    from datetime import timedelta
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import maximum_flow
+    _SORD = {"A": 0, "B": 1, "C": 2}
+
+    # Stage-2 production per (date, shift) -> {sku: qty}
+    s2: dict = defaultdict(lambda: defaultdict(float))
+    for r in bld_shift_rows:
+        if r.get("Machine_Group") == "TBM STAGE2":
+            sku = r.get("SKUCode"); q = r.get("Qty", 0) or 0
+            if sku and sku != "CHANGEOVER" and q > 0:
+                s2[(r["Date"], r["Shift"])][str(sku)] += q
+    if not s2:
+        return [], {"demand": 0, "supplied": 0, "unmet": 0,
+                    "no_elig_skus": [], "no_elig_units": 0}
+
+    shifts = sorted(s2.keys(), key=lambda k: (k[0], _SORD.get(k[1], 0)))
+    tidx = {k: i for i, k in enumerate(shifts)}
+    T = len(shifts)
+    S1 = sorted(_S1_MACHINES)
+    CAP = {m: int(round(_bld_qty_per_shift(m))) for m in S1}      # carcass units/shift
+
+    demlist = [(tidx[k], sku) for k in shifts for sku in s2[k]]
+    NMS = len(S1) * T
+    def _ms(mi, t): return 1 + mi * T + t
+    dbase = 1 + NMS
+    dnode = {d: dbase + j for j, d in enumerate(demlist)}
+    SINK = dbase + len(demlist)
+    BIG = 10 ** 7
+
+    ri = []; ci = []; da = []
+    for mi, m in enumerate(S1):                                   # source -> machine-shift
+        for t in range(T):
+            ri.append(0); ci.append(_ms(mi, t)); da.append(CAP[m])
+    no_elig: dict = defaultdict(float)
+    for (ti, sku) in demlist:
+        dn = dnode[(ti, sku)]
+        ri.append(dn); ci.append(SINK); da.append(int(round(s2[shifts[ti]][sku])))
+        me = [m for m in (s1_sku_to_machines.get(sku) or ()) if m in _S1_MACHINES]
+        if not me:
+            no_elig[sku] += s2[shifts[ti]][sku]
+        for m in me:                                             # machine-shift -> demand (aging window)
+            mi = S1.index(m)
+            for tau in range(max(0, ti - lead), ti + 1):
+                ri.append(_ms(mi, tau)); ci.append(dn); da.append(BIG)
+
+    g = csr_matrix((np.array(da), (np.array(ri), np.array(ci))), shape=(SINK + 1, SINK + 1))
+    res = maximum_flow(g, 0, SINK)
+    F = res.flow.tocoo()
+    total_dem = sum(s2[k][s] for k in s2 for s in s2[k])
+
+    # per (machine, production-shift τ, sku) from the machine-shift -> demand flows
+    prod: dict = defaultdict(float)
+    for u, v, f in zip(F.row.tolist(), F.col.tolist(), F.data.tolist()):
+        if f <= 0 or not (1 <= u <= NMS) or not (dbase <= v < SINK):
+            continue
+        mi = (u - 1) // T; tau = (u - 1) % T
+        _ti, sku = demlist[v - dbase]
+        prod[(mi, tau, sku)] += f
+
+    # build carcass rows, stacked in time within each (machine, shift)
+    rows: list = []
+    bymt: dict = defaultdict(list)
+    for (mi, tau, sku), q in prod.items():
+        if q > 0:
+            bymt[(mi, tau)].append((sku, q))
+    for (mi, tau), items in bymt.items():
+        m = S1[mi]; dstr, sh = shifts[tau]
+        cursor = _shift_start_dt(dstr, sh)
+        for sku, q in sorted(items):
+            ct = _bld_ct_sec(m, sku)   # per-SKU CT (Stage-1 CT is constant per machine)
+            _st = cursor
+            cursor = cursor + timedelta(minutes=round(q) * ct / 60.0)
+            rows.append({
+                "Machine": m, "Date": dstr, "Shift": sh, "SKUCode": sku,
+                "Qty": int(round(q)), "CO_Mins": 0,
+                "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(cursor),
+                "Machine_Group": _group_label(m), "CO_Type": "carcass",
+            })
+    report = {
+        "demand": round(total_dem), "supplied": round(res.flow_value),
+        "unmet": round(total_dem - res.flow_value),
+        "no_elig_skus": sorted(no_elig.keys()),
+        "no_elig_units": round(sum(no_elig.values())),
+    }
+    return rows, report
+
+
+def _daily_capacity_util(cure_shift_rows: list, bld_shift_rows: list,
+                         press_stats: dict, planning_days: int) -> list:
+    """Per-DAY capacity utilisation for the cloud jkt_plan_capacityUtilisation table
+    (30-31 rows per plan). Curing daily util = (production + mould-clean + CO time) /
+    total available press-minutes that day — the metric the client requested. Building
+    group utils computed symmetrically = (production + CO) / available machine-minutes.
+    Aggregates to the same monthly occupancy written to jkt_plan_kpis (sum of daily busy
+    over sum of daily available == the monthly figure)."""
+    from collections import defaultdict
+    from datetime import datetime as _dt
+    DAY_AVAIL_PER = 3 * SHIFT_MINS          # 1440 min/machine/day
+
+    def _grp(m: str) -> str:
+        m = str(m)
+        if m in {"6001","6002","6003","6004","7001","7002","7003","7004"}: return "VMI"
+        if m in {"7101","7102","7103","7104","7105","7106","7201"}:        return "BJ"
+        if m in {"7501","7502","7503"}:                                    return "UNI_NARROW"
+        if m in {"8201","8301","8302","8501","8502","7301"}:               return "STAGE2"
+        return "STAGE1"
+    GROUP_N = {"VMI": 8, "BJ": 7, "UNI_NARROW": 3, "STAGE2": 6, "STAGE1": 15}
+
+    # ── curing: production (from RUNNING segment duration) + CO + mould-clean per day ──
+    cure = defaultdict(lambda: {"prod": 0.0, "co": 0.0, "clean": 0.0})
+    for r in cure_shift_rows:
+        d = r.get("Date")
+        if not d:
+            continue
+        cure[d]["co"]    += float(r.get("CO_Mins", 0) or 0)
+        cure[d]["clean"] += float(r.get("Mould_Clean_Mins", 0) or 0)
+        if r.get("_status") == "RUNNING" and (r.get("Qty", 0) or 0) > 0:
+            try:
+                _st = _dt.strptime(r["StartTime"], "%Y-%m-%d %H:%M")
+                _en = _dt.strptime(r["EndTime"],   "%Y-%m-%d %H:%M")
+                cure[d]["prod"] += max(0.0, (_en - _st).total_seconds() / 60.0)
+            except Exception:
+                pass
+    n_press    = len(press_stats)
+    cure_avail = n_press * DAY_AVAIL_PER
+
+    # ── building: production (Qty × CT) + CO per day per group ──
+    bld = defaultdict(lambda: defaultdict(lambda: {"prod": 0.0, "co": 0.0}))
+    for r in bld_shift_rows:
+        d = r.get("Date"); m = r.get("Machine"); g = _grp(m)
+        if str(r.get("SKUCode", "")) == "CHANGEOVER":
+            bld[d][g]["co"]   += float(r.get("CO_Mins", 0) or 0)
+        else:
+            bld[d][g]["prod"] += (float(r.get("Qty", 0) or 0)
+                                  * _bld_ct_sec(m, r.get("SKUCode")) / 60.0)
+
+    out = []
+    for d in sorted(cure):
+        c = cure[d]
+        cu = round(100.0 * (c["prod"] + c["co"] + c["clean"]) / cure_avail, 2) if cure_avail else 0.0
+        def _gocc(groups):
+            busy  = sum(bld[d][g]["prod"] + bld[d][g]["co"] for g in groups)
+            avail = sum(GROUP_N[g] * DAY_AVAIL_PER for g in groups)
+            return round(100.0 * busy / avail, 2) if avail else 0.0
+        out.append({
+            "date":                             d,
+            "capacityUtilisation":              cu,                                  # CURING (client ask)
+            "building_capacityUtilisation":     _gocc(["VMI","BJ","UNI_NARROW","STAGE2","STAGE1"]),
+            "building_s2_capacityUtilisation":  _gocc(["VMI","BJ","UNI_NARROW","STAGE2"]),
+            "stage1_capacityUtilisation":       _gocc(["STAGE1"]),
+            "vmi_capacityUtilisation":          _gocc(["VMI"]),
+            "bj_capacityUtilisation":           _gocc(["BJ"]),
+            "uniNarrow_capacityUtilisation":    _gocc(["UNI_NARROW"]),
+            # audit fields (not written to DB; used to verify the daily calc)
+            "_cure_prod_mins":  round(c["prod"]), "_cure_co_mins": round(c["co"]),
+            "_cure_clean_mins": round(c["clean"]), "_cure_avail_mins": cure_avail,
+            "_n_presses": n_press,
+        })
+    return out
 
 
 def _urgency_score(
@@ -2041,8 +2291,9 @@ def _assign_building_shift(
             _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0))
                      if _cap_max else _defc(cur, _base_buf))
             if cur in eligible and _room > 0 and not flex_reclaim:
-                mins = min(s["remaining"], _room / rate if rate > 0 else s["remaining"])
-                qty = int(mins * rate)
+                _ra = _bld_qty_per_shift(m, cur) / SHIFT_MINS   # per-SKU CT rate
+                mins = min(s["remaining"], _room / _ra if _ra > 0 else s["remaining"])
+                qty = int(mins * _ra)
                 if mins >= MIN_CAMPAIGN_MINS and qty > 0:
                     s["campaigns"].append((cur, qty, "start"))
                     projected_gt[cur] = projected_gt.get(cur, 0.0) + qty
@@ -2104,8 +2355,9 @@ def _assign_building_shift(
                     if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok:
                         continue
                     avail = s["remaining"] - cost
-                    mins = min(avail, d / rate if rate > 0 else avail)
-                    qty = int(mins * rate)
+                    _ra = _bld_qty_per_shift(m, sku) / SHIFT_MINS   # per-SKU CT rate
+                    mins = min(avail, d / _ra if _ra > 0 else avail)
+                    qty = int(mins * _ra)
                     if mins < MIN_CAMPAIGN_MINS or qty <= 0:
                         continue
                     tier, primary = _tierg(sku, m, d)
@@ -2594,8 +2846,9 @@ def _assign_building_shift(
         )
         if (cur_sku in eligible and _deficit(cur_sku, effective_buf) > 0
                 and not _flex_reclaim):
-            mins = min(remaining, _deficit(cur_sku, effective_buf) / rate if rate > 0 else remaining)
-            qty  = int(mins * rate)
+            _ra = _bld_qty_per_shift(machine, cur_sku) / SHIFT_MINS   # per-SKU CT rate
+            mins = min(remaining, _deficit(cur_sku, effective_buf) / _ra if _ra > 0 else remaining)
+            qty  = int(mins * _ra)
             if mins >= MIN_CAMPAIGN_MINS and qty > 0:
                 campaigns.append((cur_sku, qty, "start"))
                 projected_gt[cur_sku] = projected_gt.get(cur_sku, 0.0) + qty
@@ -2687,8 +2940,9 @@ def _assign_building_shift(
                 break
 
             avail = remaining - best_cost
-            mins  = min(avail, _deficit(best_sku) / rate if rate > 0 else avail)
-            qty   = int(mins * rate)
+            _ra = _bld_qty_per_shift(machine, best_sku) / SHIFT_MINS   # per-SKU CT rate
+            mins  = min(avail, _deficit(best_sku) / _ra if _ra > 0 else avail)
+            qty   = int(mins * _ra)
             if mins < MIN_CAMPAIGN_MINS or qty <= 0:
                 break
 
@@ -2914,7 +3168,7 @@ def _write_rolling_building_excel(
     _PRESS_NORM = 86_400.0  # 60 days × 24h × 60min (presses_needed normalisation)
     def _avg_bld_ct(sku: str):
         machs = sku_machine_map.get(sku, set())
-        cts   = [_BLD_CT_SEC.get(str(m), 120.0) / 60.0 for m in machs]
+        cts   = [_bld_ct_sec(m, sku) / 60.0 for m in machs]
         return round(sum(cts) / len(cts), 1) if cts else None
 
     dem_rows_out = []
@@ -3021,7 +3275,7 @@ def _write_rolling_building_excel(
         m   = str(row.get("Machine", ""))
         qty = int(row.get("Qty", 0) or 0)
         sku = str(row.get("SKUCode", ""))
-        ct_sec = _BLD_CT_SEC.get(m, 120.0)
+        ct_sec = _bld_ct_sec(m, sku)
         mach_prod_mins[m] += qty * ct_sec / 60.0
         if m in _S1_MACHINES:
             mach_carcass[m] += qty
@@ -4806,7 +5060,7 @@ def run_rolling_pipeline(
             _draw = _cure_qty_per_shift(cure_ct_map.get(_s, DEFAULT_CURING_CT))
             _per  = _draw / len(_ms)
             for _m in _ms:
-                _committed[_m] += _per * (_BLD_CT_SEC.get(str(_m), _DEFAULT_BLD_CT) / 60.0)
+                _committed[_m] += _per * (_bld_ct_sec(_m, _s) / 60.0)
         return {str(_m): max(0.0, float(SHIFT_MINS) - _committed.get(str(_m), 0.0))
                 for _m in machine_skus}
 
@@ -4815,7 +5069,7 @@ def run_rolling_pipeline(
         _ms = sku_machine_map.get(sku)
         if not _ms:
             return 0.0
-        return sum(bld_free.get(str(_m), 0.0) / (_BLD_CT_SEC.get(str(_m), _DEFAULT_BLD_CT) / 60.0)
+        return sum(bld_free.get(str(_m), 0.0) / (_bld_ct_sec(_m, sku) / 60.0)
                    for _m in _ms)
 
     def _bld_commit(sku: str, units: float, bld_free: dict) -> None:
@@ -4827,7 +5081,7 @@ def run_rolling_pipeline(
         for _m in _ms:
             _ms_key = str(_m)
             bld_free[_ms_key] = max(0.0, bld_free.get(_ms_key, 0.0)
-                                    - _per * (_BLD_CT_SEC.get(_ms_key, _DEFAULT_BLD_CT) / 60.0))
+                                    - _per * (_bld_ct_sec(_ms_key, sku) / 60.0))
 
     def _co_utility(press: str, target: str, horizon_left: int, bld_cap: float) -> float:
         """One utility for 'press → target', in units. Higher = more worth a changeover.
@@ -5217,13 +5471,12 @@ def run_rolling_pipeline(
                 _built_shift: dict[str, float] = defaultdict(float)
                 _used_min: dict[str, float] = {}
                 for _m, _cps in shift_plan.items():
-                    _ct = _BLD_CT_SEC.get(str(_m), 120.0)
                     _pi = sku_inch.get(machine_current_sku.get(_m, ""), "")
                     _um = 0.0
                     for _s, _q, _ct_type in _cps:
                         if _ct_type not in ("start", "production"):
                             _um += _co_cost(_m, _pi, sku_inch.get(_s, ""))
-                        _um += _q * _ct / 60.0
+                        _um += _q * _bld_ct_sec(_m, _s) / 60.0
                         _pi = sku_inch.get(_s, "")
                         if _m not in _S1_MACHINES:
                             _built_shift[_s] += _q
@@ -5293,8 +5546,8 @@ def run_rolling_pipeline(
                 prev_sku  = machine_current_sku.get(machine, "")
                 prev_inch = sku_inch.get(prev_sku, "")
                 _cursor   = _shift_start
-                _ct_sec   = _BLD_CT_SEC.get(str(machine), 120.0)
                 for _tier_idx, (sku, qty, co_type) in enumerate(campaigns):
+                    _ct_sec = _bld_ct_sec(machine, sku)   # per-SKU CT for the timeline
                     if co_type != "start":
                         co_mins = (INCH_PLUS3_CO_MINS if co_type == "plus3_CO"
                                    else _co_cost(machine, prev_inch, sku_inch.get(sku, "")))
@@ -5387,8 +5640,8 @@ def run_rolling_pipeline(
                     # If no CO occurred: add all production minutes to existing total.
                     _had_co = False
                     _mins_after_last_co = 0.0
-                    for _, _q, _ct in campaigns:
-                        _ct_sec = _BLD_CT_SEC.get(machine, 150.0)
+                    for _csku, _q, _ct in campaigns:
+                        _ct_sec = _bld_ct_sec(machine, _csku)
                         _prod_m = _q * _ct_sec / 60.0
                         if _ct != "start":           # CO event → reset counter
                             _had_co = True
@@ -5479,7 +5732,7 @@ def run_rolling_pipeline(
                     # at the shift clock start; duration = alloc × CT.
                     _c_start = _shift_start
                     _c_end   = _c_start + timedelta(
-                        minutes=round(alloc) * _BLD_CT_SEC.get(str(m), 120.0) / 60.0
+                        minutes=round(alloc) * _bld_ct_sec(m, sku) / 60.0
                     )
                     bld_shift_rows.append({
                         "Machine":       m,
@@ -6065,6 +6318,28 @@ def run_rolling_pipeline(
               f"{'ON' if _ENDOFDAY_GT_CAP_ENABLED else 'OFF'}, fwd-buf "
               f"{'ON' if _FORWARD_BUFFER_ENABLED else 'OFF'})")
 
+    # ── Correct Stage-1 carcass schedule (replaces tracking-only Step-3b rows) ──
+    # Full 1:1 carcass for every Stage-2 GT unit, allocated by an exact time-windowed
+    # max-flow with a 1-2 shift pre-build (≤1-day aging). Does NOT touch gt_inventory /
+    # cured — correct utilization/qty/time accounting + a feasibility flag. OFF restores
+    # the old undercounting tracking rows. See _stage1_carcass_schedule / _STAGE1_CARCASS_PASS.
+    if _STAGE1_CARCASS_PASS:
+        _carc_rows, _carc_rep = _stage1_carcass_schedule(
+            bld_shift_rows, s1_sku_to_machines, planning_days, lead=_STAGE1_CARCASS_LEAD)
+        bld_shift_rows[:] = [r for r in bld_shift_rows if r.get("CO_Type") != "carcass"]
+        bld_shift_rows.extend(_carc_rows)
+        _cq = sum(r["Qty"] for r in _carc_rows)
+        _cm = len({r["Machine"] for r in _carc_rows})
+        print(f"  [Stage-1 carcass] 1:1 allocation (pre-build ≤{_STAGE1_CARCASS_LEAD} shifts, "
+              f"≤1-day aging): {_cq:,} carcass units / {_carc_rep['demand']:,} Stage-2 GT "
+              f"across {_cm} machines")
+        if _carc_rep["unmet"] > 0:
+            print(f"  [Stage-1 carcass] ⚠ INFEASIBLE: {_carc_rep['unmet']:,} carcass units cannot "
+                  f"be supplied within the aging window; {_carc_rep['no_elig_units']:,} on "
+                  f"{len(_carc_rep['no_elig_skus'])} SKU(s) with NO eligible Stage-1 machine.")
+        else:
+            print("  [Stage-1 carcass] FEASIBLE: Stage-1 supplies 100% of Stage-2 carcass demand.")
+
     # ── Write Excel outputs (same format as legacy pipeline) ─────────────────
     closing_gt_bal = {sku: v for sku, v in gt_inventory.items() if v > 0}
 
@@ -6142,6 +6417,10 @@ def run_rolling_pipeline(
         "co_scorer_stats": co_scorer_stats if _CO_SCORER_ENABLED else None,
         "build_output":      build_output,
         "curing_output":     curing_output,
+        # Per-day capacity utilisation (30-31 rows) for jkt_plan_capacityUtilisation.
+        # Curing daily = (production + mould-clean + CO) / available press-minutes.
+        "daily_capacity_util": _daily_capacity_util(
+            cure_shift_rows, bld_shift_rows, press_stats, planning_days),
     }
 
 
