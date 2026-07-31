@@ -1265,6 +1265,135 @@ def _fmt_dt(dt: "datetime") -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict) -> list:
+    """Per-SKU mould occupancy over time for the curing 'MouldInUse' sheet.
+
+    For every (day, shift) it reads which presses are RUNNING which SKU (from
+    cure_shift_rows) and which 2 moulds each such press holds (from
+    mould_info['assignments'], keyed by (press, sku)). Then, per SKU with ≥1 mould
+    mounted that shift:
+        Mould in USE     = # of that SKU's moulds mounted on its running presses
+                           (= 2 × running presses when both cavities are tooled).
+        Available moulds = the SKU's eligible moulds (Master_Mapping_Mould_SKU)
+                           that are NOT mounted on ANY running press right now
+                           (so a shared mould taken by another SKU is unavailable).
+    Consecutive shifts within the SAME day whose (in-use, available) pair is
+    unchanged are merged into one interval, so a stable SKU = 1 row/day and a
+    curing CO that changes the count mid-day yields 2+ rows for that day.
+    Returns dicts: Date, StartTime, EndTime, SKU Code, Mould in USE, Available moulds
+    (Description is added by the sheet writer). Empty if no mould_info."""
+    if not mould_info:
+        return []
+    eligible = {str(s): set(ms) for s, ms in (mould_info.get("sku_moulds") or {}).items()}
+    # (press, sku) → moulds it mounts for that SKU-run (union over any re-mounts).
+    pm: dict = defaultdict(set)
+    for a in (mould_info.get("assignments") or []):
+        key = (str(a.get("press")), str(a.get("sku")))
+        for m in (a.get("moulds") or []):
+            pm[key].add(m)
+
+    _ORDER = {"A": 0, "B": 1, "C": 2}
+    # group RUNNING (press, sku) by (date, shift)
+    by_ds: dict = defaultdict(list)
+    for r in cure_shift_rows:
+        if str(r.get("_status", "RUNNING")) != "RUNNING":
+            continue
+        sku = str(r.get("SKUCode", "")).strip()
+        if not sku or sku in ("CHANGEOVER", "MOULD_CLEAN", ""):
+            continue
+        by_ds[(str(r.get("Date")), str(r.get("Shift")))].append((str(r.get("Machine")), sku))
+
+    # per-shift snapshot: {date: {shift: {sku: (in_use, available)}}}
+    snap: dict = defaultdict(dict)
+    for (date, shift), runs in by_ds.items():
+        occupied_all = set()
+        moulds_by_sku: dict = defaultdict(set)
+        for press, sku in runs:
+            ms = pm.get((press, sku))
+            if ms:
+                moulds_by_sku[sku] |= ms
+                occupied_all |= ms
+            else:                                  # no mould record → assume 2 mounted, IDs unknown
+                moulds_by_sku[sku] |= {f"__{press}_a", f"__{press}_b"}
+        per_sku = {}
+        for sku, ms in moulds_by_sku.items():
+            elig = eligible.get(sku, set())
+            avail = len(elig - occupied_all) if elig else 0
+            per_sku[sku] = (len(ms), avail)
+        snap[date][shift] = per_sku
+
+    # merge consecutive shifts (A→B→C) with an unchanged (in_use, avail) pair per day
+    rows = []
+    for date in sorted(snap):
+        shifts = sorted(snap[date], key=lambda s: _ORDER.get(s, 9))
+        skus = set()
+        for sh in shifts:
+            skus |= set(snap[date][sh])
+        for sku in sorted(skus):
+            run_start = None; run_val = None; run_end_sh = None
+            for sh in shifts:
+                val = snap[date][sh].get(sku)   # (in_use, avail) or None if not in use this shift
+                if val is not None and val == run_val:
+                    run_end_sh = sh              # extend current interval
+                    continue
+                if run_val is not None:          # close the open interval
+                    _st = _shift_start_dt(date, run_start)
+                    _en = _shift_start_dt(date, run_end_sh) + timedelta(minutes=SHIFT_MINS)
+                    rows.append({"Date": date, "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(_en),
+                                 "SKU Code": sku, "Mould in USE": run_val[0],
+                                 "Available moulds": run_val[1]})
+                    run_start = run_val = run_end_sh = None
+                if val is not None:              # open a new interval
+                    run_start = run_end_sh = sh; run_val = val
+            if run_val is not None:              # close a trailing interval
+                _st = _shift_start_dt(date, run_start)
+                _en = _shift_start_dt(date, run_end_sh) + timedelta(minutes=SHIFT_MINS)
+                rows.append({"Date": date, "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(_en),
+                             "SKU Code": sku, "Mould in USE": run_val[0],
+                             "Available moulds": run_val[1]})
+    rows.sort(key=lambda r: (r["Date"], r["StartTime"], r["SKU Code"]))
+    return rows
+
+
+def _sku_data_skip_reasons(sku, sku_machine_map=None, cure_ct_map=None,
+                           curing_allowable=None, sku_moulds=None) -> str:
+    """Data-availability diagnostics for one SKU's Demand-Fulfillment row.
+
+    Returns a '; '-joined list of every REQUIRED input master that has NO entry for
+    this SKU (so the plan cannot fully build/cure it from the source data), or ''
+    when every input is present. Checks, in order:
+      • missing building allowable machine   — Master_Building_Allowable_Machines
+      • missing building CT                   — per-SKU building CT file (only flagged
+        when that file is enabled and the SKU is absent from it for all its machines)
+      • missing curing CT                     — cure_ct_map (curing CT master)
+      • missing curing allowable machine      — Master_Curing_Allowable_Machines
+      • missing curing mould mapping data     — Master_Mapping_Mould_SKU
+      • insufficient curing moulds (<2)       — has a mapping but <2 moulds (a press
+        needs 2), so it still cannot run
+    A map passed as None is skipped (that source isn't available in this writer)."""
+    s = str(sku)
+    reasons = []
+    # ── building side ──
+    if sku_machine_map is not None:
+        if not sku_machine_map.get(s):
+            reasons.append("missing building allowable machine")
+        elif _BLD_CT_SKU_MACH and not any(
+                (s, str(m)) in _BLD_CT_SKU_MACH for m in sku_machine_map.get(s, ())):
+            reasons.append("missing building CT")
+    # ── curing side ──
+    if cure_ct_map is not None and s not in cure_ct_map:
+        reasons.append("missing curing CT")
+    if curing_allowable is not None and not curing_allowable.get(s):
+        reasons.append("missing curing allowable machine")
+    if sku_moulds is not None:
+        _m = sku_moulds.get(s)
+        if not _m:
+            reasons.append("missing curing mould mapping data")
+        elif len(_m) < 2:
+            reasons.append("insufficient curing moulds (<2)")
+    return "; ".join(reasons)
+
+
 def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
                              planning_days: int, lead: int = 2) -> tuple:
     """Post-plan Stage-1 carcass scheduler — replaces the tracking-only Step-3b rows.
@@ -3001,6 +3130,9 @@ def _write_rolling_building_excel(
     planning_days: int,
     n_curing_cos: int = 0,         # curing press CO count (from co_events)
     endday_gt_by_date: "dict | None" = None,  # {date_str: end-of-day total GT inventory}
+    cure_ct_map: "dict | None" = None,        # {sku: ct} — for Skip_Reason data checks
+    curing_allowable: "dict | None" = None,   # {sku: [presses]} — for Skip_Reason
+    sku_moulds: "dict | None" = None,         # {sku: set(moulds)} — for Skip_Reason
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -3197,8 +3329,8 @@ def _write_rolling_building_excel(
             "CycleTime_min": avg_ct if avg_ct is not None else "NA",
             "Eligible_Machines": len(sku_machine_map.get(sku, set())) or "NA",
             "Presses_Needed": p_needed,
-            "Skip_Reason": "" if planned > 0 else (
-                "No eligible building machine" if not sku_machine_map.get(sku) else ""),
+            "Skip_Reason": _sku_data_skip_reasons(
+                sku, sku_machine_map, cure_ct_map, curing_allowable, sku_moulds),
         })
     status_colors = {"FULLY MET": _GREEN, "PARTIAL": _AMBER, "UNMET": _RED}
     pu_col_idx = dem_cols.index("Planned_Units") + 1
@@ -3411,6 +3543,8 @@ def _write_rolling_curing_excel(
     df_day0: "pd.DataFrame | None" = None,  # Day 0 consumption (has Priority_Score, Category)
     mould_life: "dict | None" = None,       # {press: remaining mould life (cycles) at horizon end}
     mould_info: "dict | None" = None,       # end-of-plan mould state for the Mould Tracker sheet
+    sku_desc_map: "dict | None" = None,     # {sku: description} for the MouldInUse sheet
+    sku_machine_map: "dict | None" = None,  # {sku: set(building machines)} — for Skip_Reason
 ) -> None:
     """
     Write curing Excel matching the legacy bc_curing_b2c output.
@@ -3484,7 +3618,10 @@ def _write_rolling_curing_excel(
             "CycleTime_min": round(ct, 2),
             "CT_available": round(cure_ct_map[sku], 2) if sku in cure_ct_map else "NA",
             "Eligible_Machines": len(curing_allowable.get(sku, [])),
-            "Presses_Needed": p_needed, "Skip_Reason": "",
+            "Presses_Needed": p_needed,
+            "Skip_Reason": _sku_data_skip_reasons(
+                sku, sku_machine_map, cure_ct_map, curing_allowable,
+                (mould_info or {}).get("sku_moulds")),
         })
     for ri, r in enumerate(rows_out, 2):
         f = _fill(status_fill.get(r["Status"], _WHITE))
@@ -3716,6 +3853,37 @@ def _write_rolling_curing_excel(
         ws2.column_dimensions["D"].width = 40
         ws2.column_dimensions["E"].width = 40
         ws2.freeze_panes = "A3"
+
+    # ── Sheet 4c: MouldInUse ──────────────────────────────────────────────────
+    # Per-SKU mould occupancy over time: how many of an SKU's moulds are mounted on
+    # running presses ("Mould in USE") vs still free ("Available moulds"). One row
+    # per constant-count interval within a day, so a curing CO that changes the
+    # count mid-day produces 2+ rows for that day (see _mould_in_use_rows).
+    ws = wb.create_sheet("MouldInUse")
+    miu_cols = ["Date", "StartTime", "EndTime", "SKU Code", "Description",
+                "Mould in USE", "Available moulds"]
+    _sdesc = sku_desc_map or {}
+    _miu = _mould_in_use_rows(cure_shift_rows, mould_info)
+    ws.cell(row=1, column=1, value=(
+        f"Mould occupancy per SKU over time  |  rows: {len(_miu)}  |  "
+        "Mould in USE = the SKU's moulds mounted on running presses; "
+        "Available moulds = the SKU's eligible moulds not mounted on any press right now."
+        if _miu else
+        "Mould gate OFF — no mould state to report (run with MOULD_GATE=1)."
+    )).font = _bold(10)
+    _hdr(ws, 2, miu_cols)
+    for _ri, _r in enumerate(_miu, 3):
+        _r = {**_r, "Description": _sdesc.get(_r["SKU Code"], "NA")}
+        for _ci, _h in enumerate(miu_cols, 1):
+            ws.cell(row=_ri, column=_ci, value=_r.get(_h, "")).alignment = _ctr()
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 32
+    ws.column_dimensions["E"].width = 40
+    ws.column_dimensions["F"].width = 14
+    ws.column_dimensions["G"].width = 16
+    ws.freeze_panes = "A3"
 
     # ── Sheet 5: Machine Schedule ─────────────────────────────────────────────
     ws = wb.create_sheet("Machine Schedule")
@@ -6354,6 +6522,10 @@ def run_rolling_pipeline(
         planning_days  = planning_days,
         n_curing_cos   = len(co_events),
         endday_gt_by_date = {r["Date"]: r["EndDay_GT_Inventory"] for r in daily_summary},
+        cure_ct_map    = cure_ct_map,
+        curing_allowable = dict(curing_allowable),
+        sku_moulds     = ({s: set(m) for s, m in _sku_moulds.items()}
+                          if _sku_moulds else None),
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,
@@ -6387,6 +6559,8 @@ def run_rolling_pipeline(
             "events":        mould_events,          # per-swap movement log (day, press, sku, added, removed)
             "assignments":   mould_assignments,     # full (press, sku, 2-moulds) timeline incl Day-0
         } if _mould_gate else None),
+        sku_desc_map      = sku_desc_map,
+        sku_machine_map   = sku_machine_map,
     )
 
     # Client output rule: next to every SKU-code column write its description, and
