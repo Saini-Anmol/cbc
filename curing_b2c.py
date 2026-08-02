@@ -68,6 +68,8 @@ from bc_config import (
     DEFAULT_CURING_CT  as DEFAULT_CT,
     GT_MACHINES,
     RUNNING_MOULDS_TABLE,
+    RUNNING_MOULDS_MONTH,
+    PLAN_MONTH,
 )
 
 DB = cbc_env.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
@@ -207,7 +209,7 @@ def _load_opening_gt(engine) -> dict:
     try:
         df = _sql(engine,
             f"SELECT sizeCode AS sku, gtInventory AS qty "
-            f"FROM {DB}.gt_inventory_manual")
+            f"FROM {DB}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
         df["sku"] = df["sku"].astype(str).str.strip()
         df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
         return {r["sku"]: float(r["qty"]) for _, r in df.iterrows()}
@@ -224,7 +226,7 @@ def _load_press_state(engine) -> pd.DataFrame:
     matches CO event press IDs and silently breaks all CO transitions.
     """
     try:
-        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE}")
+        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
         if "updatedAt" in rm.columns:
             rm = rm.drop(columns=["updatedAt"])
 
@@ -249,7 +251,7 @@ def _load_press_state(engine) -> pd.DataFrame:
 
 def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
-        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE}")
+        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
         mms = _sql(engine,
             f"SELECT MouldNo, `Matl.Code` AS sku, `Active Flag` AS flag "
             f"FROM {DB}.Master_Mapping_Mould_SKU")

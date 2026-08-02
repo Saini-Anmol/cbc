@@ -63,6 +63,15 @@ CLOUD_CONFIG: dict = {
     "MAX_BUILDING_SKUS_PER_DAY":              4,      # 4 distinct SKUs/machine/day (BLD_SKU_CAP)
     "INCH_PLUS3_CO_MINS":                     480,    # +3/−3 escape (toggle OFF by default)
     "INCH_PLUS3_MIN_DAYS_LEFT":               5,
+    # ── Historical inch-LOCK (ADOPTED this cycle) — supersedes the ±2 anchor band ──
+    # Per-machine allowed-inch SETS from the 4-month plant report: 27 machines FIXED to
+    # one inch (0 diff-CO), 12 FLEXIBLE to their ranked historical inches. Applied on
+    # cloud too (the Apr–Jul plant history is a fixed reference for every month).
+    "INCH_HIST_LOCK_ENABLED":                 True,
+    "INCH_HIST_LOCK_MIN_SHARE":               0.02,   # reproduces the 27-fixed/12-flexible split
+    "INCH_HIST_LOCK_MAX_INCHES":              3,
+    "INCH_HIST_LOCK_STAGE1":                  False,  # S1 stays demand-optimal (carcass-FEASIBLE)
+    "FIXED_ESCAPE_ENABLED":                   False,  # Lever B REJECTED (−2,572 net, 3 mo) — kept off
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
     "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)

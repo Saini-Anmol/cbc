@@ -1,22 +1,20 @@
 # B2C Scheduler — Technical Architecture (current)
 
-> **CURRENT STATE (2026-07-25) — read `CLAUDE.md` §"Rules & features added this cycle" for
-> the authoritative, up-to-date summary.** Since this spec was last fully revised, the live
-> engine adds: **(1) mould→SKU availability gate + retarget + unified CO scorer + mould life
-> v2** (a press needs 2 eligible moulds; opening life from the DB); **(2) building inch rules**
-> — 5-day minimum inch dwell + ±2 band + idle-recovery Levers B/C (the old permanent one-way
-> rule is retired); **(3) max 4 distinct SKUs/building machine/day** (env `BLD_SKU_MAX`;
-> tightening to 3 = −32k, kept at 4); **(4) IUkeep — idle building machines re-ranked toward
-> the biggest unmet-demand gaps** (keeps the starvation gate + curable-path, so no waste GT;
-> ADOPTED, `_IDLE_UNMET_ENABLED`); **(5) +3/−3 inch escape** and **(6) global mould optimiser**
-> — experiments, default OFF (the mould optimiser was measured and REJECTED: July is true
-> scarcity, `full_evict` −38k because every mould move costs an 8h clean-shift). Config now:
-> `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=7000`, `MIN_INCH_DWELL_DAYS=5`,
-> `MAX_BUILDING_SKUS_PER_DAY=4`.
-> **Current LOCAL KPIs (cap=12, all rules live incl. IUkeep, +3/−3 & mould-opt off, mould-audit
-> PASS):** May 684,910/98.73% · June 632,168/96.28% · July 694,161/89.11% (IUkeep net +13,512,
-> July +12,732). These rules are physical restrictions that make the plan floor-realistic (KPI
-> below the mould-blind baseline by design).
+> **CURRENT STATE (2026-08) — the LIVE building inch model is the HISTORICAL INCH-LOCK + Lever A
+> (§4.5); this REPLACES the ±2 band / soft-lock / inch-flex model (now the `INCH_HIST_LOCK=0`
+> fallback, §4.6).** Read `CLAUDE.md` §"Historical inch-lock" for the authoritative summary. The
+> live engine: **(1) INCH_HIST_LOCK** — per-machine allowed-inch sets from the 4-month plant
+> report (27 FIXED single-inch / 12 FLEXIBLE), ±2 band OFF; **(2) Lever A `FLEX_SCARCE_INCH`** —
+> flexible machines feed the scarcest allowed inch (+3,804 net); **(3) Lever B `FIXED_ESCAPE`
+> REJECTED** (−2,572, off); plus mould gate + retarget + CO scorer + mould life v2 + mould clean +
+> 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 10k GT cap). **Inputs:** per-month
+> `*_tomerji.xlsx`; ONE `Daily_Running_Moulds` table keyed by `plan_month`; single
+> `gt_inventory_manual`; building start-free (no building-running-machines).
+> Config: `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=10000` (⚠️ cloud pins 7000 / a
+> bc_config note mentions 6000 — see §8), `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
+> **Adopted LOCAL KPIs (mould-audit PASS, cap 0-over, deterministic, per-month opening GT):** June
+> 636,201/88.64% · July 673,221/86.38% · Aug 648,118/92.33% = **1,957,540 / 89.03%**. The rules are physical
+> restrictions that make the plan floor-realistic (KPI below the mould-blind baseline by design).
 
 **Building-to-Curing (B2C):** the building schedule is the **primary output**; the
 curing schedule is **fully derived** from it. Building runs first; curing consumes
@@ -48,6 +46,13 @@ summarised in one paragraph (§10) and is **not** the current architecture.
 pipeline for CO pre-computation. Its SKU classification, eligibility filter,
 cycle-time formula, and CO-schedule logic (§3, §8) are current.
 
+**CURRENT building inch model (2026-08):** the **historical inch-LOCK** (`INCH_HIST_LOCK`, ON) +
+**Lever A** (`FLEX_SCARCE_INCH`, ON) — see §4.5. It **replaces the anchor ±2 band / four-tier
+soft-lock/flex model** (now the `INCH_HIST_LOCK=0` fallback, §4.6). **Inputs this cycle:** per-month
+`*_tomerji.xlsx` demand; running moulds from ONE `Daily_Running_Moulds` table keyed by a
+`plan_month` column (auto-derived from `PLAN_START`); single `gt_inventory_manual` opening GT; NO
+building-running-machines (building starts free). Adopted 3-month KPIs in §16.
+
 ---
 
 ## 1. Motivation — why B2C
@@ -69,7 +74,10 @@ demand but no GT that shift), but never as negative inventory.
 ## 2. Start conditions
 
 ### 2.1 Opening GT inventory (from DB, not zero)
-GT inventory is loaded from `gt_inventory_manual` at plan start (~**6,530 units** total).
+GT inventory is loaded from `gt_inventory_manual` at plan start, **filtered by the `plan_month`
+column** (`WHERE plan_month = PLAN_MONTH`, auto-derived from `PLAN_START`) — each month uses its own
+opening GT (June 7,644 / July 8,989 / Aug 7,488). `PLAN_MONTH` is imported by value (like
+`RUNNING_MOULDS_MONTH`), so a harness that sets `PLAN_START` after import must also export env `PLAN_MONTH`.
 Pre-plan-start building output is credited to the curing sim's opening balance by
 `curing_b2c.py`. Opening carcass inventory = **0** (Stage-2 waits for Stage-1 output;
 Unistage is unaffected). Opening GT acts as a Day-1 buffer; it does not change the
@@ -87,9 +95,11 @@ Legacy behaviour (for reference): building started **2 shifts before** curing (M
 building Apr 30 Shift B), and pre-start GT was credited to the curing opening balance.
 
 ### 2.3 Demand file
-`data/input/demand_may.xlsx` — **85 SKUs**, total demand **693,748**.
-Columns: `SKUCode`, `Requirement` (the per-SKU **demand cap**), `ConsolidatedPriorityScore`
-(static input; higher = higher priority; not computed here).
+Per-month `data/input/<month>_demand_tomerji.xlsx` (June `june_demand_tomerji.xlsx` 717,765 /
+July `july_demand_tomerJi1.xlsx` 778,981 / Aug `august_demand_tomerji.xlsx` 701,933). Columns:
+`SKUCode`, `Requirement` (the per-SKU **demand cap**), `ConsolidatedPriorityScore` (a static input;
+priority is actually recomputed in code as min-max of Requirement — any file score is ignored, v1).
+(Older revisions used `demand_may.xlsx` / `june_production_data.xlsx` — retired.)
 
 ---
 
@@ -206,6 +216,9 @@ VMI `same_size_CO` = 20 min = 4.2% of a shift — cheapest. Stage-1/Unistage `di
 > at a time.
 
 ### 4.3 Per-machine dominant inch
+> Under the LIVE hist-lock (§4.5) the dominant inch = the top of each machine's 4-month ranked
+> set (loaded by `_load_inch_hist_lock`), which differs from this hardcoded map for a few machines
+> (e.g. 7001→**15** not 16). The map below is the fallback (`INCH_HIST_LOCK=0`) / historical value.
 ```
 VMIMAXX  7001→16  7002→14  7003→15  7004→14   6001→14  6002→15  6003→17  6004→16
 BJ       7101→15  7102→15  7103→13  7104→15   7105→13  7106→13  7201→16
@@ -223,7 +236,37 @@ UNI      7501→12  7502→13  7503→13
 16"/17"/18" → VMIMAXX only
 ```
 
-### 4.5 Inch-locking — four tiers
+### 4.5 Inch-locking — HISTORICAL INCH-LOCK (LIVE, ADOPTED 2026-08)
+
+The building inch model is now a **per-machine allowed-inch SET** from the 4-month plant report
+`data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx` (sheet `Inch_Counts_Matrix`),
+loaded by `_load_inch_hist_lock` in `b2c_pipeline.py`. **This REPLACES the ±2 anchor band and the
+four-tier model** (§4.6, now the `INCH_HIST_LOCK=0` fallback).
+
+- **`INCH_HIST_LOCK` (ON).** An inch is in a machine's allowed set if it is ≥ `INCH_HIST_LOCK_MIN_SHARE`
+  (0.02) of that machine's records, ranked, capped at `INCH_HIST_LOCK_MAX_INCHES` (3). At 2% this
+  gives exactly **27 FIXED machines (single historical inch, ZERO diff-size CO ever) + 12 FLEXIBLE
+  (ranked historical inches only)**. The ±2 band is DISCONTINUED — historically-evidenced +3 jumps
+  are legal (7001 15↔18, 7103 13↔16, 7201 16↔13, 7803 15↔12, 8301 12↔15); an inch never run is not.
+  Enforcement: the allowable-machine strip removes off-set SKUs; `machine_locked_inches` gates
+  Phase B (`_inch_gate`); `_inch_ok` returns True (band off); Stage-1 `_s1_inch_ok`. The dominant
+  inch (anchor + `inch_penalty`) is the top of each machine's ranked set. `INCH_HIST_LOCK_STAGE1`
+  OFF (Stage-1 stays demand-optimal + carcass-FEASIBLE). `INCH_HIST_LOCK=0` → §4.6 bit-for-bit.
+- **Lever A — `FLEX_SCARCE_INCH` (ON).** Among a FLEXIBLE machine's allowed inches, prefer the
+  SCARCEST (biggest live curing-draw shortfall) over same-inch stickiness (a per-pick inch-scarcity
+  rank overriding `inch_penalty` in `_key`, flex machines only). Feeds the about-to-starve 15"/13"
+  that fixed machines can't reach. **+3,804 net over 3 months, starvation ↓/flat all 3.**
+- **Lever B — `FIXED_ESCAPE` (OFF, REJECTED).** A fixed machine may take ≤1 diff-CO to a scarce
+  DB-allowable inch only after its own inch's whole-month demand is done. Regresses all 3 months
+  (−2,572) — the stranded 14"/17" idle capacity frees too late to redirect. Code retained. (Gate
+  MUST use `demand_remaining − projected_gt`, not buffered `_defc` — buffered → −31.7k.)
+
+### 4.6 Inch-locking — four tiers (FALLBACK, `INCH_HIST_LOCK=0` only)
+
+> Superseded by §4.5. Runs only with `INCH_HIST_LOCK=0`. Under the live lock `_HARD` is unused
+> (the strip enforces the historical set), the ±2 band is off, and `_INCH_FLEX_EXTRA_COS`/soft-lock
+> still apply to VMI+BJ but the WHICH-inch decision comes from the historical set + Lever A. Below
+> = the fallback model, kept for record.
 
 **Tier 1 — Hard filter (`_HARD` in `b2c_pipeline.py`).** Restricts a machine to its
 dominant inch(es). Without it, high-demand 15" SKUs capture 13" BJ machines (root cause of
@@ -437,7 +480,11 @@ structurally ~47% by design (15 machines for ~11.5-equiv demand).
 
 ---
 
-## 8. NEW LOGIC — forward buffer + 8k cap + risk gate
+## 8. NEW LOGIC — forward buffer + GT cap (10k) + risk gate
+
+> **GT cap = `MAX_ENDOFDAY_GT_INVENTORY = 10000`** (committed local; the dynamic buffer β=2 needs
+> the headroom). ⚠️ `main.CLOUD_CONFIG` still pins 7000 and a `bc_config.py:19` note mentions 6000
+> — final value undecided. The "8,000" figures below are from an earlier revision; read as the cap.
 
 Three buffers now cover three distinct needs:
 - **Flat buffer** (`GT_BUFFER_SHIFTS`): survive steady curing (VMI = 2, others = 1).
@@ -594,7 +641,10 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 | `GT_SHELF_LIFE_SHIFTS` | 9 | `GT_SHELF_LIFE_DAYS × 3` — forward-buffer horizon |
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | Stage-1 carcass shelf life |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | 3 | TopUp pre-build days (legacy); must equal shelf life |
-| `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Overnight GT-hold cap (hard plant constraint; was 10000) |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **10000** | Overnight GT-hold cap (dynamic buffer β=2 needs it; ⚠️ cloud pins 7000, a bc_config note mentions 6000 — see §8) |
+| `INCH_HIST_LOCK_ENABLED` / `_MIN_SHARE` / `_MAX_INCHES` | **True / 0.02 / 3** | Historical inch-lock: per-machine allowed-inch sets from the 4-mo report (§4.5) |
+| `FLEX_SCARCE_INCH` (env) | **ON** | Lever A — flexible machines feed the scarcest allowed inch (§4.5) |
+| `FIXED_ESCAPE_ENABLED` | **False** | Lever B (fixed-machine escape) — REJECTED, kept off (§4.5) |
 | `CURING_CO_DURATION_SHIFTS` | 1 | Curing press idle during CO: one shift (its own CO shift, §5.3) |
 | `CURING_CO_CHANGEOVER_MINS` | 480 | Curing CO duration (full shift); charged to planned AND dynamic COs |
 | `MOULD_CLEAN_CYCLES` | **3000** | Cycles between mould cleans (= 6,000 tyres at 2 cavities); §5.1 |
@@ -665,35 +715,32 @@ building-side starvation.
 
 ---
 
-## 16. Current KPIs (committed default)
+## 16. Current KPIs (ADOPTED approach 2026-08 — historical inch-lock + Lever A)
 
-Committed default: `demand_may.xlsx`, `RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"` (167 presses),
-forward buffer `risk=1.0` ON, **8k cap** ON, `MAX_CHANGEOVERS_PER_DAY = 12`, mould-clean ON,
-CO-shift-spread ON, every curing CO charged. Fully deterministic (every sort/min/max ends in an
-explicit tiebreak; bit-for-bit reproducible). `result_checker`-audited — all invariants hold.
+Committed default: **historical inch-lock (INCH_HIST_LOCK, 27 fixed / 12 flexible, ±2 band OFF) +
+Lever A (FLEX_SCARCE_INCH)**, `MAX_CHANGEOVERS_PER_DAY = 12`, **10k GT cap** + dynamic buffer (β=2),
+forward buffer + IUkeep ON, mould-clean ON, carcass lead 2, `FIXED_ESCAPE` OFF. Inputs: per-month
+`*_tomerji.xlsx`, month-keyed `Daily_Running_Moulds` (`plan_month`), single `gt_inventory_manual`,
+building start-free. Fully deterministic; mould-audit PASS; demand-cap 0-over on all 3 months.
 
-Verified end-to-end through the deployed container API, all months using
-`Daily_Running_Moulds` (the live Day-0 snapshot — the historical `testing_` /
-`june_` tables are retired):
+| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Cleans | Starv |
+|-------|-------------|--------|----------|----------|----------|-----------|--------|-------|
+| June | `june_demand_tomerji.xlsx`   | 717,765 | 631,586 | **636,201** | **88.64%** | 249 | 46 | 1,422 |
+| July | `july_demand_tomerJi1.xlsx`  | 778,981 | 669,065 | **673,221** | **86.38%** | 213 | 59 | 1,719 |
+| Aug  | `august_demand_tomerji.xlsx` | 701,933 | 643,722 | **648,118** | **92.33%** | 283 | 53 | 2,143 |
+| **Total** | | 2,198,679 | | **1,957,540** | **89.03%** | — | — | 5,284 |
 
-| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Building COs |
-|-------|-------------|--------|----------|----------|----------|-----------|--------------|
-| May  | `demand_may.xlsx`           | 693,748 | 681,029 | **687,028** | **99.03%** | 200 | 2,256 |
-| June | `june_production_data.xlsx` | 656,608 | 643,259 | **648,031** | **98.69%** | 225 | 2,359 |
-| July | `july_demand_tomerJi1.xlsx` | 778,981 | 700,298 | **705,399** | **90.55%** | 179 | 2,494 |
+> Measured with per-month opening GT (`gt_inventory_manual` `plan_month`-filtered) + the Lever-A
+> determinism fix (inch-scarcity sort tiebreaks on the inch string). Re-run after any DB opening-GT edit.
 
-Per-SKU demand cap verified on all 3 months: **0 SKUs cured above demand**.
-End-of-day GT inventory stays under the 8k cap (0 days over).
-| Curing COs (total) | **225** = 147 planned + 78 dynamic (all charged 480 min) |
-| Mould cleans taken | **4** |
-| Overbuild | ≤ 162 units / 0.02% (rounding only) |
+**Lever A delta:** June +570 / July +1,860 / Aug +1,374 = **+3,804 net** vs hist-lock-only, starvation
+↓/flat all 3. **Lever B (FIXED_ESCAPE) REJECTED:** −2,572. **CO sweep** (10/12/14/16) confirmed 12 best
+single value (July-only 16 = +2,677 if tuned per-month). The `INCH_HIST_LOCK=0` ±2-band baseline was
+Aug 646,403 (the lock costs Aug −6k but nets positive: June +7.7k / July +25.3k).
 
-The console completion summary now reports **"Curing COs (total): 225 (planned 147 + dynamic 78)"**
-and **"Mould cleans taken: 4"** — previously it printed only the planned count (147), undercounting.
-
-**OFF baseline** (`GT_CAP=0 FWD_BUF=0`) reproduces the ~674k / 97.2% no-forward-buffer figure
-bit-for-bit (the exact number shifts slightly now that dynamic COs and mould cleans are charged;
-re-run to confirm).
+> **These use the NEW inputs — NOT comparable to the pre-2026-08 numbers in older revisions of this
+> doc** (which used `demand_may.xlsx` / `june_production_data.xlsx` and the ±2-band inch model).
+> Per-SKU demand cap verified: 0 SKUs cured above demand. Overbuild ≤ rounding only.
 
 **CO-cap sweep (forward buffer live):** all caps 8–14 land 98.9–99.9%. **cap=14 best**
 (692,988 / 99.89%); **cap=12 lowest starvation** (911). Total curing COs scale 174→250 across the
@@ -729,8 +776,8 @@ building plan less even. Producing a flat, plant-like daily curve needs a **sepa
 ### 17.1 DB tables (MySQL `jkplanningV1`)
 | Table | Purpose |
 |-------|---------|
-| `Daily_Running_Moulds` | Which SKU each press runs today; mould life; press state (LH/RH → `WCNAME_clean`). **Always this table** — `testing_` / `june_` variants are retired. |
-| `gt_inventory_manual` | Opening GT inventory per SKU (`sizeCode`, `gtInventory`) |
+| `Daily_Running_Moulds` | Which SKU each press runs today; mould life; press state (LH/RH → `WCNAME_clean`). **ONE table for all months, keyed by a `plan_month` column** ('YYYY-MM'); all 4 curing SQL sites filter `WHERE plan_month = RUNNING_MOULDS_MONTH` (auto-derived from `PLAN_START`, imported by-value). DB has 2026-06/07/08. `testing_`/`june_` variants retired. |
+| `gt_inventory_manual` | Opening GT inventory per SKU (`sizeCode`, `gtInventory`) — **keyed by `plan_month`** (`WHERE plan_month = PLAN_MONTH`); each month uses its own opening GT |
 | `Master_Curing_Design_CycleTime` | Raw cure time per SKU; missing → default 17.0 |
 | `Master_Curing_Allowable_Machines_source` | SKU ↔ allowable curing press |
 | `Master_Building_Allowable_Machines` | SKU ↔ building machines — single comma-separated `Machines` string (renamed from `_source`, reshaped from per-machine Y/Yes cols; commit `63d193f`); parsed via `_parse()` |
@@ -740,7 +787,9 @@ building plan less even. Producing a flat, plant-like daily curve needs a **sepa
 | `Master_Mapping_Mould_SKU` | Mould ↔ SKU compatibility for CO target check |
 | `TBMStage1/2_ProductionEventData` | Currently running building machines at plan start |
 
-**File inputs:** `data/input/demand_may.xlsx`; `feed_map.json` (press → feeder machines, pre-built).
+**File inputs:** per-month `data/input/<month>_demand_tomerji.xlsx`;
+`data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx` (historical inch-lock source, §4.5);
+`data/input/Cycle_time_Building.csv` (per-(SKU×machine) building CT); `feed_map.json`.
 
 ### 17.2 Output files
 All output paths are **stamped with `PLAN_START` (+ horizon)** so a new month never overwrites the

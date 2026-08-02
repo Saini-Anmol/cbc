@@ -42,7 +42,7 @@ if (os.path.exists(_VENV_PY)
     os.execv(_VENV_PY, [_VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
 
 import cbc_env
-from bc_config import RUNNING_MOULDS_TABLE
+from bc_config import RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH
 
 HERE     = os.path.dirname(os.path.abspath(__file__))
 IN_DIR   = cbc_env.INPUT_DIR
@@ -180,7 +180,7 @@ class ConsumptionETL:
         """Load opening GT inventory from DB. Returns [SKUCode, GT_Inventory]."""
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory"
-            f" FROM {self.db}.gt_inventory_manual"
+            f" FROM {self.db}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
         )
 
     # -- adapted from curing_lp.ETL.load_running_moulds (lines 368-400) -------
@@ -193,7 +193,7 @@ class ConsumptionETL:
         wc_master = self._sql(f"SELECT * FROM {self.db}.Master_WC_Master")
         wc_master = wc_master[["wcID", "WCNAME"]]
 
-        df = self._sql(f"SELECT * FROM {self.db}.{RUNNING_MOULDS_TABLE}")
+        df = self._sql(f"SELECT * FROM {self.db}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
         if "updatedAt" in df.columns:
             df = df.drop(columns=["updatedAt"])
 
@@ -318,7 +318,8 @@ class ConsumptionETL:
             df = self._sql(
                 f"SELECT DISTINCT Sapcode AS SKUCode "
                 f"FROM {self.db}.{RUNNING_MOULDS_TABLE} "
-                f"WHERE Sapcode IS NOT NULL AND Sapcode != ''"
+                f"WHERE Sapcode IS NOT NULL AND Sapcode != '' "
+                f"AND plan_month = '{RUNNING_MOULDS_MONTH}'"
             )
             raw = set(df["SKUCode"].astype(str).str.strip())
             return {s for s in raw if s.upper() not in _sentinels}

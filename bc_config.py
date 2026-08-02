@@ -53,6 +53,60 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
 BLD_CT_FILE_ENABLED = True
 BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.csv")
 
+# ── Per-machine dominant-inch ranking file (inch-locking source) ─────────────
+# When DOMINANT_INCH_FILE_ENABLED, each building machine's dominant inch AND its
+# ordered multi-inch band come from this xlsx (sheet "Dominant_Inch", cols
+# Machine, Ranked_Inches) — built from the plant's last-N-day running data
+# (see data/analysis_aug/machine_inch_dominant_aug.xlsx). It overrides the scalar
+# b2c_pipeline._MACHINE_DOMINANT_INCH (= top inch) and exposes the ranked band as
+# _MACHINE_DOMINANT_INCH_RANKED (Phase-5 inch-locking source for the planner).
+# OFF (default) or a missing file keeps the hardcoded dominant-inch map →
+# bit-for-bit baseline. Env DOMINANT_INCH_FILE=0 also disables.
+DOMINANT_INCH_FILE_ENABLED = True   # ADOPTED — 39-machine dominant-inch band + start-free anchor
+DOMINANT_INCH_FILE = os.path.join(cbc_env.HERE, "data", "analysis_aug",
+                                  "machine_inch_dominant_aug.xlsx")
+
+# ── Historical inch-LOCK (INCH_HIST_LOCK) — replaces the anchor±2 band ────────
+# Per-machine ALLOWED-INCH SETS come from the 4-month plant building report
+# (sheet "Inch_Counts_Matrix"): an inch is kept for a machine when it is >=
+# INCH_HIST_LOCK_MIN_SHARE of that machine's records, ranked by count, capped at
+# INCH_HIST_LOCK_MAX_INCHES. A machine that ran essentially one inch (>=2% only on
+# its dominant) becomes FIXED — locked to that single inch, ZERO different-size CO
+# ever. A machine that historically ran multiple inches becomes FLEXIBLE — it may
+# only build/CO among its ranked historical inches (the +/-2 anchor band is
+# DISCONTINUED, so historically-evidenced +/-3 jumps like 7001 15<->18 are allowed
+# while a jump to an inch it never ran is not). Enforced via the allowable-machine
+# strip + machine_locked_inches gate + Stage-1 _s1_inch_ok. This 2% threshold
+# reproduces the plant's 27-fixed / 12-flexible split exactly.
+# OFF (env INCH_HIST_LOCK=0) or a missing file → current anchor±2 behaviour,
+# bit-for-bit. Overrides DOMINANT_INCH_FILE's dominant map when both are on.
+INCH_HIST_LOCK_ENABLED   = (os.environ.get("INCH_HIST_LOCK", "1") != "0")
+INCH_HIST_LOCK_FILE      = os.path.join(cbc_env.HERE, "data", "analysis_aug",
+                                        "machine_inch_dominant_4months_Apr-Jul.xlsx")
+INCH_HIST_LOCK_MIN_SHARE = float(os.environ.get("INCH_HIST_MIN_SHARE", "0.02"))
+INCH_HIST_LOCK_MAX_INCHES = int(os.environ.get("INCH_HIST_MAX_INCHES", "3"))
+# Apply the historical lock to Stage-1 carcass machines too? Default OFF: Stage-1 is
+# post-hoc (doesn't gate GT/cured) and _STAGE1_SINGLE_INCH already fixes each S1 machine
+# to ONE (demand-optimal, carcass-FEASIBLE) inch — that already satisfies "fixed = one
+# inch". Forcing S1 onto historical inches only broke carcass feasibility (715 units) for
+# zero cured benefit, so it is off. ON = also lock S1 to its historical inch set.
+INCH_HIST_LOCK_STAGE1 = (os.environ.get("INCH_HIST_LOCK_STAGE1", "0") != "0")
+# Fixed-machine escape (Lever B): a FIXED machine (single historical inch) may take at
+# most FIXED_ESCAPE_MAX_COS different-size CO(s) — and ONLY after its own inch's demand
+# is fully complete — to a scarce inch it is DB-certified for, then it stays there. This
+# recovers idle capacity stranded on fixed 14"/17" machines once their inch is done,
+# without letting them abandon their inch while it still has work. Default OFF (measure).
+FIXED_ESCAPE_ENABLED  = (os.environ.get("FIXED_ESCAPE", "0") != "0")
+FIXED_ESCAPE_MAX_COS  = int(os.environ.get("FIXED_ESCAPE_MAX_COS", "1"))
+
+# ── Start all building machines FREE (no Day-0 running SKU) ───────────────────
+# The plant provides no building-running-machine snapshot for this cycle, so every
+# building machine starts free → the first shift seeds each as a "start" (0 CO),
+# giving NO initial same/diff-size building COs; each machine anchors to its
+# DOMINANT inch (from the file above). Verified: 0 forced initial COs. Env
+# BLD_START_FREE overrides. See b2c_pipeline._BLD_START_FREE / _anchor_seed_inch.
+BLD_START_FREE_ENABLED = True
+
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
 # Every consumer (curing_consumption.py Phase 0, curing_b2c.py press state +
@@ -65,6 +119,22 @@ BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.csv")
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
+
+# ── Which month's snapshot to read from the consolidated Daily_Running_Moulds ──
+# All months now live in ONE table (Daily_Running_Moulds), discriminated by the
+# plan_month column ('YYYY-MM'). The 4 curing SQL sites filter WHERE plan_month =
+# RUNNING_MOULDS_MONTH. Auto-derived from PLAN_START so it can never disagree with
+# the plan month; env RUNNING_MOULDS_MONTH overrides (e.g. to reuse a prior month's
+# snapshot). If a month ever has >1 snapshot, read the latest snapshot_date.
+RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
+
+# ── Which month's opening inventory to read (gt_inventory_manual / carcass_inventory_manual) ──
+# Both inventory tables now hold all months in ONE table each, discriminated by the
+# plan_month column ('YYYY-MM'). The 4 GT + 1 carcass read sites filter WHERE plan_month =
+# PLAN_MONTH. Auto-derived from PLAN_START (env PLAN_MONTH overrides); same value as
+# RUNNING_MOULDS_MONTH by default. Each month's snapshot is loaded from data/gt_carcass/
+# (aggregated per SKU by plcbomname). May has no data — no 2026-05 rows exist.
+PLAN_MONTH = os.environ.get("PLAN_MONTH") or PLAN_START.strftime("%Y-%m")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -82,7 +152,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 10   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = 12   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
@@ -115,6 +185,23 @@ VMI_MAX_DIFF_CO_PER_DAY = 1
 #   The current committed month is July → False. Set True when running a May-like month.
 #   Env RT_SAME_INCH overrides. (RT_SAME_INCH_FRAC>0 relaxes the restriction — measured worse, keep 0.)
 RT_SAME_INCH = False
+
+# ── Adaptive curing CO on sustained starvation (unified delay + switch lever) ──
+# One threshold governs both directions the client wants:
+#   • while a running press keeps getting GT (fed), it stays on its SKU and its
+#     planned CO defers naturally — "if building can supply, CO can be planned later";
+#   • when a press receives 0 GT for CURING_STARV_SWITCH_SHIFTS CONSECUTIVE shifts,
+#     its SKU is building-limited → CO it to a SKU that building CAN supply (a
+#     feedable in-demand SKU with GT + 2 free moulds).
+# N=8 shifts ≈ 2.7 days ≈ the 3-day GT shelf life. Swept to find the optimum.
+# OFF (default) or env CURING_ADAPT_CO=0 → today's schedule, bit-for-bit.
+CURING_ADAPT_CO_ENABLED    = False   # OFF: conflicts with the adopted dynamic buffer (substitutes)
+CURING_STARV_SWITCH_SHIFTS = 8
+# Feed guard: only switch a GENUINELY building-limited SKU (buildable < curing draw),
+# never one transiently starved because the buffer is busy elsewhere (which the buffer
+# will feed). Fixes the buffer↔CO conflict (−12.4k→0) AND improves CO-alone (+563).
+# ON by default so the 7k fallback (CURING_ADAPT_CO_ENABLED=True) uses the better path.
+CURING_ADAPT_FEED_GUARD_ENABLED = True
 
 CO_CLASS_B_THRESHOLD = 0.8
 # Class A threshold for curing CO urgency scoring.
@@ -248,7 +335,10 @@ GT_SHELF_LIFE_DAYS      = 3
 # GT cannot sit more than 3 days before curing (plant rule).
 # TopUp will not pre-build GT beyond this window.
 
-MAX_ENDOFDAY_GT_INVENTORY = 7000
+MAX_ENDOFDAY_GT_INVENTORY = int(os.environ.get("GT_CAP_MAX", "8000"))
+# Raised 7k→10k to let the dynamic GT buffer (below) fill the storage it needs for
+# the +20.6k coverage gain (buffer natural depth ~9.3k ≤ 10k, verified days-over=0).
+# This assumes the plant can hold ~10k GT overnight — a PLANT STORAGE decision.
 # Plant capacity constraint: total GT held in inventory at the END of any day
 # (summed over all SKUs, after curing + stale writeoff) cannot exceed this many
 # units. Enforced PROACTIVELY during building (never build past the ceiling) so
@@ -267,6 +357,48 @@ GT_BUFFER_SHIFTS        = 2
 # baseline is unchanged; test the recovery config with GT_BUF_VMI=3 GT_BUF_OTHER=2.
 GT_BUFFER_SHIFTS_VMI    = int(os.environ.get("GT_BUF_VMI",   "2"))
 GT_BUFFER_SHIFTS_OTHER  = int(os.environ.get("GT_BUF_OTHER", "1"))
+
+# ── Dynamic GT buffer (Phase 1, DYN_BUFFER) ──────────────────────────────────
+# When DYN_BUFFER_ENABLED, the flat GT_BUFFER_SHIFTS_* is replaced by a per-SKU,
+# per-shift buffer horizon H_s (shifts) computed from live curing draw, feeder
+# contention (away-time proxy) and starvation risk:
+#   H_s = clip( round( floor_g · (1 + ALPHA·Contention_s + BETA·RiskShort_s) ),
+#               floor_g, GT_SHELF_LIFE_SHIFTS )
+# floor_g = FLOOR_VMI for VMI-fed SKUs else FLOOR_OTHER (the old flat values act as
+# FLOORS). Buffer target B_s = draw_s · H_s. OFF (default) or env DYN_BUFFER=0 →
+# the flat per-group buffer, bit-for-bit. ALPHA/BETA tuned by the KPI sweep.
+DYN_BUFFER_ENABLED = True    # ADOPTED — the +20.6k lever (needs the 10k GT cap above)
+DYN_BUF_FLOOR_VMI   = 2
+DYN_BUF_FLOOR_OTHER = 1
+DYN_BUF_ALPHA       = 0.0    # contention term OFF — it over-buffered the press-tight month
+DYN_BUF_BETA        = 2.0    # risk-driven depth; natural GT peak ~9.3k, fits the 10k cap
+# GT-cap fairness: the dynamic buffer's overnight-carry excess is bounded by the 7k
+# end-of-day cap, but curing DRAINS GT during the day, so reserving the full entry
+# carry under-fills the legal storage. Credit this many shifts of total curing draw
+# back into the headroom so the buffer can fill the 7k (0 = fully conservative, the
+# old too-tight bound). The retest verifies end-of-day GT still never exceeds the cap.
+DYN_BUF_CURE_CREDIT = 1.0
+
+# ── Global scored building assignment (Phase 2, GLOBAL_SCORE_V2) ──────────────
+# Replaces the Phase-A(continuation)+Phase-B(_key ranking) two-pass ordering in
+# _assign_building_shift with ONE unified scored pass: every (machine,SKU) candidate
+# — INCLUDING each machine's current SKU folded in as the CO=0 continuation — is
+# scored by a single utility U and assigned best-first (no primary/secondary). U =
+# w_def·ñDeficit + w_starv·ñStarv + w_gap·ñGap + w_scarce·(1/feeders)·[starving]
+#   − w_co·ñCO_min − w_inch·ñInchPenalty − w_over·[gt≥draw·H]. Pull terms
+# (deficit/starv/gap) and push terms (CO/inch) are min-max normalized over the
+# candidate set; scarcity + over-buffer are structural indicators. Graded inch
+# penalty uses the machine's ranked dominant band. OFF (default) or env
+# GLOBAL_SCORE_V2=0 → the committed _key path, bit-for-bit. Weights tuned by sweep.
+GLOBAL_SCORE_V2 = False
+GS_W_DEF     = 1.0    # ñ this-shift (dynamic-buffer) deficit          (pull)
+GS_W_STARV   = 1.0    # ñ near-dry starvation 1/(gt/draw+eps)          (pull)
+GS_W_GAP     = 0.5    # ñ cumulative monthly unmet-demand gap          (pull)
+GS_W_SCARCE  = 1.0    # (1/|feeders_s|)·[s starving] sole-feeder bonus (pull)
+GS_W_CO      = 0.75   # ñ changeover minutes CO_min(m,s)               (push)
+GS_W_INCH    = 0.5    # ñ inch-band position InchPenalty(m,s)          (push)
+GS_W_OVER    = 1.0    # [gt ≥ draw·H_s] over-buffer indicator          (push)
+GS_INCH_OFFBAND = 5   # penalty added on top of band length for an off-band inch
 
 POOL_SIZE = 3
 # Max SKUs per building machine pool.

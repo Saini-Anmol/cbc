@@ -47,6 +47,7 @@ if (os.path.exists(_VENV_PY)
 
 # ── Import reusable machinery from existing building.py ───────────────────────
 import building as _bld
+from bc_config import PLAN_MONTH
 from building import (
     Config,
     ETL,
@@ -117,7 +118,7 @@ class B2C_ETL(ETL):
         """Load REAL opening GT inventory (not zeroed out as in CBC cold-start)."""
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual"
+            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
         )
 
 

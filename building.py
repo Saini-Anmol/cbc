@@ -58,6 +58,7 @@ warnings.filterwarnings("ignore")
 # DB credentials come from cbc_env (.env) — never hardcoded. If the helper or
 # .env is missing, fail loudly rather than fall back to a baked-in secret.
 from cbc_env import db_config as _cbc_db_config
+from bc_config import PLAN_MONTH
 _DB = _cbc_db_config()
 
 
@@ -306,14 +307,14 @@ class ETL:
         # return df
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual"
+            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
         )
 
     def load_carcass_inventory(self):
         try:
             return self._sql(
                 f"SELECT sizeCode AS SKUCode, CarcassInv AS Carcass_Inventory "
-                f"FROM {Config.DB_NAME}.carcass_inventory_manual"
+                f"FROM {Config.DB_NAME}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
             )
         except Exception:
             return pd.DataFrame(columns=["SKUCode","Carcass_Inventory"])
