@@ -25,6 +25,20 @@ from datetime import datetime
 import cbc_env
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ★ FEATURE TOGGLE — DELIVERY-DATE / PRIORITY-FLAG COMMITTED-DELIVERY SKUs ★
+#   Flip this ONE line to turn the committed-delivery feature ON/OFF for LOCAL runs.
+#   ON (default) is INERT unless the demand file carries a "Priority Flag" / "Delivery
+#   Date" column WITH data — so June and any non-priority file run bit-for-bit either
+#   way; only July/August (which carry the columns) are affected. Full detail + the
+#   sub-levers (DP_ACQUIRE / DP_RESERVE / DP_MOULDCAP / DP_PACE_MARGIN / DP_BLD, all env)
+#   live in §4 below and in b2c_pipeline.py / curing_consumption_dynamic.py.
+#   Env DELIVERY_PRIORITY=0 also forces it off. For the CLOUD path, flip the matching
+#   top toggle in main.py (CLOUD_CONFIG) instead — editing this file does not affect cloud.
+# ══════════════════════════════════════════════════════════════════════════════
+DELIVERY_PRIORITY_ENABLED             = (os.environ.get("DELIVERY_PRIORITY", "1") != "0")
+DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = (os.environ.get("DELIVERY_PRIORITY_UNDATED", "1") != "0")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1. PLAN HORIZON
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -425,6 +439,31 @@ CARCASS_SHELF_LIFE_DAYS = 1
 # OFF reproduces the current carcass schedule bit-for-bit.
 CARCASS_INV_ENABLED = (os.environ.get("CARCASS_INV", "1") != "0")   # ADOPTED (KPI-neutral realism)
 
+# ── Delivery-date / priority-flag committed-delivery SKUs (DELIVERY_PRIORITY) ──
+# Client feature: the demand file may carry two optional columns —
+#   "Priority Flag"  (values "0" / "1" / "Yes"; blank/NaN = not set), and
+#   "Delivery Date"  (string "DD/MM/YY"; optional).
+# A SKU becomes DELIVERY-COMMITTED when its flag is set OR it carries a valid
+# delivery date (a date implies commitment even if the flag reads "No"/"0"/blank).
+# Committed behaviour:
+#   • flag set, no date → SKU must be FULLY cured by the END OF THE PLAN MONTH;
+#   • with a date       → SKU must be FULLY cured ON/BEFORE that date.
+# Meeting these dates is MORE important than overall KPI (client accepts a KPI
+# drop). One shared, self-pacing deadline-urgency signal drives BOTH the Phase-0
+# curing-CO scheduler (acquire/hold presses, EDF order, never CO a committed press
+# away pre-deadline) AND building assignment (build its GT first) — curing is
+# derived from building, so both stages must be delivery-aware. Competing
+# commitments are resolved Earliest-Deadline-First (EDF); an infeasible SKU is
+# best-effort + reported (shortfall + earliest-feasible date), never a hard-stop.
+# Every edit is ORDERING-ONLY: the demand cap, historical inch-lock, mould
+# feasibility, GT shelf + end-of-day cap are untouched, and no machine↔SKU pair is
+# ever invented (DB-allowable + DB mould eligibility only).
+# Default ON but INERT (bit-for-bit) when no priority data is present (June, cloud
+# jkt_demand which has no such columns). Env DELIVERY_PRIORITY=0 forces identity
+# everywhere. See b2c_pipeline._build_priority_deadline_map.
+# >>> The master toggle DELIVERY_PRIORITY_ENABLED (+ DELIVERY_PRIORITY_UNDATED_TO_MONTHEND)
+#     is defined at the TOP of this file (★ FEATURE TOGGLE block) so it is easy to find/flip.
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. CURING SIMULATION  →  curing_b2c.py
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,6 +471,15 @@ CARCASS_INV_ENABLED = (os.environ.get("CARCASS_INV", "1") != "0")   # ADOPTED (K
 DEFAULT_CURING_CT = 17.0
 # Fallback cure cycle time (minutes) used when a SKU's CT is absent from
 # Master_Curing_Design_CycleTime. Typical PCR press CT is 15–20 min.
+
+CURING_PRESS_COUNT = 170
+# FIXED denominator for the curing capacity-utilisation KPI = number of curing
+# presses in the plant roster (Master_Curing_Allowable_Machines_source has 170).
+# Used for BOTH the daily rows in jkt_plan_capacityUtilisation and the monthly
+# curing figure in jkt_plan_kpis, so daily average == monthly. The live
+# running-moulds snapshot may hold a few extra presses than the roster; fixing
+# the denominator keeps the KPI stable and comparable across runs. Change this
+# one line when the curing-press roster changes.
 
 # ── Curing press changeover times ────────────────────────────────────────────
 # A curing press CO occupies 2 consecutive shifts:

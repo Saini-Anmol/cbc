@@ -118,6 +118,21 @@ _SURPLUS_PER_SKU_PER_DAY  = int(os.environ.get("SURPLUS_PER_DAY", "2"))
 # shift-by-shift mould contention). Must A/B — may move KPI either way.
 _P0_MOULD_GATE = os.environ.get("P0_MOULD_GATE", "0") != "0"
 
+# DELIVERY_PRIORITY Phase-0 sub-levers (bisection A/B; all default ON when the feature is
+# active). DP_ACQUIRE=0 → drop the EDF ordering + deadline Class-A + deadline RI-skip (stop
+# forcing committed presses to be acquired). DP_RESERVE=0 → drop the "never CO a committed
+# press away pre-deadline" guards. DP_MOULDCAP=1 → cap committed-SKU acquisition at its
+# mould-pair count (needs sku_moulds). Used only when priority_deadline_map is non-empty.
+_DP_ACQUIRE  = os.environ.get("DP_ACQUIRE", "1") != "0"
+_DP_RESERVE  = os.environ.get("DP_RESERVE", "1") != "0"
+_DP_MOULDCAP = os.environ.get("DP_MOULDCAP", "1") != "0"
+# Acquisition pacing margin: a committed SKU targets (JIT-needed presses + margin), bounded by
+# its mould-pair cap. margin=0 = pure just-in-time (fewest presses that finish by the deadline —
+# most KPI-efficient, least slack); a large margin = fill to the mould-pair cap (max delivery
+# insurance, most collateral). Default 99 = "fill to the mould cap" (client priority: deliver
+# on date). Swept per month; env DP_PACE_MARGIN overrides.
+_DP_PACE_MARGIN = int(os.environ.get("DP_PACE_MARGIN", "99"))
+
 # #3 Press-swap hysteresis (SURPLUS_HYST, default OFF = current surplus-release bit-for-bit).
 # P1 (month-end CO-cost awareness): don't RELEASE surplus presses in the last SURPLUS_P1_DAYS
 # days — a swap loses a full 480-min shift + a mould reset and can't be amortized that late
@@ -198,6 +213,7 @@ def _urgency_sort_key(
     updated_demand: float,
     rate_per_day: float,
     horizon_left: int,
+    deadline_days: float | None = None,
 ) -> tuple:
     """
     Two-level urgency sort key (sort ascending = highest urgency first).
@@ -208,6 +224,13 @@ def _urgency_sort_key(
         Demand can be met with existing presses.
 
     Within class: highest Priority_Score first, then fewest after-CO days.
+
+    deadline_days (DELIVERY_PRIORITY): a committed-delivery SKU is measured against
+    its OWN (nearer) deadline, not the whole horizon — so it flips to Class A exactly
+    when its current presses can't finish by its date, and drops back once enough
+    presses are on it (self-pacing acquisition). None (every non-priority caller) →
+    the horizon test, byte-identical. The returned tuple shape is UNCHANGED so every
+    caller (and downstream sort) behaves exactly as before.
     """
     if current_press_count <= 0 or rate_per_day <= 0:
         current_days = float("inf")
@@ -219,7 +242,8 @@ def _urgency_sort_key(
     else:
         after_days = float("inf")
 
-    cls = 0 if current_days > horizon_left * CO_CLASS_B_THRESHOLD else 1
+    _h = horizon_left if deadline_days is None else min(horizon_left, deadline_days)
+    cls = 0 if current_days > _h * CO_CLASS_B_THRESHOLD else 1
     return (cls, -priority_score, after_days)
 
 
@@ -257,6 +281,7 @@ class COScheduler:
         sku_inch: dict | None = None,
         building_inch_capacity: dict | None = None,
         sku_moulds: dict | None = None,          # #4: {sku: set(eligible mould IDs)} or None
+        priority_deadline_map: dict | None = None,  # DELIVERY_PRIORITY: {sku: deadline_day} or None
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -277,6 +302,43 @@ class COScheduler:
         press_to_sku: dict[str, str] = {}
         for _, r in df_running_moulds.iterrows():
             press_to_sku[str(r["Machine"])] = str(r["SKUCode"])
+
+        # ── DELIVERY_PRIORITY: committed-delivery deadlines (Phase-0 EDF + reservation) ──
+        # Empty map → _prio_on False → every insertion below is identity (bit-for-bit).
+        _pdm: dict = {str(k): int(v) for k, v in (priority_deadline_map or {}).items()}
+        _prio_on  = bool(_pdm)
+        _prio_acq = _prio_on and _DP_ACQUIRE     # force acquisition (EDF + deadline Class-A)?
+        _prio_res = _prio_on and _DP_RESERVE     # reserve committed presses pre-deadline?
+        # Mould-pair ceiling: a committed SKU cannot cure on more concurrent presses than it
+        # has mould pairs (2 moulds/press). Forcing acquisition beyond that only churns COs
+        # and steals presses from other SKUs (those extra presses can never get moulds). None
+        # → no cap (older behaviour). Computed from the eligibility passed in for the P0 gate.
+        _prio_cap: dict = {}
+        if _prio_on and _DP_MOULDCAP and sku_moulds:
+            for _s in _pdm:
+                _prio_cap[_s] = len(sku_moulds.get(_s, ()) or ()) // 2
+        def _dd_days(sku: str, day: int):
+            dd = _pdm.get(sku)
+            return None if dd is None else max(1, dd - day + 1)   # shifts→days to this SKU's deadline
+        def _prio_target_presses(sku: str, day: int) -> int:
+            """How many concurrent presses this committed SKU should hold TODAY: the fewest
+            that still finish its remaining demand by its deadline at the current rate
+            (JIT pacing — don't front-load capacity earlier than the deadline requires),
+            bounded by its mould-pair ceiling (extra presses can never get moulds)."""
+            _rate = _qty_per_press_per_day(ct_map.get(sku, _dct))
+            _rem  = updated_demand.get(sku, 0.0)
+            _ddl  = max(1, _pdm[sku] - day + 1)
+            _need = 1
+            if _rate > 0 and _rem > 0:
+                _need = max(1, math.ceil(_rem / (_rate * _ddl)))
+            _need += _DP_PACE_MARGIN           # slack against build-lag / mould-contention / CO time
+            _cap = _prio_cap.get(sku)          # mould-pair ceiling (None/0 = unknown → no cap)
+            return min(_cap, _need) if _cap else _need
+        def _prio_wants(sku: str, day: int) -> bool:
+            """A committed SKU still needs another press today? (below its JIT pace target)."""
+            if sku not in _pdm:
+                return False
+            return press_count.get(sku, 0) < _prio_target_presses(sku, day)
 
         # ── #4 Mould-aware Phase-0: day-granularity free-mould tracker (mirrors the
         # rolling gate's Day-0 seed). A CO target is mountable only if the press can
@@ -565,6 +627,11 @@ class COScheduler:
                         if _n_alt(p) == 0:
                             continue                     # nowhere better → leave it put
                         _old = press_to_sku.get(p, "")
+                        # DELIVERY_PRIORITY: never release a committed-delivery press pre-deadline
+                        # (same reservation as the global-pairing donor guard). Identity when off.
+                        if (_prio_res and _old in _pdm
+                                and updated_demand.get(_old, 0) > 0 and day <= _pdm[_old]):
+                            continue
                         if _old in ri_skus:              # n-1 RI-protection on the donor inch
                             _nold   = press_count.get(_old, 0) - 1
                             _remold = updated_demand.get(_old, 0.0)
@@ -599,6 +666,14 @@ class COScheduler:
                         if p in _assigned:
                             continue
                         old_sku = press_to_sku.get(p, "")
+                        # DELIVERY_PRIORITY reservation: a press running a committed SKU is
+                        # NEVER CO'd away while that SKU still has demand and its deadline has
+                        # not passed — the committed SKU's GT feed must not wobble. Stricter
+                        # than the n-1 RI-protection below (protects the whole press, not just
+                        # when n-1 can't cover). Inactive/empty map → skipped (identity).
+                        if (_prio_res and old_sku in _pdm
+                                and updated_demand.get(old_sku, 0) > 0 and day <= _pdm[old_sku]):
+                            continue
                         for target in press_to_demand_targets.get(p, []):
                             if target == old_sku:
                                 continue
@@ -613,7 +688,15 @@ class COScheduler:
                                 pass
                             elif is_ri and n_t > 0:
                                 cur_days = rem / (n_t * rate_t) if rate_t > 0 else float("inf")
-                                if cur_days <= horizon_left:
+                                # A committed target is "on track" only vs its OWN (nearer)
+                                # deadline, so we keep acquiring presses for a priority SKU that
+                                # is fine for month-end but behind for its earlier date.
+                                _rihz = horizon_left
+                                _ddt = (_dd_days(target, day)
+                                        if (_prio_acq and _prio_wants(target, day)) else None)
+                                if _ddt is not None:
+                                    _rihz = min(horizon_left, _ddt)
+                                if cur_days <= _rihz:
                                     continue   # RI already on track
                             else:
                                 continue
@@ -637,7 +720,9 @@ class COScheduler:
                             key0 = _urgency_sort_key(
                                 priority_score=_priority_signal(target, p),
                                 current_press_count=n_t, updated_demand=rem,
-                                rate_per_day=rate_t, horizon_left=horizon_left)
+                                rate_per_day=rate_t, horizon_left=horizon_left,
+                                deadline_days=(_dd_days(target, day)
+                                               if (_prio_acq and _prio_wants(target, day)) else None))
                             _pairs.append((p, target, old_sku, key0))
                             _flex_p[p] = _flex_p.get(p, 0) + 1
                             _flex_t[target] = _flex_t.get(target, 0) + 1
@@ -672,10 +757,22 @@ class COScheduler:
                         _tail = (pr[3][1], pr[3][2],                # -priority, after_days
                                  ct_map.get(pr[1], _dct), pr[0], pr[1])
                         if _SAME_INCH_FIRST and _SAME_INCH_RANK == "top":
-                            return (_si, _cls, _con, _sup, *_tail)  # same-inch beats everything
-                        if _SAME_INCH_FIRST:
-                            return (_cls, _si, _con, _sup, *_tail)  # "safe": Class-A first, then same-inch
-                        return (_cls, _con, _sup, _si, *_tail)      # OFF: current order (same-inch 4th)
+                            _base = (_si, _cls, _con, _sup, *_tail)  # same-inch beats everything
+                        elif _SAME_INCH_FIRST:
+                            _base = (_cls, _si, _con, _sup, *_tail)  # "safe": Class-A first, then same-inch
+                        else:
+                            _base = (_cls, _con, _sup, _si, *_tail)  # OFF: current order (same-inch 4th)
+                        if not _prio_acq:
+                            return _base
+                        # DELIVERY_PRIORITY: committed targets fire FIRST, EARLIEST-DEADLINE-FIRST.
+                        # (1,0.0) is the identical constant for every pair when no committed target
+                        # is in the candidate set → order-preserving; a committed target still BELOW
+                        # its mould-pair cap gets (0,dd) so it wins, smaller deadline-day first = EDF.
+                        _dd = _pdm.get(pr[1])
+                        _pk = ((0, float(_dd)) if (_dd is not None
+                                                   and updated_demand.get(pr[1], 0) > 0
+                                                   and _prio_wants(pr[1], day)) else (1, 0.0))
+                        return (_pk, *_base)
                     best = min(_cand, key=_cokey)
                     p, new_sku, old_sku, _ = best
                     co_events.append(
@@ -1641,6 +1738,7 @@ def run_dynamic_consumption(
     buildable_rate: dict | None = None,
     sku_inch: dict | None = None,
     building_inch_capacity: dict | None = None,
+    priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1790,8 +1888,10 @@ def run_dynamic_consumption(
     print("\n  [Pass 1] Computing CO schedule …")
     scheduler = COScheduler()
     # #4: mould eligibility for the Phase-0 mould-aware gate (same source as the rolling gate).
+    # Also loaded when DELIVERY_PRIORITY is active (the mould-pair cap needs it) even if the
+    # P0 gate itself is off.
     _p0_sku_moulds = None
-    if _P0_MOULD_GATE:
+    if _P0_MOULD_GATE or (priority_deadline_map and _DP_MOULDCAP):
         try:
             _p0_sku_moulds = {k: set(v) for k, v in
                               etl.load_mould_eligibility()["sku_moulds"].items()}
@@ -1805,6 +1905,7 @@ def run_dynamic_consumption(
         sku_inch=sku_inch,
         building_inch_capacity=building_inch_capacity,
         sku_moulds=_p0_sku_moulds,
+        priority_deadline_map=priority_deadline_map,
     )
 
     # Pass 2: 31-day simulation

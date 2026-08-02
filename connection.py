@@ -316,6 +316,16 @@ def write_db(engine, plan_id: str, result: dict,
     u_bj     = _group_occ("BJ")
     u_uni    = _group_occ("UNI_NARROW")     # "US machines"
 
+    # Keep the monthly curing KPI consistent with the daily rows: both use the
+    # fixed CURING_PRESS_COUNT denominator (bc_config), and every day has the same
+    # available press-minutes, so the monthly curing figure == mean of the daily
+    # curing utils. Falls back to the Machine-Utilization occupancy if the engine
+    # did not emit the daily series.
+    _daily_series = result.get("daily_capacity_util") or []
+    if _daily_series:
+        u_curing = round(sum(float(r["capacityUtilisation"]) for r in _daily_series)
+                         / len(_daily_series), 2)
+
     kpis = pd.DataFrame([{
         "plan_id":                          plan_id,
         "demandFulfillment":                round(float(result.get("demand_coverage", 0.0)), 2),
@@ -336,39 +346,28 @@ def write_db(engine, plan_id: str, result: dict,
         "createdBy":                        created_by,
     }])
 
-    # ── capacity utilisation — DAILY: 30-31 rows per plan (composite PK
-    # plan_id+date). Curing daily util = (production + mould-clean + CO) /
-    # available press-minutes that day (client requirement); building group
-    # utils = (production + CO)/available. Computed in the engine
-    # (result["daily_capacity_util"]) so the daily rows aggregate exactly to the
-    # monthly occupancy stored in jkt_plan_kpis. Falls back to the single
+    # ── capacity utilisation — DAILY curing only: 30-31 rows per plan (composite
+    # PK plan_id+date). One value per day = average curing-press utilisation =
+    # (production + mould-clean + CO) / (CURING_PRESS_COUNT × 1440) that day.
+    # Building-group utils live monthly in jkt_plan_kpis (not repeated per day).
+    # From the engine (result["daily_capacity_util"]) so the daily rows aggregate
+    # to the monthly curing figure in jkt_plan_kpis. Falls back to the single
     # monthly row if the engine did not emit the daily series (back-compat).
-    _cap_cols = ["capacityUtilisation", "building_capacityUtilisation",
-                 "building_s2_capacityUtilisation", "stage1_capacityUtilisation",
-                 "vmi_capacityUtilisation", "bj_capacityUtilisation",
-                 "uniNarrow_capacityUtilisation"]
-    _daily = result.get("daily_capacity_util") or []
-    if _daily:
+    if _daily_series:
         cap = pd.DataFrame([{
-            "plan_id":   plan_id,
-            "date":      pd.to_datetime(row["date"]).date(),
-            **{c: row.get(c) for c in _cap_cols},
-            "createdAt": now,
-            "createdBy": created_by,
-        } for row in _daily])
+            "plan_id":             plan_id,
+            "date":                pd.to_datetime(row["date"]).date(),
+            "capacityUtilisation": row.get("capacityUtilisation"),
+            "createdAt":           now,
+            "createdBy":           created_by,
+        } for row in _daily_series])
     else:
         cap = pd.DataFrame([{
-            "plan_id":                          plan_id,
-            "date":                             pd.to_datetime(bs["Date"]).min().date(),
-            "capacityUtilisation":              u_curing,
-            "building_capacityUtilisation":     u_build,
-            "building_s2_capacityUtilisation":  u_s2,
-            "stage1_capacityUtilisation":       u_s1,
-            "vmi_capacityUtilisation":          u_vmi,
-            "bj_capacityUtilisation":           u_bj,
-            "uniNarrow_capacityUtilisation":    u_uni,
-            "createdAt":                        now,
-            "createdBy":                        created_by,
+            "plan_id":             plan_id,
+            "date":                pd.to_datetime(bs["Date"]).min().date(),
+            "capacityUtilisation": u_curing,
+            "createdAt":           now,
+            "createdBy":           created_by,
         }])
 
     # ── write (unique plan_id per run; overwrite makes re-runs idempotent) ─

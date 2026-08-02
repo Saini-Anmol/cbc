@@ -20,6 +20,16 @@ import tempfile
 import traceback
 
 # ══════════════════════════════════════════════════════════════════════════
+# ★ FEATURE TOGGLE (CLOUD) — DELIVERY-DATE / PRIORITY-FLAG COMMITTED-DELIVERY ★
+#   Flip this ONE line to turn the committed-delivery feature ON/OFF for the CLOUD
+#   path (it is pinned into CLOUD_CONFIG below). ON is INERT until jkt_demand carries
+#   `priorityFlag` / `deliveryDate` columns AND connection.read_db selects them, so
+#   today it is safely ON with no effect on cloud output. The LOCAL toggle is the
+#   matching ★ block at the top of bc_config.py.
+# ══════════════════════════════════════════════════════════════════════════
+DELIVERY_PRIORITY = True
+
+# ══════════════════════════════════════════════════════════════════════════
 # CLOUD CONFIG PIN — production values frozen for the cloud path.
 #
 # These are written onto bc_config BEFORE the engine imports them, so editing
@@ -72,10 +82,18 @@ CLOUD_CONFIG: dict = {
     "INCH_HIST_LOCK_MAX_INCHES":              3,
     "INCH_HIST_LOCK_STAGE1":                  False,  # S1 stays demand-optimal (carcass-FEASIBLE)
     "FIXED_ESCAPE_ENABLED":                   False,  # Lever B REJECTED (−2,572 net, 3 mo) — kept off
+    # ── Delivery-date / priority-flag committed-delivery SKUs (top ★ toggle) ──
+    # INERT on cloud until jkt_demand carries priorityFlag/deliveryDate + read_db selects
+    # them. Sub-levers (DP_ACQUIRE/DP_RESERVE/DP_MOULDCAP/DP_PACE_MARGIN/DP_BLD) are
+    # module-level env defaults in the engine (adopted "full mould-cap") — see the NOTE below.
+    "DELIVERY_PRIORITY_ENABLED":              DELIVERY_PRIORITY,
+    "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND":  True,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
     "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)
     "CURING_CO_DURATION_SHIFTS":              1,
+    # ── Curing capacity-utilisation KPI denominator (fixed plant roster) ──
+    "CURING_PRESS_COUNT":                     170,    # daily+monthly curing util denominator
 }
 # NOTE: the b2c_pipeline behaviour toggles (IUkeep `_IDLE_UNMET_ENABLED`/`_IDLE_UNMET_KEEP_GATE`,
 # mould gate, CO scorer, inch rules, mould-clean, mould-life-v2 — all pinned ON in the engine

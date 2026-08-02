@@ -264,6 +264,42 @@ stuck mould. Two modes (`MOULD_OPT_MODE`): `ro_only` (only sacrifice demand-done
   already allocate near the ceiling. More moulds/presses (a capacity decision) is the only lever
   left there, not smarter allocation. Toggle left in the code, OFF, for the record.
 
+### 7. Delivery-date / priority-flag committed-delivery SKUs — LIVE (`DELIVERY_PRIORITY`, default ON, INERT w/o data)
+
+Client feature. Two OPTIONAL demand columns — **`Priority Flag`** (`0`/`1`/`Yes`) and
+**`Delivery Date`** (`DD/MM/YY`) — make a SKU **delivery-committed**: it must be fully **cured** by
+its date (or by END OF MONTH if flagged with no date). **A valid date forces commitment even when
+the flag reads No/0/blank.** Client rule: **meeting the date > overall KPI** (KPI drop accepted).
+- **Parse** (`b2c_pipeline._build_priority_deadline_map`): normalized headers (July `Delivery Date`
+  vs Aug `Delivery date`), string flag; consolidated per SKU (earliest date = EDF); → `{sku:
+  deadline_day}`. Absent/empty columns (June, cloud `jkt_demand`) → **inert, bit-for-bit baseline**.
+- **One shared self-pacing signal drives BOTH stages** (curing is derived from building, so a
+  committed SKU needs presses AND its GT built in time). **Phase-0** (`curing_consumption_dynamic`):
+  committed targets fire FIRST **EARLIEST-DEADLINE-FIRST** (`_cokey` prepend), forced Class-A vs
+  their OWN deadline, presses reserved pre-deadline; acquisition **capped at the SKU's mould-pair
+  count** (`DP_MOULDCAP`, essential — extra presses can't get moulds) with a pacing margin
+  (`DP_PACE_MARGIN=99` = fill to the cap = **adopted "full mould-cap" = max delivery**; `0` = JIT =
+  half the collateral but under-delivers). **Building** (`_assign_building_shift._bld_prio`): a
+  behind committed SKU is built first (EDF) in `_key`/Phase-A seed/Phase-C, and bypasses the
+  Phase-C starvation-risk gate — bounded by the 3-day shelf + GT cap + demand cap (no overbuild).
+- **All edits ORDERING-ONLY**: demand cap, historical inch-lock, mould feasibility, GT shelf/cap
+  untouched; **no invented machine↔SKU pairs (DB-allowable + DB moulds only)**.
+- **Feasibility pre-check + report**: a "PRIORITY FULFILLMENT" terminal table + `res["priority_report"]`
+  gives per-SKU demand / deadline / cured-by-deadline / shortfall / **earliest-feasible date**
+  (best-effort + relax-report for the physically un-meetable ones).
+- **Sub-toggles** (bisected; all default the adopted config): `DP_ACQUIRE` (Phase-0 forcing),
+  `DP_RESERVE` (press hold — measured a NO-OP, kept as a safety guard), `DP_MOULDCAP`,
+  `DP_PACE_MARGIN`, `DP_BLD` (building boost). `DELIVERY_PRIORITY=0` forces the whole feature off.
+
+**KPIs (deterministic 2-seed, mould-audit PASS, demand-cap 0-over):** June ON==OFF=634,086 (inert).
+July 672,696→**671,324 (−1,372)** — HTORE (d20) 0→1,360 **INFEASIBLE (1 allowable press)**, HURL4
+~unchanged. Aug 649,334→**638,594 (−10,740)** — QRAT0 (d19) 915→**1,540 met**, VRHE1 (d15)
+3,884→5,023 (10 shared moulds contended, can't hit 9,900), HRHB0 (d11) 616→1,364 **INFEASIBLE (1
+mould-pair)**, HRHP0 (d27) 1,000→896 (−104 EDF contention, accepted). **Collateral ≈4 units lost
+per committed unit pulled earlier = shared-mould contention (a hard capacity limit, not
+misallocation).** Phase-0-alone (no building coupling) HURTS. Cloud follow-up (non-blocking): add
+`priorityFlag`/`deliveryDate` to `jkt_demand` + `connection.py:read_db` SELECT.
+
 ---
 
 ## Curing press physical facts & changeover timing rule

@@ -63,6 +63,7 @@ from bc_config import (
     MOULD_CLEAN_CYCLES,
     MOULD_CLEAN_MINS,
     CURING_CO_CHANGEOVER_MINS,
+    CURING_PRESS_COUNT,
     MAX_CHANGEOVERS_PER_DAY,
     VMI_JIT_MARGIN,
     VMI_MAX_DIFF_CO_PER_DAY,
@@ -754,6 +755,20 @@ _FIXED_MACHS_HIST: frozenset = frozenset(
 # diff-size CO, only after its own inch demand is done, to a DB-allowable scarce inch.
 _FIXED_ESCAPE_ENABLED = bool(getattr(_bc_cfg, "FIXED_ESCAPE_ENABLED", False))
 _FIXED_ESCAPE_MAX_COS = int(getattr(_bc_cfg, "FIXED_ESCAPE_MAX_COS", 1))
+
+# Delivery-date / priority-flag committed-delivery SKUs (DELIVERY_PRIORITY). Master
+# toggle mirrors bc_config; the per-run active flag is DELIVERY_PRIORITY_ENABLED AND
+# a non-empty priority_deadline_map (built from the demand file). When inactive every
+# priority insertion collapses to identity → bit-for-bit baseline. See the feature
+# block in bc_config.py and _build_priority_deadline_map below. Env DELIVERY_PRIORITY=0
+# forces OFF everywhere.
+_DELIVERY_PRIORITY_ENABLED = bool(getattr(_bc_cfg, "DELIVERY_PRIORITY_ENABLED", True))
+_DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = bool(
+    getattr(_bc_cfg, "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND", True))
+# Building-side committed-delivery boost sub-toggle (bisection A/B; default ON). DP_BLD=0
+# drops the _bld_prio building boost + Phase-C risk-gate bypass, leaving only the Phase-0
+# CO levers. Used only when priority_deadline_map is non-empty.
+_DP_BLD = os.environ.get("DP_BLD", "1") != "0"
 # Lever A (FLEX_SCARCE_INCH, ADOPTED — default ON): among a FLEXIBLE machine's allowed
 # inches, prefer the SCARCEST (biggest live curing-draw shortfall) over same-inch
 # stickiness, so flex capacity feeds about-to-starve scarce inches (15"/13") the fixed
@@ -1775,7 +1790,11 @@ def _daily_capacity_util(cure_shift_rows: list, bld_shift_rows: list,
             except Exception:
                 pass
     n_press    = len(press_stats)
-    cure_avail = n_press * DAY_AVAIL_PER
+    # Denominator is the FIXED plant roster (CURING_PRESS_COUNT), NOT the count of
+    # presses actually simulated (len(press_stats), which tracks the running-moulds
+    # snapshot and can drift). Keeps the daily/monthly curing KPI stable and
+    # comparable across runs; change the roster size in bc_config.CURING_PRESS_COUNT.
+    cure_avail = CURING_PRESS_COUNT * DAY_AVAIL_PER
 
     # ── building: production (Qty × CT) + CO per day per group ──
     bld = defaultdict(lambda: defaultdict(lambda: {"prod": 0.0, "co": 0.0}))
@@ -1990,6 +2009,8 @@ def _select_dynamic_co_target(
     gt_inventory: dict,
     horizon_left: int,
     already_targeted: set,
+    priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
+    day: int = 0,
 ) -> "str | None":
     """Select the best curing CO target when a press finishes its SKU demand mid-plan.
 
@@ -2000,7 +2021,14 @@ def _select_dynamic_co_target(
     Within class: fewest after-CO days → highest priority score → most GT in inventory.
     `already_targeted` prevents multiple dynamic COs going to the same new SKU in
     the same shift.
+
+    DELIVERY_PRIORITY: when priority_deadline_map is non-empty, a committed target is
+    ranked FIRST (EARLIEST-DEADLINE-FIRST) and is measured against its OWN deadline for
+    the Class-A test (so a behind-schedule committed SKU fires even before GT is banked —
+    the building side co-directs its GT). Empty/None → byte-identical to before.
     """
+    _pdm = priority_deadline_map or {}
+    _prio_on = bool(_pdm)
     candidates = []
     for sku, rem in demand_remaining.items():
         if rem <= 0 or sku == old_sku or sku in already_targeted:
@@ -2011,8 +2039,10 @@ def _select_dynamic_co_target(
         if rate <= 0:
             continue
         current_days = rem / (n * rate) if n > 0 else float("inf")
+        _dd = _pdm.get(sku) if _prio_on else None
+        _h  = horizon_left if _dd is None else min(horizon_left, max(1, _dd - day + 1))
         # Class A = cannot meet demand without this press; Class B = helpful but not critical.
-        urgency_class = 0 if current_days > horizon_left else 1
+        urgency_class = 0 if current_days > _h else 1
         # Class B allowed only if GT inventory already covers ≥ 1 shift of curing.
         # Without this guard, a Class B press starts curing next shift but finds zero GT
         # (building never pre-built for it) → starvation event instead of production.
@@ -2025,11 +2055,15 @@ def _select_dynamic_co_target(
         after_days = rem / ((n + 1) * rate)
         prio       = priority_score_map.get(sku, 0.0)
         gt_signal  = min(gt_inv, rate)  # cap at 1 day's rate
-        candidates.append((urgency_class, after_days, -prio, -gt_signal, sku))
+        if _prio_on:
+            _pk = (0, float(_dd)) if _dd is not None else (1, 0.0)   # committed first, EDF
+            candidates.append((_pk, urgency_class, after_days, -prio, -gt_signal, sku))
+        else:
+            candidates.append((urgency_class, after_days, -prio, -gt_signal, sku))
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][4]
+    return candidates[0][-1]
 
 
 def _select_ratio_co_target(
@@ -2443,6 +2477,7 @@ def _assign_building_shift(
     machine_locked_inches: dict | None = None,   # Part 1: {machine: set(allowed inches)} or None
     machine_day_diff_co: dict | None = None,     # Part 2: {machine: #diff-size COs done today}
     fixed_escape_used: dict | None = None,       # Lever B: {machine: #escape diff-COs spent}
+    priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -2597,6 +2632,25 @@ def _assign_building_shift(
     # forward buffer adds NET overnight carry, so we bound entry_carry + forward ≤ 10k.
     _entry_carry_gt = sum(v for v in gt_inventory.values() if v > 0)
 
+    # ── DELIVERY_PRIORITY: committed-delivery building boost (EDF, behind-only) ──
+    # A committed SKU that still needs GT built (demand_remaining > projected_gt) is
+    # ranked FIRST among a machine's eligible pairs, earliest-deadline-first — so the
+    # machine builds its GT ahead of its deadline. The boost operates ONLY within the
+    # already inch-locked / demand-capped candidate set (it re-orders, never widens),
+    # and drops to the identity constant (1,0.0) once the SKU is caught up or off the
+    # map → OFF/empty = bit-for-bit baseline. Reads projected_gt live so it stops
+    # boosting a SKU already filled this shift (never overbuilds past the cap).
+    _pdm_bld: dict = {str(k): int(v) for k, v in (priority_deadline_map or {}).items()}
+    _prio_on_bld = _DELIVERY_PRIORITY_ENABLED and _DP_BLD and bool(_pdm_bld)
+    def _bld_prio(sku: str) -> tuple:
+        if not _prio_on_bld:
+            return (1, 0.0)
+        dd = _pdm_bld.get(sku)
+        if dd is None:
+            return (1, 0.0)
+        behind = demand_remaining.get(sku, 0.0) - projected_gt.get(sku, 0.0)
+        return (0, float(dd)) if behind > 0 else (1, 0.0)
+
     if _GLOBAL_ASSIGN_ENABLED:
         # ══ Global machine-SKU scoring assignment (supersedes per-machine greedy) ══
         # Phase A: each machine continues its current SKU (no CO). Phase B: all
@@ -2740,7 +2794,10 @@ def _assign_building_shift(
                 cands = [x for x in eligible if _defc(x, buf) > 0
                          and not _fixed_esc_block(m, sku_inch.get(x, ""), "")]
                 if cands:
+                    # DELIVERY_PRIORITY: a behind committed SKU seeds an empty machine first
+                    # (EDF), still dom-inch-filtered. (1,0.0) constant when off → identity.
                     cur = min(cands, key=lambda x: (
+                        _bld_prio(x),
                         0 if sku_inch.get(x, "") == dom else 1,
                         *_tierg(x, m, _defc(x, buf)), x))
                     s["cur_sku"] = cur
@@ -3009,7 +3066,10 @@ def _assign_building_shift(
                 return (inch_penalty, constraint, tier, primary, cost, m, sku)  # "above"
 
             if not _pick_done:
-                m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = min(pairs, key=_key)
+                # DELIVERY_PRIORITY: prepend the committed-delivery EDF rank so a behind
+                # committed SKU wins its eligible machines first. Identity when inactive.
+                _key_sel = _key if not _prio_on_bld else (lambda p: (_bld_prio(p[1]), *_key(p)))
+                m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = min(pairs, key=_key_sel)
                 s = stg[m]
             # T2 departure gate: before rotating away from cur, ensure cur holds its round-trip cushion
             # (eff_buf). If short by ≥ a campaign, top cur up toward eff_buf and DEFER the rotation
@@ -3160,7 +3220,14 @@ def _assign_building_shift(
                                         and demand_remaining.get(sku, 0.0) > 0
                                         and _urgency_score(sku, demand_remaining, press_count,
                                                            cure_ct_map, days_left) == 0)
-                        if (not _bld_limited
+                        # DELIVERY_PRIORITY: a behind committed SKU bypasses the starvation-risk
+                        # gate so idle capacity banks its GT AHEAD of the deadline even when it
+                        # isn't about to run dry this shift. Still bounded by the shelf-safe target
+                        # (draw·9), the end-of-day GT cap, and the demand cap → no overbuild.
+                        _prio_behind = (_prio_on_bld and _pdm_bld.get(sku) is not None
+                                        and (demand_remaining.get(sku, 0.0)
+                                             - projected_gt.get(sku, 0.0)) > 0)
+                        if (not _bld_limited and not _prio_behind
                                 and (not _IDLE_UNMET_ENABLED or _IDLE_UNMET_KEEP_GATE)
                                 and _FWD_RISK_SHIFTS > 0
                                 and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
@@ -3211,7 +3278,10 @@ def _assign_building_shift(
                         room = target - projected_gt.get(sku, 0.0)
                         if room <= 0:
                             continue
-                        key = (# Lever C: under the inch rules, keep the machine on its
+                        key = (# DELIVERY_PRIORITY: a behind committed SKU is pre-built first
+                               # (EDF). (1,0.0) constant when inactive → order-preserving.
+                               _bld_prio(sku),
+                               # Lever C: under the inch rules, keep the machine on its
                                # CURRENT inch first — only move to another in-band inch when
                                # no current-inch SKU is starving (i.e. move only for starvation).
                                (0 if to_inch == cur_inch else 1) if _INCH_RULES_ENABLED else 0,
@@ -4533,6 +4603,159 @@ def _build_sku_desc_map(demand_path: str) -> dict:
     return out
 
 
+def _build_priority_deadline_map(demand_path: str, plan_start, planning_days: int):
+    """Parse the optional committed-delivery columns from the demand file.
+
+    Columns (header-normalized, so "Delivery Date"/"Delivery date"/"delivery_date"
+    all match; values are strings): "Priority Flag" ("0"/"1"/"Yes") and
+    "Delivery Date" ("DD/MM/YY"). A SKU is DELIVERY-COMMITTED when its flag is set
+    (``str.lower() in {"1","yes"}``) OR it carries a valid delivery date — a date
+    implies commitment even if the flag reads "No"/"0"/blank (client rule).
+
+    Returns ``(priority_deadline_map, priority_meta)`` where
+      • ``priority_deadline_map`` = ``{sku: deadline_day_index}`` (1-based within the
+        horizon) for committed SKUs only — the single structure threaded through the
+        pipeline; and
+      • ``priority_meta`` = ``{sku: {demand, deadline_date, deadline_day, undated,
+        past_start, beyond_month}}`` for the feasibility report.
+
+    A committed SKU with no date maps to ``planning_days`` (end of month) when
+    ``DELIVERY_PRIORITY_UNDATED_TO_MONTHEND`` is on. A date before the plan start
+    clamps to day 1 (``past_start``); a date beyond month-end clamps to
+    ``planning_days`` (``beyond_month``). Any read/parse failure → ``({}, {})`` so the
+    feature is simply inert (never breaks a run). Non-committed SKUs are absent from
+    both maps → treated as normal everywhere (identity)."""
+    empty: tuple[dict, dict] = ({}, {})
+    if not getattr(_bc_cfg, "DELIVERY_PRIORITY_ENABLED", True):
+        return empty
+    try:
+        df = (pd.read_csv(demand_path) if str(demand_path).lower().endswith(".csv")
+              else pd.read_excel(demand_path))
+    except Exception:
+        return empty
+    low = {str(c).strip().lower().replace("_", " "): c for c in df.columns}
+    def _find(cands):
+        for c in cands:
+            if c in low:
+                return low[c]
+        return None
+    sku_c  = _find(["skucode", "sku code", "sapcode", "sku"])
+    flag_c = _find(["priority flag", "priorityflag", "priority"])
+    date_c = _find(["delivery date", "deliverydate"])
+    qty_c  = _find(["requirement", "updated requirement", "quantity", "qty", "demand"])
+    if sku_c is None or (flag_c is None and date_c is None):
+        return empty  # no committed-delivery columns at all → inert
+
+    def _flag_set(v) -> bool:
+        if pd.isna(v):
+            return False
+        return str(v).strip().lower() in {"1", "1.0", "yes", "y", "true"}
+
+    def _parse_date(v):
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return None
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return pd.Timestamp(v)
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return None
+        d = pd.to_datetime(s, format="%d/%m/%y", errors="coerce")
+        if pd.isna(d):                       # tolerate a stray full-year / other order
+            d = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        return None if pd.isna(d) else pd.Timestamp(d)
+
+    undated_to_monthend = bool(
+        getattr(_bc_cfg, "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND", True))
+    start_date = plan_start.date() if hasattr(plan_start, "date") else plan_start
+
+    df = df.copy()
+    df["_sku_norm"] = df[sku_c].astype(str).str.strip()
+    pmap: dict[str, int] = {}
+    meta: dict[str, dict] = {}
+    for sku, g in df.groupby("_sku_norm"):
+        if not sku or sku.lower() == "nan":
+            continue
+        flag_any = bool(g[flag_c].map(_flag_set).any()) if flag_c else False
+        dates = [d for d in (g[date_c].map(_parse_date) if date_c else []) if d is not None]
+        has_date = len(dates) > 0
+        if not (flag_any or has_date):
+            continue  # normal SKU
+        demand = 0.0
+        if qty_c:
+            demand = float(pd.to_numeric(g[qty_c], errors="coerce").fillna(0).sum())
+        undated = not has_date
+        past_start = beyond_month = False
+        if undated:
+            if not undated_to_monthend:
+                continue  # flagged-but-undated treated as normal when toggle off
+            day_idx = int(planning_days)
+            deadline_date = None
+        else:
+            deadline = min(dates)                     # earliest date = EDF-conservative
+            deadline_date = deadline
+            raw = (deadline.date() - start_date).days + 1
+            past_start   = raw < 1
+            beyond_month = raw > int(planning_days)
+            day_idx = max(1, min(int(planning_days), raw))
+        pmap[sku] = day_idx
+        meta[sku] = {
+            "demand":        demand,
+            "deadline_date": (deadline_date.strftime("%Y-%m-%d") if deadline_date is not None else None),
+            "deadline_day":  day_idx,
+            "undated":       undated,
+            "past_start":    past_start,
+            "beyond_month":  beyond_month,
+        }
+    return pmap, meta
+
+
+def _priority_feasibility_precheck(pmap, meta, demand_dict, sku_presses, sku_moulds,
+                                   sku_bld_machines, cure_ct_map, plan_start, planning_days):
+    """Static, best-effort feasibility ceiling for each committed-delivery SKU.
+
+    For each priority SKU, compute the MOST it could possibly be cured by its
+    deadline given ONLY its DB-allowable presses + DB-eligible moulds (2 per press,
+    contention) and its inch-eligible building machines — never inventing a pair.
+    This is an upper bound (ignores contention with other SKUs), so it is a
+    conservative warning, never a hard-stop. Also derives the earliest date the SKU
+    could be fully completed at full dedication from day 1 (the 'relax-report' half
+    of the infeasibility decision). Returns a list of report rows, EDF-ordered."""
+    rows = []
+    for sku in sorted(pmap, key=lambda s: (meta[s]["deadline_day"], s)):
+        dd     = pmap[sku]
+        shifts = dd * 3                                       # A/B/C shifts per day
+        demand = float(demand_dict.get(sku, meta[sku]["demand"]))
+        n_press = len(sku_presses.get(sku, ()) or ())
+        n_pairs = len(sku_moulds.get(sku, ()) or ()) // CURING_CAVITIES
+        simul   = min(n_press, n_pairs)                       # presses that can run concurrently
+        ct        = float(cure_ct_map.get(sku, DEFAULT_CURING_CT))
+        cure_rate = _cure_qty_per_shift(ct)                   # per press per shift
+        cure_ceiling = simul * cure_rate * shifts
+        bld_rate = sum(_bld_qty_per_shift(m, sku)             # GT/shift over eligible machines
+                       for m in (sku_bld_machines.get(sku, ()) or ()))
+        bld_ceiling = bld_rate * shifts
+        feasible  = min(demand, cure_ceiling, bld_ceiling)
+        shortfall = max(0.0, demand - feasible)
+        per_day = min(simul * cure_rate * 3, bld_rate * 3)
+        if per_day > 0:
+            e_days   = int(math.ceil(demand / per_day))
+            earliest = (plan_start + timedelta(days=e_days - 1)).date().isoformat()
+        else:
+            e_days, earliest = None, None
+        rows.append({
+            "sku": sku, "demand": demand, "deadline_day": dd,
+            "deadline_date": meta[sku]["deadline_date"], "undated": meta[sku]["undated"],
+            "past_start": meta[sku]["past_start"], "beyond_month": meta[sku]["beyond_month"],
+            "n_presses": n_press, "n_mould_pairs": n_pairs, "simul_presses": simul,
+            "cure_ceiling": cure_ceiling, "bld_ceiling": bld_ceiling,
+            "feasible_by_deadline": feasible, "static_shortfall": shortfall,
+            "earliest_feasible_days": e_days, "earliest_feasible_date": earliest,
+            "on_time_possible": (e_days is not None and e_days <= dd),
+            "structurally_infeasible": (simul == 0 or bld_rate == 0),
+        })
+    return rows
+
+
 def _inject_label_columns(xlsx_path: str, sku_desc: dict,
                           machine_names: dict | None = None) -> None:
     """Post-process a finished workbook: after every SKU-code column insert a
@@ -4656,6 +4879,18 @@ def run_rolling_pipeline(
     if _labels_on and sku_desc_map is None:
         sku_desc_map = _build_sku_desc_map(demand_path)
 
+    # Delivery-date / priority-flag committed-delivery SKUs (DELIVERY_PRIORITY).
+    # Built ONCE here so both the Phase-0 curing-CO scheduler and building assignment
+    # share the same {sku: deadline_day} map. Empty (June, cloud, toggle off) →
+    # _prio_active is False → every priority insertion collapses to identity.
+    priority_deadline_map, priority_meta = _build_priority_deadline_map(
+        demand_path, plan_start, planning_days)
+    _prio_active = _DELIVERY_PRIORITY_ENABLED and bool(priority_deadline_map)
+    if _prio_active:
+        _n_dated = sum(1 for _m in priority_meta.values() if not _m["undated"])
+        print(f"  [Rolling] DELIVERY_PRIORITY ON — {len(priority_deadline_map)} committed SKUs "
+              f"({_n_dated} dated, {len(priority_deadline_map) - _n_dated} end-of-month); EDF order")
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Pre-computation")
     print("=" * 70)
@@ -4714,6 +4949,7 @@ def run_rolling_pipeline(
         buildable_rate=_buildable_rate,
         sku_inch=_early_sku_inch,
         building_inch_capacity=_building_inch_capacity,
+        priority_deadline_map=(priority_deadline_map if _prio_active else None),
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -6004,6 +6240,30 @@ def run_rolling_pipeline(
             _json.dump(_dd, _f)
         print(f"  [DAY0_DUMP] wrote Day-0 state → {_day0_dump_path}")
 
+    # ── DELIVERY_PRIORITY: static feasibility pre-check (best-effort + relax-report) ──
+    # Computes, per committed SKU, the most it could be cured by its deadline using ONLY
+    # DB-allowable presses/moulds + inch-eligible building machines, plus the earliest
+    # date it could be fully completed. Read-only; captured now, reported after the run.
+    priority_precheck: list = []
+    cured_by_deadline: dict[str, float] = {}
+    if _prio_active:
+        _sku_presses_pc: dict[str, set] = {}
+        try:
+            _dfca_pc = cetl.load_curing_allowable()
+            _dem_skus_pc = set(demand_dict.keys())
+            for _, _rw in _dfca_pc.iterrows():
+                _s = str(_rw["SKUCode"]).strip()
+                if _s in _dem_skus_pc:
+                    _ms = _rw.get("Machines", []) or []
+                    if _ms:
+                        _sku_presses_pc[_s] = {str(_p) for _p in _ms}
+        except Exception as _e:
+            print(f"  [Rolling] DELIVERY_PRIORITY pre-check: curing-allowable load failed ({_e})")
+        priority_precheck = _priority_feasibility_precheck(
+            priority_deadline_map, priority_meta, demand_dict,
+            _sku_presses_pc, _sku_moulds, sku_machine_map, cure_ct_map,
+            plan_start, planning_days)
+
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
@@ -6212,6 +6472,7 @@ def run_rolling_pipeline(
                 machine_locked_inches=machine_locked_inches,
                 machine_day_diff_co=machine_day_diff_co,
                 fixed_escape_used=fixed_escape_used,
+                priority_deadline_map=(priority_deadline_map if _prio_active else None),
             )
 
             # ── 2b. Idle-recoverability diagnostic (read-only, plan-neutral) ──
@@ -6739,6 +7000,8 @@ def run_rolling_pipeline(
                                             sku, demand_remaining, press_count,
                                             cure_ct_map, priority_score_map,
                                             gt_inventory, _horizon_left, _already,
+                                            priority_deadline_map=(priority_deadline_map if _prio_active else None),
+                                            day=day,
                                         )
                                 elif _RATIO_CO_ALLOCATION_ENABLED or _EARLY_CO_ENABLED:
                                     _pending_counts = Counter(
@@ -6759,6 +7022,8 @@ def run_rolling_pipeline(
                                         sku, demand_remaining, press_count,
                                         cure_ct_map, priority_score_map,
                                         gt_inventory, _horizon_left, _already,
+                                        priority_deadline_map=(priority_deadline_map if _prio_active else None),
+                                        day=day,
                                     )
                                 # Mould gate: only fire the reactive CO if 2 eligible
                                 # moulds are free for the target; else keep this SKU.
@@ -6938,6 +7203,15 @@ def run_rolling_pipeline(
         day_writeoff = _writeoff_stale_gt(gt_inventory, last_build_day, day)
         writeoff_total += day_writeoff
 
+        # DELIVERY_PRIORITY: snapshot cured-so-far for any committed SKU whose deadline
+        # is TODAY (all of today's curing is already reflected in demand_remaining here;
+        # today's CO transitions below only affect tomorrow). Read-only, plan-neutral.
+        if _prio_active:
+            for _psku, _pdd in priority_deadline_map.items():
+                if _pdd == day and _psku not in cured_by_deadline:
+                    cured_by_deadline[_psku] = (
+                        demand_dict.get(_psku, 0.0) - max(0.0, demand_remaining.get(_psku, 0.0)))
+
         # End-of-day total GT inventory (after curing + writeoff) — audits the 10k
         # plant cap. Should never exceed MAX_ENDOFDAY_GT_INVENTORY when the cap is on.
         endday_gt_inv = sum(v for v in gt_inventory.values() if v > 0)
@@ -7116,6 +7390,44 @@ def run_rolling_pipeline(
               f"{'ON' if _ENDOFDAY_GT_CAP_ENABLED else 'OFF'}, fwd-buf "
               f"{'ON' if _FORWARD_BUFFER_ENABLED else 'OFF'})")
 
+    # ── DELIVERY_PRIORITY: committed-delivery fulfillment report ────────────────
+    # Best-effort + relax-report (client decision): show, per committed SKU, how much
+    # was cured BY its deadline vs demand, the shortfall, whether it was met, and — when
+    # not fully feasible — the earliest date it could be completed. EDF-ordered.
+    priority_report: list = []
+    if _prio_active and priority_precheck:
+        for _r in priority_precheck:
+            _s   = _r["sku"]
+            _dem = _r["demand"]
+            _cbd = float(cured_by_deadline.get(_s,
+                     _dem - max(0.0, demand_remaining.get(_s, 0.0))))  # fallback = final
+            _fin = _dem - max(0.0, demand_remaining.get(_s, 0.0))       # cured by end of month
+            _short = max(0.0, _dem - _cbd)
+            _met   = _cbd >= _dem - 1e-6
+            _rr = dict(_r)
+            _rr.update({"cured_by_deadline": _cbd, "cured_final": _fin,
+                        "shortfall": _short, "met": _met})
+            priority_report.append(_rr)
+        print("\n  ── PRIORITY FULFILLMENT (committed-delivery SKUs, EDF order) ──")
+        print(f"  {'SKU':<20} {'Demand':>7} {'Date':>10} {'Dd':>3} "
+              f"{'CuredByDl':>9} {'Short':>6} {'Met':>4} {'Presses':>7} {'EarliestFull':>12}")
+        for _rr in priority_report:
+            _flags = []
+            if _rr["undated"]:      _flags.append("EOM")
+            if _rr["past_start"]:   _flags.append("PAST")
+            if _rr["beyond_month"]: _flags.append(">MO")
+            if _rr["structurally_infeasible"]: _flags.append("NO-CAP")
+            _ef = _rr["earliest_feasible_date"] or "n/a"
+            if not _rr["on_time_possible"] and _rr["earliest_feasible_date"]:
+                _ef = _ef + "*"          # * = later than the deadline (physically)
+            print(f"  {_rr['sku']:<20} {_rr['demand']:>7,.0f} "
+                  f"{(_rr['deadline_date'] or '—'):>10} {_rr['deadline_day']:>3} "
+                  f"{_rr['cured_by_deadline']:>9,.0f} {_rr['shortfall']:>6,.0f} "
+                  f"{('Y' if _rr['met'] else 'N'):>4} {_rr['simul_presses']:>7} {_ef:>12}"
+                  + (("  [" + ",".join(_flags) + "]") if _flags else ""))
+        _n_met = sum(1 for _rr in priority_report if _rr["met"])
+        print(f"  → {_n_met}/{len(priority_report)} committed SKUs fully delivered by their deadline.")
+
     # ── Correct Stage-1 carcass schedule (replaces tracking-only Step-3b rows) ──
     # Full 1:1 carcass for every Stage-2 GT unit, allocated by an exact time-windowed
     # max-flow with a 1-2 shift pre-build (≤1-day aging). Does NOT touch gt_inventory /
@@ -7228,6 +7540,8 @@ def run_rolling_pipeline(
         # Curing daily = (production + mould-clean + CO) / available press-minutes.
         "daily_capacity_util": _daily_capacity_util(
             cure_shift_rows, bld_shift_rows, press_stats, planning_days),
+        # DELIVERY_PRIORITY committed-delivery fulfillment (empty when inert).
+        "priority_report":   priority_report,
     }
 
 
