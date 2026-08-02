@@ -108,6 +108,27 @@ _SURPLUS_RELEASE_ENABLED  = True
 # CO cap + global pairing + n-1 RI-protection decide how many presses actually move.)
 _SURPLUS_PER_SKU_PER_DAY  = int(os.environ.get("SURPLUS_PER_DAY", "2"))
 
+# #4 Mould-aware Phase-0 (P0_MOULD_GATE, default OFF = current plan bit-for-bit). Phase-0 is
+# otherwise mould-BLIND (it ranks CO targets by allowable-machine eligibility only), so ~half
+# its planned COs get retargeted downstream by the rolling 2-mould gate to a DIFFERENT SKU.
+# When ON, Phase-0 keeps a day-granularity free-mould tracker (seeded Day-0 from the running
+# moulds) and only fires a CO to a target that has >= 2 eligible FREE moulds — so it picks a
+# mould-feasible target itself instead of one that will be redirected. The rolling gate in
+# b2c_pipeline.py stays as the AUTHORITATIVE final filter (Phase-0 can only APPROXIMATE the
+# shift-by-shift mould contention). Must A/B — may move KPI either way.
+_P0_MOULD_GATE = os.environ.get("P0_MOULD_GATE", "0") != "0"
+
+# #3 Press-swap hysteresis (SURPLUS_HYST, default OFF = current surplus-release bit-for-bit).
+# P1 (month-end CO-cost awareness): don't RELEASE surplus presses in the last SURPLUS_P1_DAYS
+# days — a swap loses a full 480-min shift + a mould reset and can't be amortized that late
+# (an over-provisioned SKU's presses free themselves via demand_done at month-end anyway).
+# P2 (release dead-band): size presses_needed with a small safety margin so each SKU keeps ~1
+# buffer press instead of being stripped to the razor-thin minimum — prevents over-release and
+# the CO→re-acquire ping-pong (each round-trip = 2 lost shifts + 2 mould resets).
+_SURPLUS_HYST        = os.environ.get("SURPLUS_HYST", "0") != "0"
+_SURPLUS_P1_MIN_DAYS = int(os.environ.get("SURPLUS_P1_DAYS", "2"))
+_SURPLUS_P2_MARGIN   = float(os.environ.get("SURPLUS_P2_MARGIN", "0.15"))
+
 # Curing CO same-inch alignment (env CURING_INCH_ALIGN, default OFF). When on (and a sku_inch
 # map is supplied), a press changing over PREFERS a target SKU of the SAME inch as its current
 # SKU — a tiebreak placed AFTER urgency_class + constraint, so demand-critical (Class-A) and
@@ -235,6 +256,7 @@ class COScheduler:
         buildable_rate: dict | None = None,
         sku_inch: dict | None = None,
         building_inch_capacity: dict | None = None,
+        sku_moulds: dict | None = None,          # #4: {sku: set(eligible mould IDs)} or None
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -255,6 +277,58 @@ class COScheduler:
         press_to_sku: dict[str, str] = {}
         for _, r in df_running_moulds.iterrows():
             press_to_sku[str(r["Machine"])] = str(r["SKUCode"])
+
+        # ── #4 Mould-aware Phase-0: day-granularity free-mould tracker (mirrors the
+        # rolling gate's Day-0 seed). A CO target is mountable only if the press can
+        # secure 2 eligible FREE moulds; else Phase-0 picks a different feasible target
+        # instead of one the rolling gate would later redirect. OFF → no filtering. ─────
+        _p0_gate = _P0_MOULD_GATE and bool(sku_moulds)
+        _p0_sm: dict[str, set] = {}
+        _p0_owner: dict[str, str] = {}
+        _p0_pm: dict[str, set] = {}
+        if _p0_gate:
+            _p0_sm = {str(k): set(v) for k, v in sku_moulds.items()}
+            for _, r in df_running_moulds.iterrows():          # seed Day-0 mounted moulds
+                _p = str(r["Machine"]); _sku0 = str(r["SKUCode"])
+                for _m in (r.get("MouldNos", []) or []):
+                    _m = str(_m).strip()
+                    if not _m or _m.lower() == "nan":
+                        continue
+                    _p0_owner[_m] = _p
+                    _p0_pm.setdefault(_p, set()).add(_m)
+                    _p0_sm.setdefault(_sku0, set()).add(_m)     # orphan-fold (seed never self-violates)
+            for _, r in df_running_moulds.iterrows():           # Day-0 second-mould top-up
+                _p = str(r["Machine"]); _sku0 = str(r["SKUCode"])
+                if len(_p0_pm.get(_p, set())) >= 2:
+                    continue
+                for _m in sorted(_x for _x in _p0_sm.get(_sku0, set()) if _p0_owner.get(_x) is None):
+                    if len(_p0_pm.get(_p, set())) >= 2:
+                        break
+                    _p0_owner[_m] = _p
+                    _p0_pm.setdefault(_p, set()).add(_m)
+
+        def _n_free_for(target: str, press: str) -> int:
+            """# moulds eligible for `target` that are FREE or already on `press` (>=2 ⇒ mountable)."""
+            _e = _p0_sm.get(str(target), set())
+            if len(_e) < 2:
+                return 0
+            _ps = str(press)
+            return sum(1 for _m in _e if _p0_owner.get(_m) in (None, _ps))
+
+        def _p0_mount(press: str, sku: str) -> None:
+            """Claim 2 eligible moulds for `sku` on `press`; release the press's now-ineligible ones."""
+            press = str(press); _e = _p0_sm.get(str(sku), set())
+            _have = _p0_pm.get(press, set())
+            _keep = {_x for _x in _have if _x in _e}
+            for _x in (_have - _keep):
+                if _p0_owner.get(_x) == press:
+                    _p0_owner[_x] = None
+            _p0_pm[press] = set(_keep)
+            for _x in sorted(_y for _y in _e if _p0_owner.get(_y) is None and _y not in _keep):
+                if len(_p0_pm[press]) >= 2:
+                    break
+                _p0_owner[_x] = press
+                _p0_pm[press].add(_x)
 
         # Same-inch alignment (Part 1): 0 if the CO target's inch matches the press's CURRENT
         # SKU inch, else 1 — used as a low-priority tiebreak so a press keeps its inch across COs.
@@ -424,7 +498,9 @@ class COScheduler:
             # These presses bypass the Class-B gate (like demand_done_free) and are
             # subject to the 5b building-supply guard in the firing loop.
             surplus_free: set[str] = set()
-            if _SURPLUS_RELEASE_ENABLED and horizon_left > 0:
+            # #3 P1: month-end guard — a surplus swap can't be amortized in the last few days.
+            _surplus_ok = not (_SURPLUS_HYST and horizon_left <= _SURPLUS_P1_MIN_DAYS)
+            if _SURPLUS_RELEASE_ENABLED and horizon_left > 0 and _surplus_ok:
                 _sku_presses: dict[str, list] = {}
                 for p in sorted(demand_running_presses):
                     cs = press_to_sku.get(p)
@@ -441,7 +517,10 @@ class COScheduler:
                     if rate <= 0:
                         continue
                     rem = updated_demand.get(sku, 0.0)
-                    presses_needed = max(1, math.ceil(rem / (rate * horizon_left)))
+                    # #3 P2: size presses_needed against a slightly SHORTENED horizon so the SKU
+                    # keeps ~1 buffer press (dead-band) — avoids over-release + CO/re-acquire ping-pong.
+                    _hl = (horizon_left * (1.0 - _SURPLUS_P2_MARGIN)) if _SURPLUS_HYST else horizon_left
+                    presses_needed = max(1, math.ceil(rem / (rate * max(1e-9, _hl))))
                     surplus = n - presses_needed
                     if surplus <= 0:
                         continue
@@ -543,6 +622,10 @@ class COScheduler:
                                 _br = buildable_rate.get(target)
                                 if _br is not None and (n_t + 1) * rate_t > _br:
                                     continue
+                            # #4 mould-availability hard filter: skip a target the press
+                            # can't mount 2 eligible free moulds for (mould-feasible only).
+                            if _p0_gate and _n_free_for(target, p) < 2:
+                                continue
                             # n-1 RI-protection on the donor (if freeing an RI press)
                             if old_sku in ri_skus:
                                 n_old = press_count.get(old_sku, 0) - 1
@@ -598,6 +681,8 @@ class COScheduler:
                     co_events.append(
                         {"day": day, "press": p, "old_sku": old_sku, "new_sku": new_sku})
                     press_to_sku[p] = new_sku
+                    if _p0_gate:
+                        _p0_mount(p, new_sku)                  # #4: claim the target's 2 moulds
                     press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
                     press_count[new_sku] = press_count.get(new_sku, 0) + 1
                     pending_ro_presses.discard(p)
@@ -1704,12 +1789,22 @@ def run_dynamic_consumption(
     # Pass 1: CO schedule
     print("\n  [Pass 1] Computing CO schedule …")
     scheduler = COScheduler()
+    # #4: mould eligibility for the Phase-0 mould-aware gate (same source as the rolling gate).
+    _p0_sku_moulds = None
+    if _P0_MOULD_GATE:
+        try:
+            _p0_sku_moulds = {k: set(v) for k, v in
+                              etl.load_mould_eligibility()["sku_moulds"].items()}
+        except Exception as _e:
+            print(f"  [Phase-0] mould eligibility load failed ({_e}); P0 mould gate disabled")
+            _p0_sku_moulds = None
     co_events = scheduler.schedule(
         df_day0, df_demand, df_allowable, df_running, ct_map, max_co_per_day,
         planning_days=planning_days,
         buildable_rate=buildable_rate,
         sku_inch=sku_inch,
         building_inch_capacity=building_inch_capacity,
+        sku_moulds=_p0_sku_moulds,
     )
 
     # Pass 2: 31-day simulation

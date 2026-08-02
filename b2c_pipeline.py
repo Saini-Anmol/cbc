@@ -763,6 +763,25 @@ _FIXED_ESCAPE_MAX_COS = int(getattr(_bc_cfg, "FIXED_ESCAPE_MAX_COS", 1))
 # Env FLEX_SCARCE_INCH=0 → dominant/same-inch ranking, bit-for-bit.
 _FLEX_SCARCE_INCH = (os.environ.get("FLEX_SCARCE_INCH", "1") != "0")
 
+# #2 Lever A → marginal coverage-value + hysteresis (FLEX_MCV, default OFF = Lever A bit-for-bit).
+# Rank a flexible machine's allowed inches by VALUE = w_now·(this-shift draw shortfall) +
+# w_mon·(cumulative monthly unmet units) — blends immediate starvation with chronic behind-ness.
+# HYSTERESIS: a flex machine leaves its CURRENT inch only if another inch's value exceeds it by
+# Δ_switch = HYS_BAND·val_scale + CO_LAMBDA·(diff-CO forgone production) — a symmetric dead-band
+# that forbids A→B→A oscillation on near-ties while still reacting to a meaningful gain; plus a
+# COOLDOWN (no diff-inch switch within N days of the last one). See _key.
+# Defaults = the adopted "config5" (hysteresis-only): the monthly-gap blend (W_MON>0) regressed
+# on the sweep, so it is OFF; a light dead-band (band 0.1, λ 0.5) + 1-day cooldown is the winner
+# (June +272 / July −780 / Aug +1,330 = net +822 vs plain Lever A). FLEX_MCV default OFF here;
+# flipped ON at the merge step.
+_FLEX_MCV_ENABLED   = (os.environ.get("FLEX_MCV", "1") != "0")   # ADOPTED (config5, net +822)
+_FLEX_MCV_W_NOW     = float(os.environ.get("FLEX_MCV_W_NOW", "1.0"))
+_FLEX_MCV_W_MON     = float(os.environ.get("FLEX_MCV_W_MON", "0.0"))
+_FLEX_MCV_HYS_BAND  = float(os.environ.get("FLEX_MCV_HYS_BAND", "0.1"))
+_FLEX_MCV_CO_LAMBDA = float(os.environ.get("FLEX_MCV_CO_LAMBDA", "0.5"))
+_FLEX_MCV_COOLDOWN  = int(os.environ.get("FLEX_MCV_COOLDOWN", "1"))
+_HYST_BIG           = 10_000   # rank bump that deprioritizes a marginal/cooldown-blocked switch
+
 # ── Dynamic GT buffer (Phase 1, DYN_BUFFER) ───────────────────────────────────
 # Replaces the flat per-group GT buffer with a per-SKU, per-shift horizon H_s
 # (see bc_config DYN_BUFFER block). Default OFF → the flat buffer, bit-for-bit.
@@ -997,6 +1016,8 @@ _STAGE1_SINGLE_INCH = True
 # old tracking rows. STAGE1_CARCASS_LEAD (default 2) = max shifts of carcass pre-build.
 _STAGE1_CARCASS_PASS = os.environ.get("STAGE1_CARCASS_PASS", "1") != "0"
 _STAGE1_CARCASS_LEAD = int(os.environ.get("STAGE1_CARCASS_LEAD", "2"))
+# #1 Carcass inventory-first: consume opening carcass before Stage-1 builds new (KPI-neutral).
+_CARCASS_INV_ENABLED = bool(getattr(_bc_cfg, "CARCASS_INV_ENABLED", False))
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1580,7 +1601,9 @@ def _sku_data_skip_reasons(sku, sku_machine_map=None, cure_ct_map=None,
 
 
 def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
-                             planning_days: int, lead: int = 2) -> tuple:
+                             planning_days: int, lead: int = 2,
+                             opening_carcass: dict | None = None,
+                             shelf_days: int = 1) -> tuple:
     """Post-plan Stage-1 carcass scheduler — replaces the tracking-only Step-3b rows.
 
     Allocates the FULL 1:1 carcass for every Stage-2 GT unit to eligible Stage-1 machines,
@@ -1610,6 +1633,36 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
                     "no_elig_skus": [], "no_elig_units": 0}
 
     shifts = sorted(s2.keys(), key=lambda k: (k[0], _SORD.get(k[1], 0)))
+    # #1 Carcass inventory-first: consume opening carcass FIRST (same SKU code, within the
+    # shelf window from Day-0), so the plant's on-hand carcass is not wasted and Stage-1 builds
+    # less. POST-HOC → KPI-neutral; only reduces Stage-1 output + the INFEASIBLE count.
+    opening_used = 0.0
+    if opening_carcass:
+        from datetime import datetime as _dtmod
+        def _dt_date(_s):
+            for _f in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+                try:
+                    return _dtmod.strptime(str(_s)[:10], _f)
+                except Exception:
+                    pass
+            return None
+        _start = _dt_date(shifts[0][0])
+        _pool = {str(_s): float(_q) for _s, _q in opening_carcass.items() if _q > 0}
+        for k in shifts:                                  # chronological (sorted)
+            _kd = _dt_date(k[0])
+            if _start is not None and _kd is not None and (_kd - _start).days >= shelf_days:
+                break                                     # past shelf window → all later too
+            for sku in list(s2[k].keys()):
+                avail = _pool.get(sku, 0.0)
+                if avail <= 0:
+                    continue
+                take = min(avail, s2[k][sku])
+                if take > 0:
+                    s2[k][sku] -= take
+                    _pool[sku] = avail - take
+                    opening_used += take
+                    if s2[k][sku] <= 0:
+                        del s2[k][sku]
     tidx = {k: i for i, k in enumerate(shifts)}
     T = len(shifts)
     S1 = sorted(_S1_MACHINES)
@@ -1673,8 +1726,12 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
                 "Machine_Group": _group_label(m), "CO_Type": "carcass",
             })
     report = {
-        "demand": round(total_dem), "supplied": round(res.flow_value),
-        "unmet": round(total_dem - res.flow_value),
+        # demand = ORIGINAL Stage-2 carcass demand (before opening-carcass consumption);
+        # supplied = built by Stage-1 in-window + covered by opening carcass.
+        "demand": round(total_dem + opening_used),
+        "supplied": round(res.flow_value + opening_used),
+        "unmet": round(total_dem - res.flow_value),   # Stage-1 could not build in-window
+        "opening_used": round(opening_used),
         "no_elig_skus": sorted(no_elig.keys()),
         "no_elig_units": round(sum(no_elig.values())),
     }
@@ -2832,19 +2889,34 @@ def _assign_building_shift(
             # machine then prefers its scarcest allowed inch (used in _key below). Recomputed
             # every pick, so it self-balances as projected_gt updates. None ⇒ lever off.
             _flex_scar_rank = None
+            _flex_ival = None       # #2 MCV: blended per-inch value (for the hysteresis in _key)
+            _flex_val_scale = 1.0
             if _FLEX_SCARCE_INCH and _FLEX_MACHS_HIST:
                 _ishort: dict = {}
+                _imon: dict = {}
                 for _p in pairs:
-                    _sk = _p[1]; _dr = shift_cure_demand.get(_sk, 0.0)
-                    if _dr <= 0:
-                        continue
-                    _sh = max(0.0, min(_dr, demand_remaining.get(_sk, 0.0))
-                              - projected_gt.get(_sk, 0.0))
-                    _ishort[_p[3]] = _ishort.get(_p[3], 0.0) + _sh
-                if _ishort:
-                    # Tiebreak on the inch string so equal-shortfall inches rank
-                    # deterministically (the pairs/_ishort insertion order is set-iteration
-                    # dependent = hash-seed dependent; the inch tiebreak removes that).
+                    _sk = _p[1]; _ti = _p[3]
+                    _dr = shift_cure_demand.get(_sk, 0.0)
+                    if _dr > 0:                              # this-shift draw shortfall (S_now)
+                        _sh = max(0.0, min(_dr, demand_remaining.get(_sk, 0.0))
+                                  - projected_gt.get(_sk, 0.0))
+                        _ishort[_ti] = _ishort.get(_ti, 0.0) + _sh
+                    if _FLEX_MCV_ENABLED:                    # cumulative monthly unmet units (G_mon)
+                        _imon[_ti] = _imon.get(_ti, 0.0) + max(
+                            0.0, demand_remaining.get(_sk, 0.0) - projected_gt.get(_sk, 0.0))
+                if _FLEX_MCV_ENABLED:
+                    # #2: blended value = w_now·shortfall + w_mon·monthly-gap; rank by it.
+                    _flex_ival = {_i: _FLEX_MCV_W_NOW * _ishort.get(_i, 0.0)
+                                     + _FLEX_MCV_W_MON * _imon.get(_i, 0.0)
+                                  for _i in (set(_ishort) | set(_imon))}
+                    if _flex_ival:
+                        _flex_val_scale = max(_flex_ival.values()) or 1.0
+                        _flex_scar_rank = {_i: _r for _r, _i in enumerate(
+                            sorted(_flex_ival, key=lambda z: (-_flex_ival[z], z)))}
+                elif _ishort:
+                    # Lever A (MCV off): pure shortfall rank. Tiebreak on the inch string so
+                    # equal-shortfall inches rank deterministically (set-iteration order is
+                    # hash-seed dependent; the inch tiebreak removes that).
                     _flex_scar_rank = {_i: _r for _r, _i in
                                        enumerate(sorted(_ishort, key=lambda z: (-_ishort[z], z)))}
 
@@ -2892,6 +2964,21 @@ def _assign_building_shift(
                 # about-to-starve scarce inch first. Fixed machines keep the sticky penalty.
                 if _flex_scar_rank is not None and str(m) in _FLEX_MACHS_HIST:
                     inch_penalty = _flex_scar_rank.get(to_inch, 99)
+                    # #2 hysteresis: a flex machine leaves its CURRENT inch only for a
+                    # MEANINGFULLY better one (symmetric dead-band Δ = HYS_BAND·scale +
+                    # CO_LAMBDA·forgone-CO-production) and not within the switch cooldown —
+                    # kills A→B→A oscillation while still reacting to a real gain.
+                    if _FLEX_MCV_ENABLED and _flex_ival is not None:
+                        _cur_i = sku_inch.get(stg[m]["cur_sku"], "")
+                        if to_inch != _cur_i:
+                            _delta = (_FLEX_MCV_HYS_BAND * _flex_val_scale
+                                      + _FLEX_MCV_CO_LAMBDA * cost * stg[m]["rate"])
+                            _meaningful = (_flex_ival.get(to_inch, 0.0)
+                                           > _flex_ival.get(_cur_i, 0.0) + _delta)
+                            _cooldown = ((day - machine_last_diff_co_day.get(m, -10**9))
+                                         < _FLEX_MCV_COOLDOWN)
+                            if (not _meaningful) or _cooldown:
+                                inch_penalty += _HYST_BIG
                 constraint = min(flex_m[m], flex_s[sku])
                 if _BLD_SEC_ORDER != "baseline":
                     # Explicit four-factor ordering (same-size first, cost/m/sku tail).
@@ -4976,6 +5063,14 @@ def run_rolling_pipeline(
     except Exception:
         opening_gt = {}
     gt_inventory: dict[str, float] = defaultdict(float, opening_gt)
+    # #1: Opening carcass inventory (consumed first by the Stage-1 carcass pass; KPI-neutral).
+    opening_carcass: dict[str, float] = {}
+    if _CARCASS_INV_ENABLED:
+        try:
+            from curing_b2c import _load_opening_carcass
+            opening_carcass = _load_opening_carcass(engine)
+        except Exception:
+            opening_carcass = {}
 
     # ── D2: Mould-clean state (per press) ─────────────────────────────────────
     # remaining_mould_life = cycles a press may still run before a mandatory clean.
@@ -7028,14 +7123,17 @@ def run_rolling_pipeline(
     # the old undercounting tracking rows. See _stage1_carcass_schedule / _STAGE1_CARCASS_PASS.
     if _STAGE1_CARCASS_PASS:
         _carc_rows, _carc_rep = _stage1_carcass_schedule(
-            bld_shift_rows, s1_sku_to_machines, planning_days, lead=_STAGE1_CARCASS_LEAD)
+            bld_shift_rows, s1_sku_to_machines, planning_days, lead=_STAGE1_CARCASS_LEAD,
+            opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None),
+            shelf_days=int(getattr(_bc_cfg, "CARCASS_SHELF_LIFE_DAYS", 1)))
         bld_shift_rows[:] = [r for r in bld_shift_rows if r.get("CO_Type") != "carcass"]
         bld_shift_rows.extend(_carc_rows)
         _cq = sum(r["Qty"] for r in _carc_rows)
         _cm = len({r["Machine"] for r in _carc_rows})
+        _ou = _carc_rep.get("opening_used", 0)
         print(f"  [Stage-1 carcass] 1:1 allocation (pre-build ≤{_STAGE1_CARCASS_LEAD} shifts, "
               f"≤1-day aging): {_cq:,} carcass units / {_carc_rep['demand']:,} Stage-2 GT "
-              f"across {_cm} machines")
+              f"across {_cm} machines" + (f"; {_ou:,} covered by opening carcass" if _ou else ""))
         if _carc_rep["unmet"] > 0:
             print(f"  [Stage-1 carcass] ⚠ INFEASIBLE: {_carc_rep['unmet']:,} carcass units cannot "
                   f"be supplied within the aging window; {_carc_rep['no_elig_units']:,} on "

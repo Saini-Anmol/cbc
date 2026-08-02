@@ -414,6 +414,17 @@ STARVATION_BUFFER_MINS = 30
 CARCASS_SHELF_LIFE_DAYS = 1
 # Stage-1 carcass shelf life: 1 day (must enter Stage-2 same or next shift).
 
+# ── Opening carcass inventory-first (CARCASS_INV) ─────────────────────────────
+# Consume the plant's opening Stage-1 carcass (jkplanningV1.carcass_inventory_manual,
+# SKU-keyed = sizeCode, col CarcassInv, plan_month-filtered) BEFORE the Stage-1 carcass
+# scheduler builds new carcass — the exact analog of opening GT (gt_inventory_manual).
+# Consumed only within the carcass SHELF window from Day-0 (CARCASS_SHELF_LIFE_DAYS) and
+# only against the SAME SKU code. NOTE: carcass is POST-HOC in the rolling pipeline (it
+# does NOT gate GT/cured), so this is KPI-NEUTRAL — it only makes Stage-1 utilization/output
+# realistic and LOWERS the carcass INFEASIBLE count. Default OFF (env CARCASS_INV=1) = A/B;
+# OFF reproduces the current carcass schedule bit-for-bit.
+CARCASS_INV_ENABLED = (os.environ.get("CARCASS_INV", "1") != "0")   # ADOPTED (KPI-neutral realism)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. CURING SIMULATION  →  curing_b2c.py
 # ══════════════════════════════════════════════════════════════════════════════

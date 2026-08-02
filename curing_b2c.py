@@ -218,6 +218,22 @@ def _load_opening_gt(engine) -> dict:
         return {}
 
 
+def _load_opening_carcass(engine) -> dict:
+    """Opening Stage-1 CARCASS inventory per SKU (sizeCode → CarcassInv), plan_month-filtered —
+    the exact analog of _load_opening_gt for carcass_inventory_manual. Consumed FIRST in the
+    Stage-1 carcass schedule so the plant's on-hand carcass is not wasted."""
+    try:
+        df = _sql(engine,
+            f"SELECT sizeCode AS sku, CarcassInv AS qty "
+            f"FROM {DB}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
+        df["sku"] = df["sku"].astype(str).str.strip()
+        df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
+        return {r["sku"]: float(r["qty"]) for _, r in df.iterrows() if float(r["qty"]) > 0}
+    except Exception as e:
+        print(f"  ⚠  Opening carcass inventory: {e}")
+        return {}
+
+
 def _load_press_state(engine) -> pd.DataFrame:
     """
     Returns DataFrame with columns: press, sku, mould_life
