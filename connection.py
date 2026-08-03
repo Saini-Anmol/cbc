@@ -90,18 +90,92 @@ def _val(row: dict, preset: dict, key, default=None):
 
 
 def read_db(engine, plan_id: str):
-    """Return (demand_df[SKUCode,Requirement], run_cfg dict, sku_desc dict)."""
-    dem = pd.read_sql(
-        text("SELECT skuCode, requirement, skuDescription "
-             "FROM jkt_demand WHERE plan_id = :p"),
+    """Return (demand_df[SKUCode,Requirement(,Priority Flag,Delivery Date)], run_cfg, sku_desc).
+
+    ALL run configuration is read from jkt_plan_params ONLY — the backend does NOT read the
+    preset table. The frontend copies the selected preset's values (impPriorityFlag,
+    mouldAvailability, noOfChangeOver, efficiency, dates, …) into the params row on plan
+    create/edit, so jkt_plan_params is the single source of truth for a run.
+
+    The committed-delivery feature (jkt_demand.priorityFlag + deliveryDate) is GATED by
+    jkt_plan_params.impPriorityFlag:
+      • impPriorityFlag = 1 → the two columns ARE read + staged, so the engine honours the
+        delivery dates / priority flags.
+      • impPriorityFlag = 0 → they are NOT read; the plan is the plain baseline even if the
+        columns are populated in jkt_demand.
+    """
+    # ── plan params — the single source of truth (no preset read) ──
+    prm = pd.read_sql(
+        text("SELECT * FROM jkt_plan_params WHERE plan_id = :p"),
         engine, params={"p": plan_id},
     )
+    if prm.empty:
+        raise ValueError(f"jkt_plan_params has no row for plan_id={plan_id!r}")
+    row = prm.iloc[0].to_dict()
+
+    def _pv(key, default=None):
+        v = row.get(key)
+        return default if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+    def _truthy(v) -> bool:
+        return (v is not None) and (str(v).strip().lower() in {"1", "1.0", "yes", "y", "true"})
+
+    # ── config knobs — jkt_plan_params ONLY ──
+    imp_priority       = _truthy(_pv("impPriorityFlag"))
+    mould_availability = int(_pv("mouldAvailability", 0))
+    max_co_per_day     = int(_pv("noOfChangeOver", 12))
+    _eff_pct           = float(_pv("efficiency", 94.0))      # stored as a PERCENTAGE in the DB (94.0)
+    press_efficiency   = _eff_pct / 100.0 if _eff_pct > 1.0 else _eff_pct   # engine wants a fraction
+
+    # ── demand — read the committed-delivery columns ONLY when impPriorityFlag is ON ──
+    _read_prio = imp_priority
+    if _read_prio:
+        try:
+            dem = pd.read_sql(
+                text("SELECT skuCode, requirement, skuDescription, priorityFlag, deliveryDate "
+                     "FROM jkt_demand WHERE plan_id = :p"),
+                engine, params={"p": plan_id},
+            )
+        except Exception:            # columns absent on this DB → degrade to base, feature inert
+            _read_prio = False
+    if not _read_prio:
+        dem = pd.read_sql(
+            text("SELECT skuCode, requirement, skuDescription "
+                 "FROM jkt_demand WHERE plan_id = :p"),
+            engine, params={"p": plan_id},
+        )
     if dem.empty:
         raise ValueError(f"jkt_demand has no rows for plan_id={plan_id!r}")
     dem["skuCode"] = dem["skuCode"].astype(str).str.strip()
-    demand_df = (dem.groupby("skuCode", as_index=False)["requirement"].sum()
-                    .rename(columns={"skuCode": "SKUCode",
-                                     "requirement": "Requirement"}))
+    if _read_prio:
+        # Consolidate per SKU: requirement summed; committed when ANY row's priorityFlag
+        # is set OR a deliveryDate is present (a date implies commitment); deadline =
+        # EARLIEST deliveryDate. Staged under the exact header names the engine parser
+        # reads ("Priority Flag" / "Delivery Date") — identical to a local Excel run.
+        def _flag_any(s):
+            for v in s:
+                if v is not None and str(v).strip().lower() in {"1", "1.0", "yes", "y", "true"}:
+                    return "1"
+            return ""
+
+        def _earliest_date(s):
+            ds = [d for d in (pd.to_datetime(v, errors="coerce") for v in s) if pd.notna(d)]
+            return min(ds) if ds else pd.NaT
+
+        demand_df = (dem.groupby("skuCode", as_index=False)
+                        .agg(Requirement=("requirement", "sum"),
+                             **{"Priority Flag": ("priorityFlag", _flag_any),
+                                "Delivery Date": ("deliveryDate", _earliest_date)})
+                        .rename(columns={"skuCode": "SKUCode"}))
+        _n_committed = int(((demand_df["Priority Flag"] == "1")
+                            | demand_df["Delivery Date"].notna()).sum())
+        print(f"[read_db] DELIVERY_PRIORITY ON (jkt_plan_params.impPriorityFlag=1): "
+              f"{_n_committed} committed SKU(s) from jkt_demand")
+    else:
+        demand_df = (dem.groupby("skuCode", as_index=False)["requirement"].sum()
+                        .rename(columns={"skuCode": "SKUCode",
+                                         "requirement": "Requirement"}))
+        print(f"[read_db] DELIVERY_PRIORITY OFF (jkt_plan_params.impPriorityFlag=0) — "
+              f"priority flag / delivery date in jkt_demand are ignored")
     # Description lookup — SOLE source is the uploaded jkt_demand.skuDescription (the
     # jkt_sku_description master table is retired / not used). SKUs absent from jkt_demand
     # (e.g. Runner-Out SKUs on a press with zero demand) have no description → "NA"
@@ -111,45 +185,24 @@ def read_db(engine, plan_id: str):
         if v is not None and str(v).strip() and str(v).lower() != "nan":
             sku_desc[str(k).strip()] = v
 
-    prm = pd.read_sql(
-        text("SELECT * FROM jkt_plan_params WHERE plan_id = :p"),
-        engine, params={"p": plan_id},
-    )
-    if prm.empty:
-        raise ValueError(f"jkt_plan_params has no row for plan_id={plan_id!r}")
-    row = prm.iloc[0].to_dict()
-
-    preset: dict = {}
-    pname = row.get("optimisationPreset")
-    if pname is not None and not (isinstance(pname, float) and pd.isna(pname)):
-        pdf = pd.read_sql(
-            text("SELECT * FROM jkt_plan_presets WHERE presetName = :n"),
-            engine, params={"n": pname},
-        )
-        if not pdf.empty:
-            preset = pdf.iloc[0].to_dict()
-
-    start = pd.to_datetime(_val(row, preset, "planStartDate")).replace(
-        hour=7, minute=0, second=0, microsecond=0)
-    end = pd.to_datetime(_val(row, preset, "planEndDate"))
+    # ── plan dates: jkt_plan_params ONLY (never the preset) ──
+    _sd, _ed = row.get("planStartDate"), row.get("planEndDate")
+    if _sd is None or pd.isna(_sd) or _ed is None or pd.isna(_ed):
+        raise ValueError(f"jkt_plan_params.planStartDate/planEndDate is NULL for plan_id={plan_id!r}")
+    start = pd.to_datetime(_sd).replace(hour=7, minute=0, second=0, microsecond=0)
+    end = pd.to_datetime(_ed)
     planning_days = int((end.normalize() - start.normalize()).days) + 1
-
-    # efficiency is stored as a PERCENTAGE in the DB (e.g. 94.0); the engine
-    # wants a fraction (PRESS_EFFICIENCY = 0.94). Normalise > 1 → /100.
-    eff = float(_val(row, preset, "efficiency", 0.94))
-    if eff > 1.0:
-        eff = eff / 100.0
 
     run_cfg = {
         "plan_id":          plan_id,
         "plan_start":       start.to_pydatetime(),
         "planning_days":    planning_days,
-        "max_co_per_day":   int(_val(row, preset, "noOfChangeOver", 12)),
-        "press_efficiency": eff,
-        "plant_name":       _val(row, preset, "plantName"),
-        "product_name":     _val(row, preset, "productName"),
+        "max_co_per_day":   max_co_per_day,     # PRESET-authoritative (resolved above)
+        "press_efficiency": press_efficiency,   # PRESET-authoritative (resolved above)
+        "plant_name":       _pv("plantName"),
+        "product_name":     _pv("productName"),
         # v2 / dormant, carried for completeness
-        "mould_availability": _val(row, preset, "mouldAvailability"),
+        "mould_availability": mould_availability,
     }
     return demand_df, run_cfg, sku_desc
 

@@ -49,7 +49,10 @@ CLOUD_CONFIG: dict = {
     # ── Day-0 curing press state — MUST stay the live snapshot on cloud ──
     "RUNNING_MOULDS_TABLE":                   "Daily_Running_Moulds",
     # ── GT storage / shelf life ─────────────────────────────────────────
-    "MAX_ENDOFDAY_GT_INVENTORY":              7000,
+    # MUST equal bc_config.MAX_ENDOFDAY_GT_INVENTORY (the dynamic GT buffer fills to this
+    # cap, so any drift changes the plan) → keep in sync for local↔cloud parity. Committed
+    # local value is 8000; if the local cap changes, update this pin too.
+    "MAX_ENDOFDAY_GT_INVENTORY":              8000,
     "GT_SHELF_LIFE_DAYS":                     3,
     "TOPUP_LOOKAHEAD_DAYS_GT":                3,
     "CARCASS_SHELF_LIFE_DAYS":                1,
@@ -154,6 +157,33 @@ def _set_running_moulds_table(name: str) -> None:
         pass
 
 
+def _set_plan_month(plan_start) -> None:
+    """Point plan_month (running-moulds + opening GT/carcass SQL filters) at THIS run's
+    month, derived from the run's plan_start.
+
+    PLAN_MONTH / RUNNING_MOULDS_MONTH are imported BY VALUE into several engine modules
+    at import time (they key the `WHERE plan_month = …` queries), and on cloud they are
+    otherwise fixed to bc_config's file-default month. Without this, a cloud run for any
+    month != that default would read the WRONG month's Day-0 snapshot + opening GT.
+    Mirrors _set_running_moulds_table: set on bc_config and on every engine module that
+    binds the value (both already-imported and lazily-imported later).
+    """
+    pm = plan_start.strftime("%Y-%m")
+    os.environ["PLAN_MONTH"] = pm
+    os.environ["RUNNING_MOULDS_MONTH"] = pm
+    setattr(_bc, "PLAN_MONTH", pm)
+    setattr(_bc, "RUNNING_MOULDS_MONTH", pm)
+    for _modname in ("curing_consumption", "curing_b2c", "curing_consumption_dynamic",
+                     "building", "building_b2c", "b2c_pipeline"):
+        try:
+            _m = __import__(_modname)
+        except Exception:  # pragma: no cover
+            continue
+        for _attr in ("PLAN_MONTH", "RUNNING_MOULDS_MONTH"):
+            if hasattr(_m, _attr):
+                setattr(_m, _attr, pm)
+
+
 def run_plan(plan_id: str, created_by: str = "scheduler",
              keep_files: bool = False,
              running_moulds_table: str | None = None) -> dict:
@@ -167,6 +197,8 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
 
     # ── read inputs from the 3 input tables ───────────────────────────────
     demand_df, run_cfg, sku_desc = conn.read_db(engine, plan_id)
+    # Align plan_month to the run's actual month BEFORE the engine ETL reads Day-0 data.
+    _set_plan_month(run_cfg["plan_start"])
     print(f"[main] plan_id={plan_id}  SKUs={len(demand_df)}  "
           f"start={run_cfg['plan_start'].date()}  days={run_cfg['planning_days']}  "
           f"max_co={run_cfg['max_co_per_day']}  eff={run_cfg['press_efficiency']}")
