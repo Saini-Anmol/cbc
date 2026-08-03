@@ -35,8 +35,8 @@ import cbc_env
 #   Env DELIVERY_PRIORITY=0 also forces it off. For the CLOUD path, flip the matching
 #   top toggle in main.py (CLOUD_CONFIG) instead — editing this file does not affect cloud.
 # ══════════════════════════════════════════════════════════════════════════════
-DELIVERY_PRIORITY_ENABLED             = (os.environ.get("DELIVERY_PRIORITY", "1") != "0")
-DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = (os.environ.get("DELIVERY_PRIORITY_UNDATED", "1") != "0")
+DELIVERY_PRIORITY_ENABLED             = False
+DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. PLAN HORIZON
@@ -481,6 +481,19 @@ CURING_PRESS_COUNT = 170
 # the denominator keeps the KPI stable and comparable across runs. Change this
 # one line when the curing-press roster changes.
 
+# ── Restrict the press roster to the allowable matrix (LOCAL-ONLY, default OFF) ──
+# The live Daily_Running_Moulds snapshot sometimes carries MORE unique presses
+# than the 170-press allowable matrix (Master_Curing_Allowable_Machines_source):
+# e.g. July has 2 extra (85214, 85215) and August 8 extra (85207–85215). Those
+# presses are not in any SKU's allowable list, so they can run their Day-0 SKU
+# but can never CO anywhere. When RESTRICT_PRESSES_TO_ALLOWABLE is ON, the
+# running-moulds snapshot is filtered so ONLY the 170 allowable presses exist
+# (assume no other press exists); their Day-0 moulds return to the free pool.
+# LOCAL-ONLY: local_main.py passes this flag into run_rolling_pipeline; the cloud
+# path (main.py) never passes it, so cloud is unaffected regardless of this value.
+# Default OFF → bit-for-bit prior behaviour. Env PRESS_ALLOWABLE_ONLY=1 enables.
+RESTRICT_PRESSES_TO_ALLOWABLE = (os.environ.get("PRESS_ALLOWABLE_ONLY", "0") == "1")
+
 # ── Curing press changeover times ────────────────────────────────────────────
 # A curing press CO occupies 2 consecutive shifts:
 #   Shift A (CO day)  → CHANGEOVER   (press idle, mould swap)
@@ -490,7 +503,7 @@ CURING_PRESS_COUNT = 170
 
 CURING_CO_DURATION_SHIFTS  = 1     # shifts idle during CO: Shift A only (CHANGEOVER).
 #                                    Mould clean removed from scheduler model.
-CURING_CO_CHANGEOVER_MINS  = 490   # Shift A: press occupied for changeover (full shift)
+CURING_CO_CHANGEOVER_MINS  = 480   # Shift A: press occupied for changeover (full shift = 480 min)
 # Shift B: PRODUCTION begins for new SKU immediately (no mould-clean idle shift).
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -275,6 +275,16 @@ class ConsumptionETL:
         # here was a real source of run-to-run non-determinism in the CO schedule.
         return df[["SKUCode", "Machines"]].sort_values("SKUCode").reset_index(drop=True)
 
+    def load_allowable_press_ids(self) -> set:
+        """The plant curing-press roster = the numeric press-ID columns of the
+        allowable matrix (Master_Curing_Allowable_Machines_source) — exactly 170
+        presses. Used to restrict the running-moulds snapshot to real presses
+        (the snapshot occasionally carries a few presses not in this roster)."""
+        df = self._sql(
+            f"SELECT * FROM {self.db}.Master_Curing_Allowable_Machines_source"
+        )
+        return {str(c) for c in df.columns if str(c).isdigit()}
+
     def load_building_allowable_skus(self) -> set:
         """SKUs that appear in building allowable master with at least one machine."""
         try:

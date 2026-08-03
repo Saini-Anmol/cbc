@@ -68,6 +68,7 @@ _OUTPUT_TABLES = [
     "jkt_plan_Infeasibility",
     "jkt_plan_kpis",
     "jkt_plan_capacityUtilisation",
+    "jkt_plan_moulds",
 ]
 
 
@@ -423,6 +424,23 @@ def write_db(engine, plan_id: str, result: dict,
             "createdBy":           created_by,
         }])
 
+    # ── mould-in-use — DAILY grid straight from the curing MouldInUse sheet:
+    # PLANNING_DAYS × #demand-SKUs rows (one per day×SKU). mouldsInUse = the day's
+    # MAX across its 3 shifts of the SKU's moulds mounted on running presses;
+    # totalEligibleMoulds = the SKU's eligible-mould pool (constant, 0 if none).
+    # Composite PK (plan_id, Date, SKUCode). Sheet header is on Excel row 2.
+    ms = pd.read_excel(curing_xlsx, sheet_name="MouldInUse", header=1)
+    moulds = pd.DataFrame({
+        "plan_id":             plan_id,
+        "Date":                pd.to_datetime(ms["Date"]).dt.date,
+        "SKUCode":             ms["SKU Code"].astype(str),
+        "skuDescription":      _desc(ms["SKU Code"], sku_desc),
+        "mouldsInUse":         pd.to_numeric(ms["Mould in USE"], errors="coerce").fillna(0).astype(int),
+        "totalEligibleMoulds": pd.to_numeric(ms["Total Eligible Moulds"], errors="coerce").fillna(0).astype(int),
+        "createdAt":           now,
+        "createdBy":           created_by,
+    }) if len(ms) else pd.DataFrame()
+
     # ── write (unique plan_id per run; overwrite makes re-runs idempotent) ─
     if overwrite:
         with engine.begin() as c:
@@ -435,6 +453,8 @@ def write_db(engine, plan_id: str, result: dict,
         infeas.to_sql("jkt_plan_Infeasibility", engine, if_exists="append", index=False)
     kpis.to_sql("jkt_plan_kpis", engine, if_exists="append", index=False)
     cap.to_sql("jkt_plan_capacityUtilisation", engine, if_exists="append", index=False)
+    if len(moulds):
+        moulds.to_sql("jkt_plan_moulds", engine, if_exists="append", index=False)
 
     return {
         "jkt_plan_building":            len(bld),
@@ -442,4 +462,5 @@ def write_db(engine, plan_id: str, result: dict,
         "jkt_plan_Infeasibility":       len(infeas),
         "jkt_plan_kpis":                len(kpis),
         "jkt_plan_capacityUtilisation": len(cap),
+        "jkt_plan_moulds":              len(moulds),
     }

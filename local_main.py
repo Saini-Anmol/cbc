@@ -10,11 +10,18 @@ same inputs.
 """
 from __future__ import annotations
 
+import bc_config
 from b2c_pipeline import run_rolling_pipeline
 
 
 def main() -> dict:
-    result = run_rolling_pipeline()  # bc_config defaults (demand, plan_start, days)
+    # LOCAL-ONLY press-roster restriction (default OFF). When
+    # bc_config.RESTRICT_PRESSES_TO_ALLOWABLE is ON, only the 170 presses in the
+    # allowable matrix are used; extra running-moulds presses are dropped. The
+    # cloud path (main.py) never passes this, so cloud is unaffected.
+    result = run_rolling_pipeline(  # bc_config defaults (demand, plan_start, days)
+        restrict_to_allowable_presses=bc_config.RESTRICT_PRESSES_TO_ALLOWABLE,
+    )
     print("\n" + "=" * 60)
     print("  LOCAL RUN COMPLETE (Excel path)")
     print("=" * 60)

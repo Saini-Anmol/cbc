@@ -93,7 +93,7 @@ CLOUD_CONFIG: dict = {
     "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND":  True,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
-    "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)
+    "CURING_CO_CHANGEOVER_MINS":              480,    # full shift; must match bc_config
     "CURING_CO_DURATION_SHIFTS":              1,
     # ── Curing capacity-utilisation KPI denominator (fixed plant roster) ──
     "CURING_PRESS_COUNT":                     170,    # daily+monthly curing util denominator
@@ -227,7 +227,7 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         sku_desc_map=sku_desc,          # DB master descriptions → output sheets
     )
 
-    # ── write the 4 output tables (rules 4 & 5 applied inside write_db) ────
+    # ── write the output tables (incl. jkt_plan_moulds; rules 4 & 5 inside write_db) ──
     counts = conn.write_db(
         engine, plan_id, result,
         result["build_output"], result["curing_output"],

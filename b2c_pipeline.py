@@ -1489,27 +1489,23 @@ def _fmt_dt(dt: "datetime") -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict) -> list:
-    """Per-SKU mould occupancy over time for the curing 'MouldInUse' sheet.
+def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict,
+                       demand_skus, planning_days: int, plan_start: datetime) -> list:
+    """MouldInUse sheet — a FIXED daily grid: PLANNING_DAYS × #demand-SKUs rows.
 
-    For every (day, shift) it reads which presses are RUNNING which SKU (from
-    cure_shift_rows) and which 2 moulds each such press holds (from
-    mould_info['assignments'], keyed by (press, sku)). Then, per SKU with ≥1 mould
-    mounted that shift:
-        Mould in USE        = # of that SKU's moulds mounted on its running presses
-                              (= 2 × running presses when both cavities are tooled).
+    Exactly one row per (calendar day, demand SKU). For each such (day, SKU):
+        Mould in USE = the MAXIMUM across the day's 3 shifts (A/B/C) of that SKU's
+                       moulds mounted on presses RUNNING that SKU. A press that
+                       changes over mid-day is not RUNNING that shift, so its
+                       shift's count drops — taking the max keeps the day's PEAK
+                       (e.g. shift A=4 moulds, shift B=CO, shift C=2 → row shows 4).
         Total Eligible Moulds = size of the SKU's eligible mould pool
-                              (Master_Mapping_Mould_SKU) — a CONSTANT per SKU,
-                              independent of what is mounted right now. So
-                              Mould in USE ≤ Total Eligible Moulds always.
-    It is an EVENT LOG: for each SKU, consecutive shifts (across days) with an
-    UNCHANGED 'Mould in USE' count are merged into one interval, and a new row is
-    emitted only when that count changes (StartTime→EndTime span the interval). A
-    press changing over — which moves that SKU's mould count up or down — starts a
-    new row. Only intervals with Mould in USE > 0 are emitted.
-    Returns dicts: Date, StartTime, EndTime, SKU Code, Mould in USE,
-    Total Eligible Moulds (Description is added by the sheet writer). Empty if no
-    mould_info."""
+                       (Master_Mapping_Mould_SKU) — CONSTANT per SKU, 0 if the SKU
+                       has no eligible moulds. So Mould in USE ≤ Total Eligible always.
+    A day on which the SKU never runs → Mould in USE = 0 (row still present). The
+    SKU universe is EVERY SKU in the demand file, so the sheet is a complete
+    days×SKUs grid. Returns dicts: Date, SKU Code, Mould in USE, Total Eligible
+    Moulds (Description added by the sheet writer). Empty if no mould_info."""
     if not mould_info:
         return []
     eligible = {str(s): set(ms) for s, ms in (mould_info.get("sku_moulds") or {}).items()}
@@ -1522,7 +1518,6 @@ def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict) -> list:
 
     # RUNNING (press, sku) grouped by (date, shift)
     by_ds: dict = defaultdict(list)
-    dates: set = set()
     for r in cure_shift_rows:
         if str(r.get("_status", "RUNNING")) != "RUNNING":
             continue
@@ -1531,7 +1526,6 @@ def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict) -> list:
             continue
         d = str(r.get("Date")); sh = str(r.get("Shift"))
         by_ds[(d, sh)].append((str(r.get("Machine")), sku))
-        dates.add(d)
 
     # per-(date,shift) in-use mould count per SKU
     inuse: dict = {}
@@ -1542,37 +1536,17 @@ def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict) -> list:
             mbs[sku] |= ms if ms else {f"__{press}_a", f"__{press}_b"}
         inuse[(d, sh)] = {sku: len(ms) for sku, ms in mbs.items()}
 
-    # ordered timeline across the whole plan; walk each SKU and split on count change
-    timeline = [(d, sh) for d in sorted(dates) for sh in ("A", "B", "C")]
-    all_skus: set = set()
-    for v in inuse.values():
-        all_skus |= set(v)
-
+    # Fixed grid: every (calendar day, demand SKU). Day count = PLANNING_DAYS, so
+    # dates come from plan_start (not just days that ran) → exact days×SKUs rows.
+    day_dates = [(plan_start + timedelta(days=i)).strftime("%Y-%m-%d")
+                 for i in range(planning_days)]
+    skus = sorted({str(s).strip() for s in demand_skus if str(s).strip()})
     rows = []
-    for sku in sorted(all_skus):
-        tot = len(eligible.get(sku, set()))
-        cur_val = 0; start_i = None
-        for i, key in enumerate(timeline):
-            v = inuse.get(key, {}).get(sku, 0)
-            if v == cur_val:
-                continue
-            if cur_val > 0 and start_i is not None:        # close the open interval
-                sd, ssh = timeline[start_i]; ed, esh = timeline[i - 1]
-                _st = _shift_start_dt(sd, ssh)
-                _en = _shift_start_dt(ed, esh) + timedelta(minutes=SHIFT_MINS)
-                rows.append({"Date": sd, "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(_en),
-                             "SKU Code": sku, "Mould in USE": cur_val,
-                             "Total Eligible Moulds": tot})
-            cur_val = v
-            start_i = i if v > 0 else None
-        if cur_val > 0 and start_i is not None:            # close a trailing interval
-            sd, ssh = timeline[start_i]; ed, esh = timeline[-1]
-            _st = _shift_start_dt(sd, ssh)
-            _en = _shift_start_dt(ed, esh) + timedelta(minutes=SHIFT_MINS)
-            rows.append({"Date": sd, "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(_en),
-                         "SKU Code": sku, "Mould in USE": cur_val,
-                         "Total Eligible Moulds": tot})
-    rows.sort(key=lambda r: (r["StartTime"], r["SKU Code"]))
+    for d in day_dates:                       # date-major (day 1 all SKUs, then day 2…)
+        for sku in skus:
+            day_max = max(inuse.get((d, sh), {}).get(sku, 0) for sh in ("A", "B", "C"))
+            rows.append({"Date": d, "SKU Code": sku, "Mould in USE": day_max,
+                         "Total Eligible Moulds": len(eligible.get(sku, set()))})
     return rows
 
 
@@ -4428,22 +4402,23 @@ def _write_rolling_curing_excel(
         ws2.freeze_panes = "A3"
 
     # ── Sheet 4c: MouldInUse ──────────────────────────────────────────────────
-    # Per-SKU mould occupancy over time: how many of an SKU's moulds are mounted on
-    # running presses ("Mould in USE") vs its total eligible mould pool
-    # ("Total Eligible Moulds", constant). Event log — one row per constant-in-use
-    # interval (merged across shifts and days); a curing CO that changes the count
-    # starts a new row (see _mould_in_use_rows).
+    # Fixed daily grid: one row per (calendar day, demand SKU) = PLANNING_DAYS ×
+    # #demand-SKUs rows. "Mould in USE" = the MAX across that day's 3 shifts of the
+    # SKU's moulds mounted on running presses (a mid-day curing CO drops a shift's
+    # count, so the peak shift wins). "Total Eligible Moulds" = the SKU's eligible
+    # pool size, constant (0 if none). Days with no run → 0. See _mould_in_use_rows.
     ws = wb.create_sheet("MouldInUse")
-    miu_cols = ["Date", "StartTime", "EndTime", "SKU Code", "Description",
+    miu_cols = ["Date", "SKU Code", "Description",
                 "Mould in USE", "Total Eligible Moulds"]
     _sdesc = sku_desc_map or {}
-    _miu = _mould_in_use_rows(cure_shift_rows, mould_info)
+    _miu = _mould_in_use_rows(cure_shift_rows, mould_info, demand_dict,
+                              planning_days, plan_start)
     ws.cell(row=1, column=1, value=(
-        f"Mould occupancy per SKU over time (event log — new row when the in-use "
-        f"count changes)  |  rows: {len(_miu)}  |  "
-        "Mould in USE = the SKU's moulds mounted on running presses; "
-        "Total Eligible Moulds = size of the SKU's eligible mould pool "
-        "(Master_Mapping_Mould_SKU), constant per SKU."
+        f"Daily mould occupancy per SKU (grid: {planning_days} days × "
+        f"{len(demand_dict)} demand SKUs = {len(_miu)} rows)  |  "
+        "Mould in USE = MAX over the day's 3 shifts of the SKU's moulds mounted on "
+        "running presses; Total Eligible Moulds = size of the SKU's eligible mould "
+        "pool (Master_Mapping_Mould_SKU), constant per SKU."
         if _miu else
         "Mould gate OFF — no mould state to report (run with MOULD_GATE=1)."
     )).font = _bold(10)
@@ -4453,12 +4428,10 @@ def _write_rolling_curing_excel(
         for _ci, _h in enumerate(miu_cols, 1):
             ws.cell(row=_ri, column=_ci, value=_r.get(_h, "")).alignment = _ctr()
     ws.column_dimensions["A"].width = 12
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 32
-    ws.column_dimensions["E"].width = 40
-    ws.column_dimensions["F"].width = 14
-    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["C"].width = 40
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 18
     ws.freeze_panes = "A3"
 
     # ── Sheet 5: Machine Schedule ─────────────────────────────────────────────
@@ -4857,9 +4830,16 @@ def run_rolling_pipeline(
     build_output:   str | None = None,
     curing_output:  str | None = None,
     sku_desc_map:   dict | None = None,
+    restrict_to_allowable_presses: bool = False,
 ) -> dict:
     """
     Rolling day-by-day B2C pipeline.
+
+    restrict_to_allowable_presses (LOCAL-ONLY, default OFF): when True, drop any
+    running-moulds press that is NOT in the 170-press allowable matrix, so only
+    the allowable presses exist. local_main.py passes bc_config
+    .RESTRICT_PRESSES_TO_ALLOWABLE here; the cloud path never passes it (stays
+    False), so cloud behaviour is unaffected.
 
     Generates building and curing schedules simultaneously:
       - Building machines are assigned based on actual GT deficit each day
@@ -5089,6 +5069,29 @@ def run_rolling_pipeline(
 
     # ── C: Press state ────────────────────────────────────────────────────────
     df_moulds = cetl.load_running_moulds()
+    # LOCAL-ONLY (default OFF): restrict the roster to the 170 allowable presses.
+    # The running-moulds snapshot occasionally carries presses NOT in the
+    # allowable matrix (e.g. Aug 85207–85215); they can never CO anywhere. When
+    # enabled, drop them here — before press_state AND the Day-0 mould seeding
+    # (both iterate df_moulds) — so their moulds return to the free pool and only
+    # the 170 allowable presses exist. Cloud never sets this flag → no-op there.
+    if restrict_to_allowable_presses:
+        try:
+            _allowed_presses = cetl.load_allowable_press_ids()
+        except Exception as _e:
+            _allowed_presses = set()
+            print(f"  [Rolling] allowable-press roster load FAILED ({_e}); "
+                  f"no press restriction applied")
+        if _allowed_presses:
+            _mcol = df_moulds["Machine"].astype(str)
+            _keep = _mcol.isin(_allowed_presses)
+            _dropped = sorted(set(_mcol[~_keep]))
+            _before = _mcol.nunique()
+            df_moulds = df_moulds[_keep].reset_index(drop=True)
+            _after = df_moulds["Machine"].astype(str).nunique()
+            print(f"  [Rolling] Press roster restricted to allowable matrix: "
+                  f"{_before} → {_after} presses "
+                  f"({len(_dropped)} dropped: {_dropped})")
     press_state: dict[str, dict] = {}
     for _, r in df_moulds.iterrows():
         press_state[str(r["Machine"])] = {"sku": str(r["SKUCode"]), "status": "RUNNING"}

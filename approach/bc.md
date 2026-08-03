@@ -7,11 +7,12 @@
 > report (27 FIXED single-inch / 12 FLEXIBLE), ±2 band OFF; **(2) Lever A `FLEX_SCARCE_INCH`** —
 > flexible machines feed the scarcest allowed inch (+3,804 net); **(3) Lever B `FIXED_ESCAPE`
 > REJECTED** (−2,572, off); plus mould gate + retarget + CO scorer + mould life v2 + mould clean +
-> 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 10k GT cap). **Inputs:** per-month
+> 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 8k GT cap). **Inputs:** per-month
 > `*_tomerji.xlsx`; ONE `Daily_Running_Moulds` table keyed by `plan_month`; single
 > `gt_inventory_manual`; building start-free (no building-running-machines).
-> Config: `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=10000` (⚠️ cloud pins 7000 / a
-> bc_config note mentions 6000 — see §8), `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
+> Config: `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=8000` (env `GT_CAP_MAX`; cloud
+> aligned — `main.CLOUD_CONFIG` pins 8000 too, so local↔cloud byte-parity; see §8),
+> `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
 > **Adopted LOCAL KPIs (mould-audit PASS, cap 0-over, deterministic, per-month opening GT):** June
 > 636,201/88.64% · July 673,221/86.38% · Aug 648,118/92.33% = **1,957,540 / 89.03%**. The rules are physical
 > restrictions that make the plan floor-realistic (KPI below the mould-blind baseline by design).
@@ -480,11 +481,12 @@ structurally ~47% by design (15 machines for ~11.5-equiv demand).
 
 ---
 
-## 8. NEW LOGIC — forward buffer + GT cap (10k) + risk gate
+## 8. NEW LOGIC — forward buffer + GT cap (8k) + risk gate
 
-> **GT cap = `MAX_ENDOFDAY_GT_INVENTORY = 10000`** (committed local; the dynamic buffer β=2 needs
-> the headroom). ⚠️ `main.CLOUD_CONFIG` still pins 7000 and a `bc_config.py:19` note mentions 6000
-> — final value undecided. The "8,000" figures below are from an earlier revision; read as the cap.
+> **GT cap = `MAX_ENDOFDAY_GT_INVENTORY = 8000`** (RESOLVED — bc_config, env `GT_CAP_MAX`, default
+> "8000"). `main.CLOUD_CONFIG` now pins **8000** too (previously a stale 7000), so the cap is 8,000
+> **everywhere** and local↔cloud are byte-parity. The earlier "10k committed / cloud pins 7000 / a
+> bc_config note mentions 6000 / final value undecided" open item is closed.
 
 Three buffers now cover three distinct needs:
 - **Flat buffer** (`GT_BUFFER_SHIFTS`): survive steady curing (VMI = 2, others = 1).
@@ -532,6 +534,36 @@ next SKU that runs dry.
 Ungated (risk=0): buffer clogs, mean inventory 7,877 → 681k cured
 Gated (risk=1.0): mean inventory 3,664           → 690k cured
 ```
+
+### 8.3 Delivery-date / priority-flag committed-delivery SKUs (LIVE, local + cloud)
+
+Client feature. A SKU is **committed** to a delivery date and must be fully **cured** by it — the
+client accepts a KPI drop to hit the date (**meeting the date > overall KPI**). Master toggle
+`bc_config.DELIVERY_PRIORITY_ENABLED` (top of `bc_config.py`, default ON; **INERT** with no priority
+data → June + non-priority files run bit-for-bit).
+- **Input (local):** two optional demand-file columns — **`Priority Flag`** (`0`/`1`/`Yes`) and
+  **`Delivery Date`** (`DD/MM/YY`). A SKU is committed when its flag is set **OR** it has a valid
+  date (a date implies commitment even if the flag is off); flag-set + no date → committed by
+  **end of month**. **Input (cloud):** `jkt_demand.priorityFlag`/`deliveryDate`, gated by
+  `jkt_plan_params.impPriorityFlag` (§17.1).
+- **One shared EDF self-pacing signal** `required_presses = ceil(remaining / (rate · days_to_deadline))`
+  drives BOTH stages (curing is derived from building, so a committed SKU needs presses **and** its GT
+  built in time): **Phase-0 curing-CO** acquires/holds presses (a committed press is never CO'd away
+  pre-deadline; acquisition capped at the SKU's **mould-pair count** — extra presses can't get moulds —
+  and JIT-paced by `DP_PACE_MARGIN`, default **99 = fill to the mould cap = adopted "full mould-cap"**);
+  **building** (`_assign_building_shift._bld_prio`) boosts a behind committed SKU EDF-first in
+  `_key`/Phase-A/Phase-C.
+- **All edits ORDERING-ONLY:** demand cap, historical inch-lock (§4.5), mould feasibility, GT
+  shelf/cap all untouched; **no invented machine↔SKU pairs** (DB-allowable + DB moulds only).
+  Env sub-levers: `DP_ACQUIRE`, `DP_RESERVE` (measured a NO-OP, kept as a guard), `DP_MOULDCAP`,
+  `DP_PACE_MARGIN`, `DP_BLD`. A **"PRIORITY FULFILLMENT"** terminal table + `res["priority_report"]`
+  give per-SKU demand / deadline / cured-by-deadline / shortfall / earliest-feasible date.
+- **KPIs (deterministic 2-seed, mould-audit PASS, cap 0-over):** June ON==OFF = 634,086 (inert);
+  July 672,696 → **671,324 (−1,372)** (HURL4 ~met, HTORE INFEASIBLE = only 1 allowable press);
+  Aug 649,334 → **638,594 (−10,740)** (QRAT0 met, VRHE1 3,884→5,023 mould-contended, HRHB0 INFEASIBLE
+  = 1 mould-pair, HRHP0 1,000→896 EDF contention). **Collateral ≈ 4 units lost per committed unit
+  pulled earlier = shared-mould contention (a hard capacity limit, not misallocation); 2 SKUs are
+  physically infeasible by date.**
 
 ---
 
@@ -641,7 +673,8 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 | `GT_SHELF_LIFE_SHIFTS` | 9 | `GT_SHELF_LIFE_DAYS × 3` — forward-buffer horizon |
 | `CARCASS_SHELF_LIFE_DAYS` | 1 | Stage-1 carcass shelf life |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | 3 | TopUp pre-build days (legacy); must equal shelf life |
-| `MAX_ENDOFDAY_GT_INVENTORY` | **10000** | Overnight GT-hold cap (dynamic buffer β=2 needs it; ⚠️ cloud pins 7000, a bc_config note mentions 6000 — see §8) |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Overnight GT-hold cap (env `GT_CAP_MAX`, default "8000"); **`main.CLOUD_CONFIG` pins 8000 too — local↔cloud aligned** (§8) |
+| `DELIVERY_PRIORITY_ENABLED` | **True** | Master toggle for committed-delivery SKUs (§8.3); INERT with no priority data. Cloud-gated by `jkt_plan_params.impPriorityFlag` (§17.1) |
 | `INCH_HIST_LOCK_ENABLED` / `_MIN_SHARE` / `_MAX_INCHES` | **True / 0.02 / 3** | Historical inch-lock: per-machine allowed-inch sets from the 4-mo report (§4.5) |
 | `FLEX_SCARCE_INCH` (env) | **ON** | Lever A — flexible machines feed the scarcest allowed inch (§4.5) |
 | `FIXED_ESCAPE_ENABLED` | **False** | Lever B (fixed-machine escape) — REJECTED, kept off (§4.5) |
@@ -718,10 +751,15 @@ building-side starvation.
 ## 16. Current KPIs (ADOPTED approach 2026-08 — historical inch-lock + Lever A)
 
 Committed default: **historical inch-lock (INCH_HIST_LOCK, 27 fixed / 12 flexible, ±2 band OFF) +
-Lever A (FLEX_SCARCE_INCH)**, `MAX_CHANGEOVERS_PER_DAY = 12`, **10k GT cap** + dynamic buffer (β=2),
+Lever A (FLEX_SCARCE_INCH)**, `MAX_CHANGEOVERS_PER_DAY = 12`, **8k GT cap** + dynamic buffer (β=2),
 forward buffer + IUkeep ON, mould-clean ON, carcass lead 2, `FIXED_ESCAPE` OFF. Inputs: per-month
 `*_tomerji.xlsx`, month-keyed `Daily_Running_Moulds` (`plan_month`), single `gt_inventory_manual`,
 building start-free. Fully deterministic; mould-audit PASS; demand-cap 0-over on all 3 months.
+
+> **These are the historical-inch-lock baseline — DELIVERY_PRIORITY OFF** (`DELIVERY_PRIORITY_ENABLED`
+> is INERT with no priority data). With `impPriorityFlag = 1` on committed-delivery inputs (§8.3) the
+> effect is **June inert (634,086 ON==OFF) / July −1,372 / Aug −10,740** — accepted, since meeting the
+> committed date outranks overall KPI.
 
 | Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Cleans | Starv |
 |-------|-------------|--------|----------|----------|----------|-----------|--------|-------|
@@ -791,6 +829,23 @@ building plan less even. Producing a flat, plant-like daily curve needs a **sepa
 `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx` (historical inch-lock source, §4.5);
 `data/input/Cycle_time_Building.csv` (per-(SKU×machine) building CT); `feed_map.json`.
 
+**Cloud DB contract (the boundary tables — see §19 for the full mapping).**
+- **`connection.read_db` is PARAMS-ONLY** — it reads **everything** from **`jkt_plan_params`** alone:
+  `planStartDate`/`planEndDate`, `noOfChangeOver`, `efficiency`, `impPriorityFlag`,
+  `mouldAvailability`, `plantName`/`productName`. It does **not** read the `jkt_plan_presets` table at
+  all — the **frontend** copies the selected preset's values into the params row on plan create/edit;
+  the backend never writes back. Two BTP presets exist — **`BTP Preset Main`** (`impPriorityFlag = 1`)
+  and **`BTP Preset`** (`impPriorityFlag = 0`); CTP presets untouched.
+- **`jkt_demand`** (staged to a temp xlsx) now carries **`priorityFlag`** (`VARCHAR(10)`) +
+  **`deliveryDate`** (`DATE`) columns for the committed-delivery feature (§8.3), consumed only when
+  `impPriorityFlag = 1` (=0 → plain baseline even if the columns are populated). Priority *score* is
+  still computed in code (min-max of requirement), so `jkt_demand` needs only `skuCode` + `requirement`
+  for the base plan.
+- **`main._set_plan_month(plan_start)`** derives `plan_month` per run and sets
+  `RUNNING_MOULDS_MONTH`/`PLAN_MONTH` on `bc_config` + all engine modules, so a live cloud run for any
+  month ≠ the `bc_config` file default reads the **correct** month's running-moulds + opening GT
+  (fixes a prior multi-month cloud correctness bug).
+
 ### 17.2 Output files
 All output paths are **stamped with `PLAN_START` (+ horizon)** so a new month never overwrites the
 previous: `curing_consumption_<days>day_<date>.xlsx`, `bc_building_schedule_<date>.xlsx`,
@@ -840,7 +895,7 @@ the `DEFAULT_CURING_CT = 17` default (no real data). (For May demand all 85 SKUs
 | RI demand fulfilled mid-cycle | Cap building to 0; freed press enters CO queue (`demand_done_free`) |
 | Stage-1 machine unavailable for a Stage-2 assignment | Stage-2 removed that shift; carcass shortfall logged |
 | Machine spare minutes < CO cost + one campaign | Machine treated as occupied; no new SKU |
-| End-of-day GT would exceed 10k | Forward buffer bounded proactively so carry ≤ 10,000 |
+| End-of-day GT would exceed 8k | Forward buffer bounded proactively so carry ≤ 8,000 |
 
 ---
 
@@ -861,7 +916,7 @@ the `DEFAULT_CURING_CT = 17` default (no real data). (For May demand all 85 SKUs
 ## 20. Framing-
 
 When answering "should we / what if / what's wrong":
-1. **Which invariant does it touch?** (demand cap, CO caps, Stage-1/2 dependency, no-waste / 10k cap)
+1. **Which invariant does it touch?** (demand cap, CO caps, Stage-1/2 dependency, no-waste / 8k cap)
 2. **Which SKU category?** (RI / RO / NRI)
 3. **Which machines?** (Stage-1 under-utilised by design; VMI 7001/7003 soft-locked; flex = VMI+BJ)
 4. **Config, logic, or data change?**
@@ -877,16 +932,19 @@ When answering "should we / what if / what's wrong":
 The engine is unchanged by deployment; only its I/O is wrapped. **Three things
 cross the local↔cloud boundary — demand, run params, outputs.** Masters and the
 running-moulds snapshot are read from the DB by the engine's own ETL on both paths.
+**Parity:** `local_main.py` == `main.py` byte-identical on all 7 KPIs for June/July/August, with
+DELIVERY_PRIORITY active on cloud (read from `jkt_demand`, gated by `jkt_plan_params.impPriorityFlag`).
 
 ### 19.1 Modules
 
 | File | Role |
 |------|------|
 | `local_main.py` | LOCAL entry — Excel in/out, reads `bc_config`. Parity anchor. |
-| `main.py` | CLOUD orchestrator — `run_plan(plan_id)`: `read_db` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (18 pinned tuning params). |
-| `connection.py` | DB adapter — `read_db()` (3 input tables) / `write_db()` (5 output tables), `now_ist()`. |
+| `main.py` | CLOUD orchestrator — `run_plan(plan_id)`: `read_db` → `_set_plan_month(plan_start)` (derives `plan_month`, sets `RUNNING_MOULDS_MONTH`/`PLAN_MONTH` on `bc_config` + engine modules) → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (pinned tuning params, now incl. `MAX_ENDOFDAY_GT_INVENTORY = 8000`, `CURING_PRESS_COUNT = 170`, `DELIVERY_PRIORITY_ENABLED`). |
+| `connection.py` | DB adapter — **`read_db()` is PARAMS-ONLY** (reads only `jkt_plan_params`; `jkt_demand` staged separately) / `write_db()` (5 output tables), `now_ist()`. Does **not** read `jkt_plan_presets`. |
 | `app.py` | Flask API (synchronous). |
-| `Dockerfile` | `python:3.14-slim` + tzdata; gunicorn 1 worker / 4 threads / 1800 s. |
+| `Dockerfile` | `python:3.14-slim` + tzdata; gunicorn 1 worker / 4 threads / 1800 s. Published `anmolsaini07/jkt-btp-planning:v2` (& `:latest`), linux/amd64, ~145 MB. |
+| `.dockerignore` | Re-includes 3 engine reference files read from the filesystem every run (else the cloud engine silently falls back and diverges from local): `data/input/Cycle_time_Building.csv`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx`. |
 
 ### 19.2 What drives what
 
@@ -896,7 +954,8 @@ running-moulds snapshot are read from the DB by the engine's own ETL on both pat
 | demand | `DEMAND_FILE` xlsx | `jkt_demand` (staged to a temp xlsx) |
 | `MAX_CHANGEOVERS_PER_DAY` | `bc_config` | `jkt_plan_params.noOfChangeOver` |
 | `PRESS_EFFICIENCY` | `ConsumptionConfig` | `jkt_plan_params.efficiency` (stored as %, ÷100) |
-| the 18 tuning knobs incl. `RUNNING_MOULDS_TABLE` | `bc_config` | **`main.CLOUD_CONFIG`** (pinned before the engine imports) |
+| committed-delivery ON/OFF (§8.3) | `DELIVERY_PRIORITY_ENABLED` + demand columns | `jkt_plan_params.impPriorityFlag` gates `jkt_demand.priorityFlag`/`deliveryDate` |
+| the pinned tuning knobs incl. `RUNNING_MOULDS_TABLE`, `MAX_ENDOFDAY_GT_INVENTORY = 8000`, `CURING_PRESS_COUNT = 170` | `bc_config` | **`main.CLOUD_CONFIG`** (pinned before the engine imports) |
 
 Editing `bc_config` therefore affects the **local run only**. To change a cloud
 tuning value edit `main.CLOUD_CONFIG`; for a per-run value edit the DB row.
@@ -916,14 +975,21 @@ Errors: `{status, stage, mode, plan_id, message}` + 400 / 404 / 409 (a run is
 already in progress) / 422 / 500. One run at a time (`_RUN_LOCK`); re-running a
 `plan_id` **overwrites** its rows. Full frontend guide: `API.md`.
 
-### 19.4 Output tables (all stamped `plan_id`, timestamps IST)
+### 19.4 Output tables (5, all stamped `plan_id`, timestamps IST)
 
-`jkt_plan_building` · `jkt_plan_curing` · `jkt_plan_Infeasibility` ·
-`jkt_plan_kpis` (PK) · `jkt_plan_capacityUtilisation` (PK, **one overall/monthly
-row**, not per-day).
+`jkt_plan_building` · `jkt_plan_curing` · `jkt_plan_Infeasibility` · `jkt_plan_kpis` ·
+`jkt_plan_capacityUtilisation`.
 
+* **`jkt_plan_kpis`** — **single row/plan, 15 metrics:** `demandFulfillment`,
+  `capacityUtilisation` (curing), `building_`/`building_s2_`/`stage1_`/`vmi_`/`bj_`/`uniNarrow_capacityUtilisation`,
+  `curingChangeovers`, `buildingChangeovers_sameSize`/`_diffSize`/`_total`. The curing
+  `capacityUtilisation` denominator is `CURING_PRESS_COUNT = 170` (`b2c_pipeline._daily_capacity_util`:
+  `cure_avail = CURING_PRESS_COUNT × 1440`), pinned in `CLOUD_CONFIG`.
+* **`jkt_plan_capacityUtilisation`** — **DAILY curing utilisation** (composite PK `plan_id + date`),
+  **`planning_days` rows/plan** (was mis-described as one overall/monthly row).
 * **Priority score** is computed in code (min-max of requirement) — `jkt_demand`
-  needs only `skuCode` + `requirement`, no priority column.
+  needs only `skuCode` + `requirement` for the base plan (the `priorityFlag`/`deliveryDate`
+  columns drive the separate committed-delivery feature, §8.3).
 * **`curingChangeovers`** = planned + dynamic (total).
 * **`jkt_plan_Infeasibility`** stores UNMET + missing-master + **zero-production**
   SKUs. The last case matters: the engine labels a SKU UNMET only when

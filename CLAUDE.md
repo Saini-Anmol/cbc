@@ -297,8 +297,18 @@ July 672,696→**671,324 (−1,372)** — HTORE (d20) 0→1,360 **INFEASIBLE (1 
 3,884→5,023 (10 shared moulds contended, can't hit 9,900), HRHB0 (d11) 616→1,364 **INFEASIBLE (1
 mould-pair)**, HRHP0 (d27) 1,000→896 (−104 EDF contention, accepted). **Collateral ≈4 units lost
 per committed unit pulled earlier = shared-mould contention (a hard capacity limit, not
-misallocation).** Phase-0-alone (no building coupling) HURTS. Cloud follow-up (non-blocking): add
-`priorityFlag`/`deliveryDate` to `jkt_demand` + `connection.py:read_db` SELECT.
+misallocation).** Phase-0-alone (no building coupling) HURTS.
+
+**CLOUD wiring — LIVE (params-only, gated by `impPriorityFlag`).** On cloud the feature is gated by
+**`jkt_plan_params.impPriorityFlag`**: `=1` → `connection.read_db` reads `jkt_demand.priorityFlag`
+(VARCHAR) + `deliveryDate` (DATE) and stages them as `Priority Flag`/`Delivery Date` so the engine
+activates identically to a local Excel run; `=0` → they are NOT read (plain baseline even if the
+columns are populated). **`read_db` is PARAMS-ONLY** — impPriorityFlag / mouldAvailability /
+noOfChangeOver / efficiency / dates all come from `jkt_plan_params`; the backend does NOT read the
+preset table (the FRONTEND copies the selected preset's values into params on plan create/edit; no
+backend copy-back). Two BTP presets exist: **`BTP Preset Main`** (impPriorityFlag=1) / **`BTP Preset`**
+(impPriorityFlag=0); CTP presets untouched. Cloud parity verified: with `impPriorityFlag=1`, cloud ==
+local (July 671,324 / Aug 638,594); with `=0`, cloud == baseline (672,696 / 649,334) — byte-identical.
 
 ---
 
@@ -565,7 +575,7 @@ CO fires instantly when Runner-In demand is fulfilled; counts toward `MAX_CHANGE
 | `OVERBUILD_BUFFER_FRAC` | 0.2 | LP headroom above net demand per day (prevents cap collapse). |
 | `TOPUP_LOOKAHEAD_DAYS_GT` | **3** | How many days ahead TopUp pre-builds GT. Must equal `GT_SHELF_LIFE_DAYS = 3`. |
 | `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap per calendar day (12 this cycle for the surplus-release test; plant hard limit is 18). Single source of truth in `bc_config.py`. Sweep with forward-buffer live (8→14): all 98.9–99.9%; 14→692,988/99.89%, 12→690,180/99.49% (lowest starvation). Total curing COs scale 174→250. |
-| `MAX_ENDOFDAY_GT_INVENTORY` | **7000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 7,000 (was 8,000 → 10,000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). Audit column `EndDay_GT_Inventory` in building "Daily GT & Carcass" sheet. |
+| `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Hard plant storage limit: total GT held overnight (all SKUs, after curing + writeoff) ≤ 8,000 (env `GT_CAP_MAX`, default 8000). Enforced proactively by the forward-buffer (`_ENDOFDAY_GT_CAP_ENABLED`). **`main.CLOUD_CONFIG` pins 8000 too — aligned for local↔cloud byte-parity** (the old 7000/10000 drift is resolved). Audit column `EndDay_GT_Inventory` in building "Daily GT & Carcass" sheet. |
 | `MOULD_CLEAN_CYCLES` / `MOULD_CLEAN_MINS` | **3000 / 480** | Mould clean: 3,000 cycles (=6,000 tyres) → 8h (480 min = 1 shift) clean, then reset. Toggle `_MOULD_CLEAN_ENABLED` (default ON). See "Mould setup + mould clean". |
 | `RUNNING_MOULDS_TABLE` | **"Daily\_Running\_Moulds"** | Single source of truth for the Day-0 running-moulds ETL table (curing press state). All 4 SQL sites import it. **ALWAYS `Daily_Running_Moulds` (the live snapshot) — every month, local and cloud. Do NOT switch to the historical `testing_` / `june_` variants; they are retired.** Pinned for cloud in `main.CLOUD_CONFIG`. |
 | `_CO_SHIFT_SPREAD_ENABLED` | **True** | Spread planned curing COs across A/B/C by when each press finishes its old SKU (hardcoded ON; flip to `False` → old shift-A-only). |
@@ -613,19 +623,20 @@ current SKU's press shouldn't starve while the machine is away. Applies to all m
 
 ## Forward-buffer + GT cap + starvation-risk gate (LIVE, the +16k win)
 
-> **The committed cap is `MAX_ENDOFDAY_GT_INVENTORY = 10000`** (bc_config, local) — the dynamic
-> buffer (β=2, natural GT peak ~9.3k) needs the 10k headroom. The adopted 3-month KPIs were
-> measured at 10k. ⚠️ **Open item:** `main.CLOUD_CONFIG` still pins **7000** (stale) and a note at
-> `bc_config.py:19` mentions **6000** — the final cap + cloud/local alignment is undecided. Older
-> "+16k" decomposition text below was measured at 10k and illustrates the *mechanism* only.
+> **The committed cap is `MAX_ENDOFDAY_GT_INVENTORY = 8000`** (bc_config, env `GT_CAP_MAX`) and
+> **`main.CLOUD_CONFIG` pins the SAME 8000** — the earlier 7000-stale / 10000 / 6000 drift is
+> RESOLVED; local and cloud are aligned (byte-parity verified June/July/August). The older "+16k"
+> decomposition text below was measured at the historical 10k cap and illustrates the *mechanism*
+> only — the adopted-approach KPIs are at 8k.
 
 The residual gap was NOT curing-press/15"-tooling limited as previously believed — it was **mostly
 building-side starvation**: late-month building machines sit 51–56% utilised (~15k idle machine-min/day)
 while presses run (have demand) with zero GT. Three coupled changes close it: **674,422 → 690,180
 cured (97.2% → 99.5%)**, starvation 1,508 → 911. All toggle-gated; OFF reproduces 674,422 bit-for-bit.
 
-**Feature 1 — 10k end-of-day GT-inventory cap** (`_ENDOFDAY_GT_CAP_ENABLED`, `b2c_pipeline.py:186`,
-env `GT_CAP`; value `MAX_ENDOFDAY_GT_INVENTORY = 10000` in `bc_config.py`). Total GT held overnight
+**Feature 1 — end-of-day GT-inventory cap** (`_ENDOFDAY_GT_CAP_ENABLED`, `b2c_pipeline.py:186`,
+env `GT_CAP`; committed value `MAX_ENDOFDAY_GT_INVENTORY = 8000` — the 10k below is the historical
+mechanism figure). Total GT held overnight
 (sum over all SKUs, after curing + writeoff) ≤ 10,000 — a hard plant storage limit. Enforced
 **proactively** (the forward buffer is bounded so overnight carry never exceeds 10k), NOT reactive
 writeoff. Audit column `EndDay_GT_Inventory` added to building "Daily GT & Carcass" sheet (verified
@@ -770,34 +781,43 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | File | Role |
 |------|------|
 | [local_main.py](local_main.py) | **LOCAL entry point** — Excel in/out, reads `bc_config`. Parity anchor. |
-| [main.py](main.py) | **CLOUD orchestrator** — `run_plan(plan_id)`: `read_db` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (18 pinned params). |
-| [connection.py](connection.py) | DB adapter — `read_db()` (3 input tables) / `write_db()` (4 output tables) + `now_ist()`. |
+| [main.py](main.py) | **CLOUD orchestrator** — `run_plan(plan_id)`: `read_db` → `_set_plan_month` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (~20 pinned params incl `CURING_PRESS_COUNT=170`, GT cap 8000, `DELIVERY_PRIORITY_ENABLED`). `_set_plan_month(plan_start)` sets RUNNING_MOULDS_MONTH/PLAN_MONTH per run so any month reads its own Day-0 snapshot. |
+| [connection.py](connection.py) | DB adapter — `read_db()` reads **`jkt_plan_params` ONLY** (params-only; dates/CO/efficiency/impPriorityFlag/mouldAvailability — NOT the preset table) + `jkt_demand` (incl `priorityFlag`/`deliveryDate` when `impPriorityFlag=1`); `write_db()` → **5 output tables** + `now_ist()`. |
 | [app.py](app.py) | **Flask API** — `POST /app/v1/jkt/planning-scheduling/plan/generate-plan {plan_id}`, `GET /health`. Synchronous. |
 | [approach/deployment.md](approach/deployment.md) | Deployment spec — DB contract, config mapping, phases, parity-gate results. |
 | [requirements.txt](requirements.txt) | Pinned runtime deps (Flask, SQLAlchemy, PyMySQL, pandas, numpy, scipy, openpyxl). |
+| [Dockerfile](Dockerfile) / [.dockerignore](.dockerignore) | linux/amd64 image (gunicorn, port 5001). **`.dockerignore` MUST re-include 3 engine reference files** (`data/input/Cycle_time_Building.csv`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `machine_inch_dominant_4months_Apr-Jul.xlsx`) — read from the filesystem every run; without them the cloud engine silently falls back and diverges from local. Secrets injected at runtime (`--env-file .env`, never baked). Published: `anmolsaini07/jkt-btp-planning:v2` (+ `:latest`), ~145 MB. |
 
 ---
 
 ## Deployment — local vs cloud (what drives what)
 
 One engine, two I/O paths. **Only these cross the boundary: demand, per-run params, outputs.**
-Masters + running-moulds are read from the DB by the engine's own ETL on both paths.
+Masters + running-moulds are read from the DB by the engine's own ETL on both paths. **Cloud
+`read_db` is PARAMS-ONLY** — every per-run knob comes from `jkt_plan_params`; the backend does
+**not** read `jkt_plan_presets` (the FRONTEND copies the selected preset's values into the params
+row on plan create/edit; there is no backend copy-back).
 
-| Value | LOCAL source | CLOUD source | Editing `bc_config` affects cloud? |
+| Value | LOCAL source | CLOUD source (`jkt_plan_params` unless noted) | Editing `bc_config` affects cloud? |
 |-------|--------------|--------------|-----------------------------------|
-| `PLAN_START` / `PLANNING_DAYS` | `bc_config` | `jkt_plan_params.planStartDate/planEndDate` | **No** |
+| `PLAN_START` / `PLANNING_DAYS` | `bc_config` | `planStartDate` / `planEndDate` | **No** |
+| plan_month (Day-0 snapshot + opening GT) | env / `PLAN_START` | derived from `planStartDate` by `main._set_plan_month` (per run) | **No** |
 | `DEMAND_FILE` | `bc_config` | `jkt_demand` (staged to a temp xlsx) | **No** |
-| `MAX_CHANGEOVERS_PER_DAY` | `bc_config` | `jkt_plan_params.noOfChangeOver` | **No** |
-| `PRESS_EFFICIENCY` | `ConsumptionConfig` | `jkt_plan_params.efficiency` (stored as %, ÷100) | **No** |
-| The 18 tuning knobs (GT cap, mould clean, campaign mins, `RUNNING_MOULDS_TABLE`, …) | `bc_config` | **`main.CLOUD_CONFIG`** (pinned, applied before the engine imports) | **No — pinned** |
+| `MAX_CHANGEOVERS_PER_DAY` | `bc_config` | `noOfChangeOver` | **No** |
+| `PRESS_EFFICIENCY` | `ConsumptionConfig` | `efficiency` (stored as %, ÷100) | **No** |
+| **`DELIVERY_PRIORITY` gate** | Excel `Priority Flag`/`Delivery Date` cols + `DELIVERY_PRIORITY_ENABLED` | **`impPriorityFlag`** (=1 → read `jkt_demand.priorityFlag`/`deliveryDate`; =0 → baseline) | **No** |
+| `mouldAvailability` (v2/dormant) | — | `mouldAvailability` | **No** |
+| The ~20 tuning knobs (GT cap 8000, `CURING_PRESS_COUNT=170`, mould clean, campaign mins, `RUNNING_MOULDS_TABLE`, `INCH_HIST_LOCK`, …) | `bc_config` | **`main.CLOUD_CONFIG`** (pinned, applied before the engine imports) | **No — pinned** |
 
 To change a **cloud** tuning value edit `main.CLOUD_CONFIG`; to change a cloud per-run value
-edit the **DB row**. `bc_config` drives the local run only.
+edit the **`jkt_plan_params` row** (the frontend seeds it from the chosen preset). `bc_config`
+drives the local run only. **Two BTP presets** exist for the frontend: `BTP Preset Main`
+(impPriorityFlag=1 → delivery feature ON) / `BTP Preset` (impPriorityFlag=0 → OFF); CTP untouched.
 
-**Priority score** is computed in code (min-max of requirement) in
-`curing_consumption.load_demand` + `b2c_pipeline` — so `jkt_demand` needs only
-`skuCode` + `requirement`, no priority column. Any priority column in a local
-Excel is ignored.
+**ConsolidatedPriorityScore** (the min-max-of-requirement urgency weight) is still computed in code
+(`curing_consumption.load_demand` + `b2c_pipeline`) from `requirement` only — SEPARATE from the
+committed-delivery feature. The delivery feature uses `jkt_demand.priorityFlag`/`deliveryDate`
+(cloud) or the `Priority Flag`/`Delivery Date` Excel columns (local), gated as above.
 
 **API:** synchronous (returns `elapsed_seconds` when the run finishes, ~1–4 min);
 planning mode only; re-run **overwrites** that `plan_id`; 409 = a run already in progress.
