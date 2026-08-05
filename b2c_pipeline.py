@@ -1071,7 +1071,13 @@ _STAGE1_CO = (os.environ.get("STAGE1_CO",
 # cap. Bounds the gate's carcass pre-build so the buffer carried between shifts stays small.
 # Applied only when _STAGE1_CO (carcass-realism model); OFF path untouched.
 _MAX_EOD_CARCASS = int(os.environ.get("CARCASS_EOD_CAP",
-                       str(getattr(_bc_cfg, "MAX_ENDOFDAY_CARCASS_INVENTORY", 2000))))
+                       str(getattr(_bc_cfg, "MAX_ENDOFDAY_CARCASS_INVENTORY", 1200))))
+# Carcass build-to-consumption: pre-build to the Stage-2 BUILD rate (the true carcass consumer)
+# instead of max(Stage-2 rate, curing draw) → no aging-out over-build; also drives the carcass-row
+# builder to a time-windowed FIFO match (rows track GT consumption, aged-out carcass hidden).
+# Default ON; env CARCASS_NO_OVERBUILD=0 reverts to over-build + front-loaded rows bit-for-bit.
+_CARCASS_NO_OVERBUILD = (os.environ.get("CARCASS_NO_OVERBUILD",
+                         "1" if bool(getattr(_bc_cfg, "CARCASS_NO_OVERBUILD_ENABLED", False)) else "0") != "0")
 # Balanced (demand-proportional) Stage-1 inch allocation — spreads the 15 carcass machines
 # across inches ∝ carcass demand. MEASURED a no-op on the real data (carcass eligibility is
 # inch-lock-filtered, so a machine's Stage-2-carcass inch set is near-forced) → default OFF
@@ -1118,6 +1124,14 @@ _S2_MIN_CAMPAIGN_MINS = int(os.environ.get("S2_MIN_CAMPAIGN_MINS",
 # than the min-campaign on July → left disabled by default (env S2_MAX_CO_PER_DAY).
 _S2_MAX_CO_PER_DAY = int(os.environ.get("S2_MAX_CO_PER_DAY",
                          str(getattr(_bc_cfg, "S2_MAX_CO_PER_DAY", 0))))
+
+# Concentration allocation (CONC_ALLOC): defer redundant machines onto already-paced SKUs so
+# each SKU runs on ~ceil(draw/rate) machines (fewer machines, longer campaigns, fewer building
+# COs). Deferral-only + starvation-override; OFF = current selection bit-for-bit. See bc_config.
+_CONCENTRATION = (os.environ.get("CONC_ALLOC",
+                  "1" if bool(getattr(_bc_cfg, "CONCENTRATION_ENABLED", False)) else "0") != "0")
+_CONC_STARV_SHIFTS = float(os.environ.get("CONC_STARV_SHIFTS",
+                           str(getattr(_bc_cfg, "CONC_STARV_SHIFTS", 1.0))))
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1841,16 +1855,25 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
 
 
 def _stage1_carcass_rows_co(prod_log: list, s2_gt_per_sku: dict, sku_inch: dict,
-                            opening_carcass: dict | None = None) -> tuple:
+                            opening_carcass: dict | None = None,
+                            s2_gt_consume: dict | None = None,
+                            aging_shifts: int = 3) -> tuple:
     """STAGE1_CO Site 2: build carcass rows + building-CO events from the Stage-2 gate's
     OWN production log, CAPPED per SKU at what Stage-2 actually consumes (Stage-2 GT minus
-    opening carcass). Pre-built carcass that a Stage-2 machine consumes within the 1-day
-    aging window is KEPT (it's part of consumption); only the gate's never-consumed,
-    aged-out over-production is dropped. CO is recomputed on the resulting consolidated
-    sequence (60 same-inch / 180 diff, no production during the CO). A capped subsequence
-    has ≤ the gate's switches AND ≤ its production, and the gate already fit CO+production
-    in 480 min/shift → each machine-shift still fits (no overbook, no trim), and carcass
-    total == Stage-2 consumption. Returns (rows, report, co_events)."""
+    opening carcass). CO is recomputed on the resulting consolidated sequence (60 same-inch
+    / 180 diff, no production during the CO); carcass total == Stage-2 consumption.
+
+    Row-attribution has two modes:
+      • _CARCASS_NO_OVERBUILD ON (default, needs `s2_gt_consume` = per-SKU list of
+        (day, shift_ord, qty) Stage-2 consumption): a TIME-WINDOWED FIFO MATCH — each
+        Stage-2 consumption unit is matched to carcass BUILT within its `aging_shifts` window
+        (built same shift or up to aging−1 shifts earlier), oldest build first. Matched builds
+        are KEPT at their REAL build (day,shift,machine); carcass that no in-window consumer
+        ever pulls (true aged-out over-production) is DROPPED. Result: carcass rows track GT
+        consumption day-by-day and no aged-out carcass is shown.
+      • OFF: the legacy chronological emit — the gate's builds earliest-first up to the scalar
+        per-SKU target, dropping the tail (front-loads rows; kept for bit-for-bit parity).
+    Returns (rows, report, co_events)."""
     from datetime import timedelta
     _SORD = {"A": 0, "B": 1, "C": 2}
     _si = sku_inch or {}
@@ -1864,34 +1887,86 @@ def _stage1_carcass_rows_co(prod_log: list, s2_gt_per_sku: dict, sku_inch: dict,
     total_gt = float(sum(gt_int.values()))
     opening_used = float(sum(open_used_sku.values()))
     tgt = {s: gt_int[s] - open_used_sku[s] for s in gt_int}          # Stage-1's integer share
-    # Emit each SKU's gate production (chronological) up to its integer target, dropping the
-    # aged-out tail; cumulative rounding + a final top-up make the per-SKU sum EXACT.
     by_sku: dict = defaultdict(list)
     for i, e in enumerate(prod_log):
         by_sku[str(e["sku"])].append((int(e["day"]), _SORD.get(e["shift"], 0), i, e))
     kept: list = []
-    for s, entries in by_sku.items():
-        T = tgt.get(s, 0)
-        if T <= 0:
-            continue
-        ents = sorted(entries)
-        cum = 0.0; emitted = 0
-        for _k, (_d, _so, _i, e) in enumerate(ents):
-            if emitted >= T:
-                break
-            take = min(float(e["qty"]), T - cum)
-            cum += take
-            qi = int(round(cum)) - emitted
-            if _k == len(ents) - 1 and emitted + qi < T:
-                qi = T - emitted                         # last chunk → force exact
-            if qi <= 0:
+    if _CARCASS_NO_OVERBUILD and s2_gt_consume is not None:
+        # ── Time-windowed FIFO match: attribute each Stage-2 consumption unit to carcass
+        # built within the 1-day aging window; keep those builds at their real (day,shift,
+        # machine); drop carcass no in-window consumer pulls (true aged-out over-production).
+        _AG = max(1, int(aging_shifts))
+        for s in by_sku:
+            T = tgt.get(s, 0)
+            if T <= 0:
                 continue
-            emitted += qi
-            kept.append((int(e["day"]), _SORD.get(e["shift"], 0), e["date"], e["shift"],
-                         str(e["machine"]), s, qi))
-        if emitted < T and kept and kept[-1][5] == s:    # safeguard: hit the target exactly
-            r = kept[-1]
-            kept[-1] = (r[0], r[1], r[2], r[3], r[4], r[5], r[6] + (T - emitted))
+            # supply = gate carcass builds for s, oldest first (gidx then machine = deterministic)
+            sup = [[(int(e["day"]) - 1) * 3 + _so, int(e["day"]), e["date"], e["shift"],
+                    str(e["machine"]), float(e["qty"]), 0.0]            # [.., qty, matched]
+                   for (_d, _so, _i, e) in by_sku[s]]
+            sup.sort(key=lambda r: (r[0], r[4]))
+            # demand = Stage-2 consumption per (day,shift), earliest first; drop the opening-fed
+            # head (opening carcass has no Stage-1 build row) so residual demand sums to T.
+            dem = sorted(((int(_dd) - 1) * 3 + int(_so), float(_q))
+                         for (_dd, _so, _q) in s2_gt_consume.get(s, ()))
+            _skip = float(open_used_sku.get(s, 0))
+            for cidx, dq in dem:
+                if _skip > 0:
+                    _t = min(_skip, dq); _skip -= _t; dq -= _t
+                need = dq
+                if need <= 1e-9:
+                    continue
+                for r in sup:                            # FIFO within [cidx-(AG-1), cidx]
+                    if need <= 1e-9:
+                        break
+                    if r[0] > cidx or r[0] < cidx - (_AG - 1):
+                        continue
+                    _av = r[5] - r[6]
+                    if _av <= 1e-9:
+                        continue
+                    _take = min(need, _av); r[6] += _take; need -= _take
+            # emit matched supply at its real build shift, integer-rounded to hit T exactly
+            _emit = 0; _cum = 0.0
+            _matched = [r for r in sup if r[6] > 1e-9]
+            for _k, r in enumerate(_matched):
+                if _emit >= T:
+                    break
+                _cum += r[6]
+                qi = int(round(_cum)) - _emit
+                if _k == len(_matched) - 1 and _emit + qi < T:
+                    qi = T - _emit
+                if qi <= 0:
+                    continue
+                _emit += qi
+                kept.append((r[1], r[0] % 3, r[2], r[3], r[4], s, qi))
+            if _emit < T and kept and kept[-1][5] == s:  # safeguard: hit T exactly
+                rr = kept[-1]
+                kept[-1] = (rr[0], rr[1], rr[2], rr[3], rr[4], rr[5], rr[6] + (T - _emit))
+    else:
+        # Legacy: emit each SKU's gate production chronologically up to its integer target,
+        # dropping the tail; cumulative rounding + a final top-up make the per-SKU sum EXACT.
+        for s, entries in by_sku.items():
+            T = tgt.get(s, 0)
+            if T <= 0:
+                continue
+            ents = sorted(entries)
+            cum = 0.0; emitted = 0
+            for _k, (_d, _so, _i, e) in enumerate(ents):
+                if emitted >= T:
+                    break
+                take = min(float(e["qty"]), T - cum)
+                cum += take
+                qi = int(round(cum)) - emitted
+                if _k == len(ents) - 1 and emitted + qi < T:
+                    qi = T - emitted                     # last chunk → force exact
+                if qi <= 0:
+                    continue
+                emitted += qi
+                kept.append((int(e["day"]), _SORD.get(e["shift"], 0), e["date"], e["shift"],
+                             str(e["machine"]), s, qi))
+            if emitted < T and kept and kept[-1][5] == s:  # safeguard: hit the target exactly
+                r = kept[-1]
+                kept[-1] = (r[0], r[1], r[2], r[3], r[4], r[5], r[6] + (T - emitted))
     # Lay out per machine, chronological; recompute CO on the consolidated sequence.
     bym: dict = defaultdict(list)
     for row in kept:
@@ -3003,6 +3078,40 @@ def _assign_building_shift(
             for m in machines
         }
 
+        # CONCENTRATION (CONC_ALLOC): per-shift bookkeeping of which machines already serve
+        # each SKU and how much has been committed to it this shift. Seeded by Phase A, grown
+        # by Phase B/C. Drives _over_prov below. Untouched (and _over_prov returns 0) when the
+        # lever is OFF → the selection keys are byte-identical to the committed baseline.
+        _sku_shift_machs: dict = defaultdict(set)
+        _sku_shift_qty: dict = defaultdict(float)
+
+        def _over_prov(m, sku):
+            """CONCENTRATION: 1 if giving `sku` an ADDITIONAL machine this shift would
+            over-provision it, else 0. Deferral only (ranks below still-under-served SKUs) —
+            never blocks, so a machine whose eligible SKUs are all paced still builds one (no
+            forced idle). Rules: the first machine on a SKU this shift, or a machine already
+            on it, is always 0. A STARVING SKU (on-hand GT < draw × _CONC_STARV_SHIFTS) is
+            always 0 — the deviation override that lets multiple machines rescue a behind SKU.
+            Otherwise 1 once this shift's committed build already keeps pace with the draw
+            (committed_qty >= draw), which self-limits a SKU to ~ceil(draw/rate) machines."""
+            if not _CONCENTRATION:
+                return 0
+            _machs = _sku_shift_machs.get(sku)
+            if not _machs or m in _machs:
+                return 0
+            _draw = shift_cure_demand.get(sku, 0.0)
+            if _draw <= 0:
+                return 0
+            if projected_gt.get(sku, 0.0) < _draw * _CONC_STARV_SHIFTS:
+                return 0                                   # starving → admit extra machines
+            return 1 if _sku_shift_qty.get(sku, 0.0) >= _draw else 0
+
+        def _conc_commit(m, sku, qty):
+            """Record a committed build against the per-shift concentration trackers."""
+            if _CONCENTRATION and qty > 0:
+                _sku_shift_machs[sku].add(m)
+                _sku_shift_qty[sku] += qty
+
         # ── Phase A: continuation anchor (no CO) ──
         for m in sorted(machines):
             s = stg[m]; buf = _buf_of(m); rate = s["rate"]
@@ -3075,6 +3184,7 @@ def _assign_building_shift(
                     s["campaigns"].append((cur, qty, "start"))
                     projected_gt[cur] = projected_gt.get(cur, 0.0) + qty
                     s["remaining"] -= mins
+                    _conc_commit(m, cur, qty)          # CONCENTRATION: count the continuation
                 s["primary_done"] = _defc(cur, _base_buf) <= 0
 
         # ── Phase B: global pair-scoring greedy for remaining capacity ──
@@ -3289,6 +3399,11 @@ def _assign_building_shift(
                         return (inch_penalty, STARV, tier, primary, constraint, cost, m, sku)
                     # unknown code → fall through to committed baseline
                 if _GLOBAL_CONSTRAINT_MODE == "below":
+                    if _CONCENTRATION:
+                        # Defer a redundant machine (over_prov=1) below any still-under-served
+                        # SKU, but keep inch stickiness first (never force a diff-CO to spread).
+                        return (inch_penalty, _over_prov(m, sku), tier, primary,
+                                constraint, cost, m, sku)
                     return (inch_penalty, tier, primary, constraint, cost, m, sku)
                 elif _GLOBAL_CONSTRAINT_MODE == "captive":
                     return (inch_penalty, 0 if constraint <= 1 else 1,
@@ -3320,6 +3435,7 @@ def _assign_building_shift(
                             s["campaigns"].append((_curm, _tqty, "start"))
                             projected_gt[_curm] = projected_gt.get(_curm, 0.0) + _tqty
                             s["remaining"] -= _tmins
+                            _conc_commit(m, _curm, _tqty)   # CONCENTRATION: count the top-up
                             continue                 # cur topped up → re-evaluate (defer rotation)
             _qc = _dyn_cap_qty(sku, qty)                        # bound overnight excess by 7k cap
             if _qc != qty:
@@ -3344,6 +3460,7 @@ def _assign_building_shift(
             s["campaigns"].append((sku, qty, co_type))
             projected_gt[sku] = projected_gt.get(sku, 0.0) + qty
             s["remaining"] -= (cost + mins)
+            _conc_commit(m, sku, qty)                # CONCENTRATION: count the Phase-B pick
             if not _is_cont:
                 s["co_count"] += 1
                 machine_day_co[m] = machine_day_co.get(m, 0) + 1   # S2_CAMPAIGN per-day budget
@@ -3516,6 +3633,9 @@ def _assign_building_shift(
                         key = (# DELIVERY_PRIORITY: a behind committed SKU is pre-built first
                                # (EDF). (1,0.0) constant when inactive → order-preserving.
                                _bld_prio(sku),
+                               # CONCENTRATION: defer an idle machine from piling onto an
+                               # already-paced SKU (0 constant when OFF → order-preserving).
+                               _over_prov(m, sku),
                                # Lever C: under the inch rules, keep the machine on its
                                # CURRENT inch first — only move to another in-band inch when
                                # no current-inch SKU is starving (i.e. move only for starvation).
@@ -3559,6 +3679,7 @@ def _assign_building_shift(
                     projected_gt[best] = projected_gt.get(best, 0.0) + qty
                     _fwd_added += qty
                     s["remaining"] -= (cost + mins)
+                    _conc_commit(m, best, qty)       # CONCENTRATION: count the Phase-C pre-build
                     if best != cur:
                         s["cur_sku"] = best
                         s["co_count"] += 1
@@ -6972,7 +7093,12 @@ def run_rolling_pipeline(
                               if shift_cure_demand.get(s, 0.0) > 0 and demand_remaining.get(s, 0.0) > 0}
                     for _gs in sorted(_cand, key=lambda s: (-(shift_cure_demand.get(s, 0.0)
                                                              + _s2_desired.get(s, 0.0)), s)):
-                        _rate = max(_s2_desired.get(_gs, 0.0), shift_cure_demand.get(_gs, 0.0))
+                        # Build-to-consumption: pre-build to the Stage-2 BUILD rate only (the true
+                        # carcass consumer). The old max(...) added the full CURING DRAW, which
+                        # counts BJ/Unistage GT that needs NO carcass → pre-built a surplus that
+                        # aged out and churned. _s2_desired is exactly what Stage-2 will consume.
+                        _rate = (_s2_desired.get(_gs, 0.0) if _CARCASS_NO_OVERBUILD
+                                 else max(_s2_desired.get(_gs, 0.0), shift_cure_demand.get(_gs, 0.0)))
                         if _rate <= 0:
                             continue
                         _buf = min(_rate * (1 + _STAGE1_CARCASS_LEAD),
@@ -7974,13 +8100,20 @@ def run_rolling_pipeline(
         # Stage-2 consumption (keeps pre-built-and-consumed carcass within the 1-day aging
         # window; drops only the never-consumed aged-out over-production), CO recomputed.
         _s2_gt_per_sku: dict = defaultdict(float)
+        _s2_gt_consume: dict = defaultdict(list)     # per-SKU (day, shift_ord, qty) for the FIFO match
+        _SORD_C = {"A": 0, "B": 1, "C": 2}
         for r in bld_shift_rows:
             if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
                     and (r.get("Qty", 0) or 0) > 0):
-                _s2_gt_per_sku[str(r["SKUCode"])] += r["Qty"]
+                _s = str(r["SKUCode"])
+                _s2_gt_per_sku[_s] += r["Qty"]
+                _day = int(str(r["Date"]).split("-")[-1])
+                _s2_gt_consume[_s].append((_day, _SORD_C.get(r.get("Shift"), 0), float(r["Qty"])))
         _carc_rows, _carc_rep, _carc_co = _stage1_carcass_rows_co(
             _s1_prod_log, dict(_s2_gt_per_sku), sku_inch,
-            opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None))
+            opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None),
+            s2_gt_consume=dict(_s2_gt_consume),
+            aging_shifts=max(1, _STAGE1_CARCASS_LEAD + 1))
         bld_shift_rows[:] = [r for r in bld_shift_rows if r.get("CO_Type") != "carcass"]
         bld_shift_rows.extend(_carc_rows)
         bld_co_events.extend(_carc_co)                # so Stage-1 occupancy counts the CO

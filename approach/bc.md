@@ -164,12 +164,12 @@ new month never overwrites the previous.
 
 ## 4. Machines, groups & inch policy
 
-### 4.1 Building machine groups (39 machines)
+### 4.1 Building machine groups (38 machines)
 ```
-Stage-1  (15): 6801,6802,6803,6909,6911,7601,7701,7801–7804,8001–8003,8101
+Stage-1  (14): 6802,6803,6909,6911,7601,7701,7801–7804,8001–8003,8101   (6801/bj1stage1 retired by plant)
    → Carcass (semi-finished). Feeds Stage-2 only.
 Stage-2  (6):  8201,8301,8302,8501,8502,7301
-   → GT, requires Stage-1 carcass as input. BOTTLENECK (6 vs 15 Stage-1).
+   → GT, requires Stage-1 carcass as input. BOTTLENECK (6 vs 14 Stage-1).
 Unistage (18): 6001–6004,7001–7004 (VMI) · 7101–7106,7201 (BJ) · 7501–7503 (UNI_NARROW)
    → GT, independent (no Stage-1 dependency).
 ```
@@ -183,10 +183,14 @@ so they must **not** be renamed. A separate `_MACHINE_GROUP_DISPLAY` map + `_gro
 plant-facing names in the building Shift Schedule `Machine_Group` column **only**: VMIMAXX GROUP /
 BJ GROUP / UNISTAGE GROUP / TBM STAGE2 / TBM STAGE1.
 
-**Stage-1 carcass capacity fact:** Stage-1 ≈ 2,459 carcass/shift (15 machines) vs Stage-2
-demand ≈ 2,215 carcass/shift at full output → ~11% headroom, no sustained bottleneck. Stage-1
-util is structurally ~47% (15 machines for ~11.5 machine-equivalents of Stage-2 demand) — by
-design, not a scheduling bug. It rises only if more SKUs are certified onto Stage-2.
+**Stage-1 carcass capacity fact (recomputed post-6801, active `_BLD_CT_SEC`):** Stage-1 supplies
+≈ **2,896 carcass/shift on 14 machines** (was ≈ 3,123 on 15 — 6801/bj1stage1 ≈ 227/shift, now
+retired by the plant) vs Stage-2's full-output carcass demand ≈ **2,657/shift** → **~9% headroom,
+down from ~17.5% on 15 machines**. Removing 6801 roughly halved the buffer but Stage-1 stays a
+**net carcass supplier — no bottleneck even at full Stage-2 output**, and the real margin is larger
+because Stage-2 is demand-limited (rarely 100%). *(The older 2,459 / 2,215 / ~11% figures predate
+the building-CT correction in commit `f86f70b` and are retired.)* Stage-1 util is structurally
+~47–50% — by design, not a scheduling bug. It rises only if more SKUs are certified onto Stage-2.
 
 **Group demand-vs-capacity (approximate, orient only — re-pull for exact figures):**
 | Group | Machines | Demand/cap posture |
@@ -477,7 +481,7 @@ ranking changed. Toggles `_IDLE_UNMET_ENABLED` / `_IDLE_UNMET_KEEP_GATE` (hardco
 
 **Utilisation floor (target, not an override of the demand cap):** `MIN_SHIFT_UTILISATION = 0.77`
 is documented but yields to the demand cap and the CO-cost guard. GT machines only — Stage-1 is
-structurally ~47% by design (15 machines for ~11.5-equiv demand).
+structurally ~47–50% by design (14 machines for ~11.5-equiv demand; 6801 retired).
 
 ---
 
@@ -704,7 +708,7 @@ corrected against plant norms in commit `f86f70b` (every value changed). Samples
 ```
 VMI:      7001=51.6s  7002=52.6s  7003=56.0s  7004=53.0s
 BJ/UNI:   7101=83.0s  7104=87.0s  7501=90.0s  7502=90.0s
-Stage-1:  6801=127s   8101=230s   7601=186s   (slower — carcass)
+Stage-1:  6802=146s   8101=230s   7601=186s   (slower — carcass; 6801 retired)
 ```
 GT machines ≈ 0.85–1.5 min/tyre — far faster than the old 17-min curing-CT proxy. The proxy
 (and the old capacity figures derived from it) is retired.
@@ -941,7 +945,7 @@ DELIVERY_PRIORITY active on cloud (read from `jkt_demand`, gated by `jkt_plan_pa
 |------|------|
 | `local_main.py` | LOCAL entry — Excel in/out, reads `bc_config`. Parity anchor. |
 | `main.py` | CLOUD orchestrator — `run_plan(plan_id)`: `read_db` → `_set_plan_month(plan_start)` (derives `plan_month`, sets `RUNNING_MOULDS_MONTH`/`PLAN_MONTH` on `bc_config` + engine modules) → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (pinned tuning params, now incl. `MAX_ENDOFDAY_GT_INVENTORY = 8000`, `CURING_PRESS_COUNT = 170`, `DELIVERY_PRIORITY_ENABLED`). |
-| `connection.py` | DB adapter — **`read_db()` is PARAMS-ONLY** (reads only `jkt_plan_params`; `jkt_demand` staged separately) / `write_db()` (5 output tables), `now_ist()`. Does **not** read `jkt_plan_presets`. |
+| `connection.py` | DB adapter — **`read_db()` is PARAMS-ONLY** (reads only `jkt_plan_params`; `jkt_demand` staged separately) / `write_db()` (6 output tables incl `jkt_plan_moulds`), `now_ist()`. Does **not** read `jkt_plan_presets`. |
 | `app.py` | Flask API (synchronous). |
 | `Dockerfile` | `python:3.14-slim` + tzdata; gunicorn 1 worker / 4 threads / 1800 s. Published `anmolsaini07/jkt-btp-planning:v2` (& `:latest`), linux/amd64, ~145 MB. |
 | `.dockerignore` | Re-includes 3 engine reference files read from the filesystem every run (else the cloud engine silently falls back and diverges from local): `data/input/Cycle_time_Building.csv`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx`. |
@@ -978,7 +982,8 @@ already in progress) / 422 / 500. One run at a time (`_RUN_LOCK`); re-running a
 ### 19.4 Output tables (5, all stamped `plan_id`, timestamps IST)
 
 `jkt_plan_building` · `jkt_plan_curing` · `jkt_plan_Infeasibility` · `jkt_plan_kpis` ·
-`jkt_plan_capacityUtilisation`.
+`jkt_plan_capacityUtilisation` · `jkt_plan_moulds` (daily MouldInUse per SKU: `mouldsInUse`
+= MAX over the day's 3 shifts, `totalEligibleMoulds` = SKU's eligible pool, PK `plan_id+Date+SKUCode`).
 
 * **`jkt_plan_kpis`** — **single row/plan, 15 metrics:** `demandFulfillment`,
   `capacityUtilisation` (curing), `building_`/`building_s2_`/`stage1_`/`vmi_`/`bj_`/`uniNarrow_capacityUtilisation`,

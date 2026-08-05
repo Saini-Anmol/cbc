@@ -782,7 +782,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 |------|------|
 | [local_main.py](local_main.py) | **LOCAL entry point** — Excel in/out, reads `bc_config`. Parity anchor. |
 | [main.py](main.py) | **CLOUD orchestrator** — `run_plan(plan_id)`: `read_db` → `_set_plan_month` → inject cfg → engine → `write_db`. Holds `CLOUD_CONFIG` (~20 pinned params incl `CURING_PRESS_COUNT=170`, GT cap 8000, `DELIVERY_PRIORITY_ENABLED`). `_set_plan_month(plan_start)` sets RUNNING_MOULDS_MONTH/PLAN_MONTH per run so any month reads its own Day-0 snapshot. |
-| [connection.py](connection.py) | DB adapter — `read_db()` reads **`jkt_plan_params` ONLY** (params-only; dates/CO/efficiency/impPriorityFlag/mouldAvailability — NOT the preset table) + `jkt_demand` (incl `priorityFlag`/`deliveryDate` when `impPriorityFlag=1`); `write_db()` → **5 output tables** + `now_ist()`. |
+| [connection.py](connection.py) | DB adapter — `read_db()` reads **`jkt_plan_params` ONLY** (params-only; dates/CO/efficiency/impPriorityFlag/mouldAvailability — NOT the preset table) + `jkt_demand` (incl `priorityFlag`/`deliveryDate` when `impPriorityFlag=1`); `write_db()` → **6 output tables** (incl `jkt_plan_moulds`) + `now_ist()`. |
 | [app.py](app.py) | **Flask API** — `POST /app/v1/jkt/planning-scheduling/plan/generate-plan {plan_id}`, `GET /health`. Synchronous. |
 | [approach/deployment.md](approach/deployment.md) | Deployment spec — DB contract, config mapping, phases, parity-gate results. |
 | [requirements.txt](requirements.txt) | Pinned runtime deps (Flask, SQLAlchemy, PyMySQL, pandas, numpy, scipy, openpyxl). |

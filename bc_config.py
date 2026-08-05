@@ -16,7 +16,6 @@ Sections:
     6. Physical constants  (do NOT change — plant constraints)
     7. Output paths
 """
-# I have updated GT invenoty value from 8k to 6k, so i needs to update the docker image for this? So, please update the dcoker image and update and push this same image to the docker hub. 
 from __future__ import annotations
 
 import os
@@ -43,7 +42,7 @@ DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = False
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -53,7 +52,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
@@ -362,8 +361,27 @@ MAX_ENDOFDAY_GT_INVENTORY = int(os.environ.get("GT_CAP_MAX", "8000"))
 # carcass held overnight). Carcass has a 1-day shelf, so a limited buffer of
 # pre-built carcass may be carried between shifts/overnight to back a Stage-2 burst;
 # this bounds that buffer so the plant never hoards carcass. Applied only when the
-# STAGE1_CO carcass-realism model is ON (bounds the gate's pre-build). Env CARCASS_EOD_CAP.
-MAX_ENDOFDAY_CARCASS_INVENTORY = int(os.environ.get("CARCASS_EOD_CAP", "2000"))
+# STAGE1_CO carcass-realism model is ON (bounds the gate's pre-build). HARD plant limit
+# 1200 (was 2000). Env CARCASS_EOD_CAP.
+MAX_ENDOFDAY_CARCASS_INVENTORY = int(os.environ.get("CARCASS_EOD_CAP", "1200"))
+
+# ── Carcass build-to-consumption (CARCASS_NO_OVERBUILD) — ADOPTED, default ON ──
+# The Stage-1 carcass GATE used to size its per-shift pre-build to max(Stage-2 build rate,
+# CURING DRAW). Curing draw is the TOTAL GT a SKU's presses pull, which includes GT built by
+# BJ/Unistage groups that need NO carcass — so for a split-group SKU (e.g. 1225170015012LSTL0:
+# curing draw 899/shift vs Stage-2 carcass consumption 470/shift) the gate targeted a carcass
+# buffer ~1.9x what Stage-2 actually consumes. The surplus had no consumer, aged out on the
+# 1-day shelf, and was rebuilt next shift — ~21k units of phantom Stage-1 work for that one SKU
+# (64,880 built vs 43,670 consumed), none of it KPI-visible (the output rows were already capped
+# at consumption) but wasteful and it broke the carcass-row timeline (rows front-loaded to early
+# days, then dropped the real late carcass as "aged-out tail" — the display bug). When ON, the
+# gate pre-builds to the Stage-2 BUILD rate only (the true carcass consumer), so carcass built
+# ~= carcass consumed with no aging-out; PASS 1 (same-shift Stage-2 shortfall) is UNTOUCHED so
+# Stage-2 never starves for carcass (invariant #3). Also drives the carcass-row builder to a
+# time-windowed FIFO match (rows attributed to the day/shift their GT is consumed, within the
+# 1-day aging window; any still-aged-out carcass is NOT shown). Env CARCASS_NO_OVERBUILD=0
+# reverts to the over-build + front-loaded-rows behaviour bit-for-bit.
+CARCASS_NO_OVERBUILD_ENABLED = (os.environ.get("CARCASS_NO_OVERBUILD", "1") != "0")
 
 GT_BUFFER_SHIFTS        = 2
 # VMI sibling machines (e.g. 6004+7001, both on 16") both need non-zero deficit
@@ -466,10 +484,10 @@ STAGE2_CARCASS_GATE_ENABLED = (os.environ.get("STAGE2_CARCASS_GATE", "1") != "0"
 # changeovers were FREE (0 min) in both the gate feasibility and the post-plan
 # carcass rows — a real-plant modelling gap. Requires the Stage-2 carcass gate ON.
 # ADOPTED default ON (verified July/Aug/June: mould-audit PASS, carcass=Stage-2 GT
-# exactly, EOD carcass ≤ MAX_ENDOFDAY_CARCASS_INVENTORY=2000 with 0 days over,
-# deterministic). Carcass is shown = exactly what Stage-2 consumes (aged-out pre-build
-# dropped; pre-build within the 1-day aging kept). KPI cost (net ~−2.5k over 3 months)
-# is the honest price of the hard 2000 carcass-storage limit + real Stage-1 CO — proven
+# exactly, EOD carcass ≤ MAX_ENDOFDAY_CARCASS_INVENTORY=1200 with 0 days over,
+# deterministic). Carcass is shown = exactly what Stage-2 consumes (see CARCASS_NO_OVERBUILD:
+# build-to-consumption + FIFO row match, aged-out carcass never built/shown). KPI cost
+# is the honest price of the hard 1200 carcass-storage limit + real Stage-1 CO — proven
 # unrecoverable by Stage-1 reallocation (Stage-1 is ~48% idle, 0 inch shortages) or by
 # cutting Stage-2 COs (that STARVES the 6 bottleneck presses — Aug −22k). Env STAGE1_CO=0
 # reverts to the free-Stage-1-CO baseline bit-for-bit. Pinned in main.CLOUD_CONFIG.
@@ -477,8 +495,8 @@ STAGE1_CO_ENABLED = (os.environ.get("STAGE1_CO", "1") != "0")
 
 # ── Stage-2 campaign consolidation (S2_CAMPAIGN) ──────────────────────────────
 # Cuts the churn of the 6 Stage-2 GT machines {8201,8301,8302,8501,8502,7301} so
-# per-shift CARCASS demand is smoother and the FIXED 2000-unit overnight carcass
-# buffer (MAX_ENDOFDAY_CARCASS_INVENTORY, do NOT change) can absorb it — recovering
+# per-shift CARCASS demand is smoother and the 1200-unit overnight carcass
+# buffer (MAX_ENDOFDAY_CARCASS_INVENTORY) can absorb it — recovering
 # the KPI that spiky carcass demand costs WITHOUT raising the cap. STAGE2-only knobs,
 # all no-ops when OFF (bit-for-bit). The ADOPTED lever is S2_MIN_CAMPAIGN_MINS: a
 # Stage-2 CO to a NEW sku must yield a campaign >= this long (default 185 min), else
@@ -494,6 +512,30 @@ S2_CAMPAIGN_ENABLED = (os.environ.get("S2_CAMPAIGN", "0") != "0")
 S2_SKU_CAP = int(os.environ.get("S2_SKU_CAP", "4"))               # 4 = no-op (tighter HURT July)
 S2_MIN_CAMPAIGN_MINS = int(os.environ.get("S2_MIN_CAMPAIGN_MINS", "185"))  # mid of the [180,190] plateau
 S2_MAX_CO_PER_DAY = int(os.environ.get("S2_MAX_CO_PER_DAY", "0"))  # 0 = disabled (blunter alt to min-camp)
+
+# ── Concentration allocation (CONC_ALLOC) — fewer machines per SKU, longer campaigns ──
+# RCA finding: the per-shift greedy has NO cap on how many building machines pile onto one
+# SKU. A high-demand SKU shows a large deficit on EVERY eligible machine at once (its
+# dynamic-buffer target is draw × up-to-9 shifts), so machine after machine grabs it in the
+# same shift — over-provisioning mid-tier SKUs (draw < one machine's rate, yet 2-3 machines)
+# into many short campaigns (July: ~464 excess campaigns, ~87 excess machine-assignments).
+# This lever adds a per-shift OVER-PROVISION penalty to the Phase-B/-C selection: the FIRST
+# machine on a SKU each shift is always free; an ADDITIONAL machine is DEFERRED (ranked below
+# any still-under-served SKU) once this shift's committed build already keeps pace with the
+# SKU's curing draw AND the SKU is not about to run dry. It is a DEFERRAL, never a block — a
+# machine with no under-served eligible SKU still builds the paced one (no forced idle), so
+# KPI is protected while campaigns concentrate. DEVIATION OVERRIDE: a STARVING SKU (on-hand
+# GT < draw × CONC_STARV_SHIFTS) always admits extra machines so a behind SKU can be rescued
+# fast — this is what keeps the concentration from hurting starvation recovery (the failure
+# mode that sank SKU/day-cap=3 at −32,330 and IDLE_GAP_FILL at −56k). The pace test yields
+# ~ceil(draw/rate) machines per SKU (mega-SKUs like 1225170015012LSTL0 still get ~4; mid-tier
+# get 1). Env CONC_ALLOC=1 to enable; default OFF = current selection bit-for-bit.
+CONCENTRATION_ENABLED = (os.environ.get("CONC_ALLOC", "0") != "0")
+# Starvation-override threshold (shifts of draw on-hand below which a SKU is "about to run
+# dry" and may still take extra machines). 1.0 ties to the forward-buffer risk gate
+# (_FWD_RISK_SHIFTS). Higher = more aggressive rescue (more machines allowed) = weaker
+# concentration; lower = stricter concentration. Env CONC_STARV_SHIFTS.
+CONC_STARV_SHIFTS = float(os.environ.get("CONC_STARV_SHIFTS", "1.0"))
 
 # ── Delivery-date / priority-flag committed-delivery SKUs (DELIVERY_PRIORITY) ──
 # Client feature: the demand file may carry two optional columns —
