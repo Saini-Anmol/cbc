@@ -15,7 +15,7 @@ Building produces — starvation is zero by architectural design (curing is deri
 FROM building output by `curing_b2c.py`, so it can never exceed available GT).
 Building machines are constrained by a strict per-SKU demand
 cap: total build across the horizon ≤ 100% of customer demand. There are
-39 building machines (15 Stage-1 carcass, 6 Stage-2 GT, 18 Unistage GT), 167
+38 building machines (14 Stage-1 carcass, 6 Stage-2 GT, 18 Unistage GT), 167
 active curing presses (from the running-moulds snapshot named by
 `RUNNING_MOULDS_TABLE` in `bc_config.py` — currently `Daily_Running_Moulds`, 167 presses).
 The planning horizon is 31 days × 3 shifts
@@ -383,11 +383,11 @@ dynamic mid-shift, and overhang) is visible in the sheet — not only in the Cha
 ## Building machine groups
 
 ```
-Stage-1  (15 machines: 6801, 6802, 6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101)
+Stage-1  (14 machines: 6802, 6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 — 6801 retired)
   → Output: Carcass (semi-finished). Feeds Stage-2 only.
 
 Stage-2  (6 machines: 8201, 8301, 8302, 8501, 8502, 7301)
-  → Output: GT (requires Stage-1 carcass as input). BOTTLENECK (6 vs 15 Stage-1).
+  → Output: GT (requires Stage-1 carcass as input). BOTTLENECK (6 vs 14 Stage-1).
 
 Unistage (18 machines: 6001–6004, 7001–7004, 7101–7106, 7201, 7501–7503)
   → Output: GT. Independent — no Stage-1 dependency.

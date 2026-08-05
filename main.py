@@ -56,6 +56,14 @@ CLOUD_CONFIG: dict = {
     "GT_SHELF_LIFE_DAYS":                     3,
     "TOPUP_LOOKAHEAD_DAYS_GT":                3,
     "CARCASS_SHELF_LIFE_DAYS":                1,
+    # ── Stage-1 carcass CO + gate + overnight carcass cap (ADOPTED this cycle) ──
+    # Stage-2 GT is clamped to feasible Stage-1 carcass (invariant #3); Stage-1 machines
+    # charge real building CO (no production during CO); carcass shown = exactly Stage-2
+    # consumption; the overnight carcass buffer is hard-capped at 2000 (a plant storage
+    # limit). Verified July/Aug/June (mould-audit PASS, carcass=GT, EOD ≤2000 / 0 over).
+    "STAGE2_CARCASS_GATE_ENABLED":            True,
+    "STAGE1_CO_ENABLED":                      True,
+    "MAX_ENDOFDAY_CARCASS_INVENTORY":         2000,   # MUST equal bc_config (hard limit)
     "GT_BUFFER_SHIFTS":                       2,
     "GT_BUFFER_SHIFTS_VMI":                   2,      # split buffer (VMI banks 2 shifts)
     "GT_BUFFER_SHIFTS_OTHER":                 1,      # BJ/UNI/STAGE bank 1
@@ -93,7 +101,7 @@ CLOUD_CONFIG: dict = {
     "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND":  True,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
-    "CURING_CO_CHANGEOVER_MINS":              480,    # full shift; must match bc_config
+    "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)
     "CURING_CO_DURATION_SHIFTS":              1,
     # ── Curing capacity-utilisation KPI denominator (fixed plant roster) ──
     "CURING_PRESS_COUNT":                     170,    # daily+monthly curing util denominator
@@ -227,7 +235,7 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         sku_desc_map=sku_desc,          # DB master descriptions → output sheets
     )
 
-    # ── write the output tables (incl. jkt_plan_moulds; rules 4 & 5 inside write_db) ──
+    # ── write the 4 output tables (rules 4 & 5 applied inside write_db) ────
     counts = conn.write_db(
         engine, plan_id, result,
         result["build_output"], result["curing_output"],

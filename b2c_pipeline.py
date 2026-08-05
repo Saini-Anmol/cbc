@@ -129,8 +129,8 @@ for _m in ("7501","7502","7503"):
     _MACHINE_GROUP[_m] = "UNISTAGE"
 for _m in ("8201","8301","8302","8501","8502","7301"):
     _MACHINE_GROUP[_m] = "STAGE2"
-for _m in ("6801","6802","6803","6909","6911","7601","7701",
-           "7801","7802","7803","7804","8001","8002","8003","8101"):
+for _m in ("6802","6803","6909","6911","7601","7701",
+           "7801","7802","7803","7804","8001","8002","8003","8101"):  # 6801 removed (plant retired it) → 14 Stage-1
     _MACHINE_GROUP[_m] = "STAGE1"
 
 # Plant-facing display labels — used ONLY for the Machine_Group column in the
@@ -554,7 +554,7 @@ _BLD_CT_SEC: dict[str, float] = {
     "7501":90.0, "7502":90.0, "7503":90.0,
     "8201":62.0,  "8301":60.0,  "8302":60.0,
     "8501":70.0, "8502":70.0, "7301":70.0,
-    "6801":127,   "6802":146,   "6803":146,
+    "6802":146,   "6803":146,
     "6909":157,   "6911":115,   "7601":186,
     "7701":163,   "7801":135,   "7802":135,
     "7803":135,   "7804":135,   "8001":113,
@@ -1033,6 +1033,91 @@ _STAGE1_CARCASS_PASS = os.environ.get("STAGE1_CARCASS_PASS", "1") != "0"
 _STAGE1_CARCASS_LEAD = int(os.environ.get("STAGE1_CARCASS_LEAD", "2"))
 # #1 Carcass inventory-first: consume opening carcass before Stage-1 builds new (KPI-neutral).
 _CARCASS_INV_ENABLED = bool(getattr(_bc_cfg, "CARCASS_INV_ENABLED", False))
+# ── Stage-2 carcass GATE (hard constraint) ───────────────────────────────────
+# When ON, Stage-2 GT is CAPPED each shift by the feasible same-shift Stage-1
+# carcass supply (its eligible, inch-matched Stage-1 machines' capacity, honoring
+# one-machine-per-SKU contention): Stage-2 can NEVER build GT that carcass cannot
+# back — it WAITS for carcass instead. This enforces invariant #3 as a scheduling
+# constraint (Stage-1 built BEFORE Stage-2 committed, carcass rows emitted here),
+# not just the post-hoc report. It only ever REDUCES Stage-2 GT (demand cap +
+# no-waste-GT stay safe) and can lower cured — the honest, physically-realizable
+# plan. OFF (default) reproduces prior behaviour bit-for-bit (Step-3b post-hoc
+# tracking runs instead). Env STAGE2_CARCASS_GATE=1 enables. See the gate block in
+# the shift loop + bc_config for the committed default.
+_STAGE2_CARCASS_GATE = (os.environ.get("STAGE2_CARCASS_GATE",
+                        "1" if bool(getattr(_bc_cfg, "STAGE2_CARCASS_GATE_ENABLED", False)) else "0") != "0")
+# Carcass PRE-BUILD (aging window): Stage-1 uses residual capacity to bank carcass
+# AHEAD (within the ≤1-day shelf) so a Stage-2 burst is backed by carcass built in
+# the prior 1-2 shifts — honoring "within 1 day aging". Without it the gate is
+# same-shift-only and over-clamps (Stage-2 waits even when yesterday's carcass could
+# feed it). ON by default when the gate is on. Env STAGE2_CARCASS_PREBUILD=0 → strict
+# same-shift gate (measure only).
+_STAGE2_CARCASS_PREBUILD = os.environ.get("STAGE2_CARCASS_PREBUILD", "1") != "0"
+
+# ── Stage-1 building CHANGEOVER time (STAGE1_CO) ──────────────────────────────
+# Charge real building CO on the 15 Stage-1 carcass machines — same_size_CO = 60,
+# diff_size_CO = 180 (flat, all 15; already in BUILDING_CO_SAME/DIFF_SIZE via
+# _co_cost) — modelled like the 24 GT machines: NO production during the CO block,
+# BINDING on capacity. Charged in two places, both guarded by this flag:
+#   Site 1 (KPI-binding): the carcass GATE's _gate_build reserves CO minutes when a
+#     Stage-1 machine switches carcass SKU (fewer units that shift → Stage-2 clamps).
+#   Site 2 (accounting):  the post-plan _stage1_carcass_schedule lays CO blocks into
+#     the carcass rows (CO_Mins + honest Stage-1 occupancy).
+# Requires _STAGE2_CARCASS_GATE (the binding site lives inside the gate). Default OFF
+# → both sites reproduce the current plan bit-for-bit. Env STAGE1_CO=1 enables.
+_STAGE1_CO = (os.environ.get("STAGE1_CO",
+              "1" if bool(getattr(_bc_cfg, "STAGE1_CO_ENABLED", False)) else "0") != "0")
+# End-of-day carcass buffer cap (units held overnight, all SKUs) — analogous to the 8k GT
+# cap. Bounds the gate's carcass pre-build so the buffer carried between shifts stays small.
+# Applied only when _STAGE1_CO (carcass-realism model); OFF path untouched.
+_MAX_EOD_CARCASS = int(os.environ.get("CARCASS_EOD_CAP",
+                       str(getattr(_bc_cfg, "MAX_ENDOFDAY_CARCASS_INVENTORY", 2000))))
+# Balanced (demand-proportional) Stage-1 inch allocation — spreads the 15 carcass machines
+# across inches ∝ carcass demand. MEASURED a no-op on the real data (carcass eligibility is
+# inch-lock-filtered, so a machine's Stage-2-carcass inch set is near-forced) → default OFF
+# (env S1_BALANCED_INCH=1 to experiment). The real Stage-1 lever is the gate's per-shift
+# machine selection, not this static inch assignment.
+_S1_BALANCED_INCH = (os.environ.get("S1_BALANCED_INCH", "0") != "0")
+# Stage-1 one-way inch flexibility (client rule): a Stage-1 machine may take a DIFFERENT-size
+# CO (180 min) to another inch ONLY once its current inch's Stage-2 carcass demand is complete,
+# then it continues on the new inch and NEVER reverts. This mobilises the ~48% idle Stage-1
+# capacity (a machine on a small/near-done inch moves to a still-demanded one) → fewer Stage-2
+# clamps. Default tied to STAGE1_CO; env S1_INCH_FLEX overrides.
+_S1_INCH_FLEX = (os.environ.get("S1_INCH_FLEX", "1" if _STAGE1_CO else "0") != "0")
+
+# ── Stage-2 campaign consolidation (S2_CAMPAIGN) ──────────────────────────────
+# Reduce the churn of the 6 Stage-2 GT machines {8201,8301,8302,8501,8502,7301}
+# (217 building COs in July under STAGE1_CO=1, e.g. 8501 = 15 SKUs / 71 COs) by
+# forcing LONGER Stage-2 campaigns. Fewer, longer Stage-2 campaigns -> smoother
+# per-shift carcass demand -> the FIXED 2000-unit overnight carcass buffer absorbs
+# it -> the cured KPI the spiky carcass demand costs is recovered WITHOUT raising the
+# cap. STAGE2 GT machines only. The ADOPTED knob is S2_MIN_CAMPAIGN_MINS; the other
+# two were measured WORSE on July and default to no-ops:
+#   • S2_MIN_CAMPAIGN_MINS (ADOPTED, default 185): a Stage-2 machine may CO to a NEW
+#     sku only if the resulting campaign runs >= this long. If every candidate is too
+#     short the machine IDLES rather than doing a short churn switch. Counter-intuitively
+#     this RAISES Stage-2 GT (freed CO time -> longer productive runs) so long as the
+#     threshold stays on the measured stable step: July STAGE1_CO=1, min in [180,190]
+#     all give 665,599 (+1,899, Stage-2 COs 217->142); min=200 falls off a cliff (633k),
+#     so keep 185 (mid-step). Same-sku continuation (Phase A) is NEVER blocked.
+#   • S2_SKU_CAP (default 4 = plant-wide cap = NO-OP): a tighter distinct-SKU-per-day
+#     cap. Measured WORSE on July (constrains the SKU mix -> less GT) -> left a no-op.
+#   • S2_MAX_CO_PER_DAY (default 0 = disabled): a blunt per-day building-CO budget per
+#     Stage-2 machine. Measured WORSE than the min-campaign (budget<=2 idles/collapses).
+# All three are STAGE2-only and no-ops when the toggle is OFF, so with the toggle OFF the
+# STAGE1_CO=1 plan is reproduced bit-for-bit (verified: 663,700, 217 Stage-2 COs).
+_S2_CAMPAIGN = (os.environ.get("S2_CAMPAIGN",
+                "1" if bool(getattr(_bc_cfg, "S2_CAMPAIGN_ENABLED", False)) else "0") != "0")
+_S2_SKU_CAP = int(os.environ.get("S2_SKU_CAP",
+                  str(getattr(_bc_cfg, "S2_SKU_CAP", 4))))
+_S2_MIN_CAMPAIGN_MINS = int(os.environ.get("S2_MIN_CAMPAIGN_MINS",
+                            str(getattr(_bc_cfg, "S2_MIN_CAMPAIGN_MINS", 185))))
+# Optional 3rd knob: a hard per-day building-CO budget on each Stage-2 machine
+# (0 = disabled). Once a Stage-2 machine spends its daily COs it can only continue
+# its current SKU. A blunter alternative to the min-campaign gate; measured worse
+# than the min-campaign on July → left disabled by default (env S2_MAX_CO_PER_DAY).
+_S2_MAX_CO_PER_DAY = int(os.environ.get("S2_MAX_CO_PER_DAY",
+                         str(getattr(_bc_cfg, "S2_MAX_CO_PER_DAY", 0))))
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1154,6 +1239,34 @@ def _greedy_inch_assignment(machines, elig_inches: dict, cap: dict, inch_demand:
         best = max(opts, key=lambda i: (remaining.get(i, 0.0), inch_demand.get(i, 0.0)))
         result[m] = best
         remaining[best] = remaining.get(best, 0.0) - cap.get(m, 0.0)
+    return result
+
+
+def _balanced_inch_assignment(machines, elig_inches: dict, cap: dict, inch_demand: dict) -> dict:
+    """Stage-1 carcass allocation that spreads machines PROPORTIONAL to per-inch demand,
+    instead of the coverage-greedy's "one big machine covers a small inch, strand the next
+    on a dead inch". Each machine (most-constrained first, then most capacity) takes the
+    eligible DEMANDED inch with the lowest capacity/demand provisioning so far — so every
+    machine flows to where per-shift carcass is scarcest, and no machine is parked on a
+    near-zero-demand inch while a high-demand inch stays thin. Deterministic; a machine with
+    no demanded eligible inch falls back to its lowest eligible inch (never dropped)."""
+    dem = {str(i): float(d) for i, d in inch_demand.items() if d and float(d) > 0}
+    used: dict = defaultdict(float)                       # capacity already homed per inch
+    result: dict = {}
+    order = sorted(machines,
+                   key=lambda m: (len(elig_inches.get(m, ()) or ()), -cap.get(m, 0.0), str(m)))
+    for m in order:
+        cm = float(cap.get(m, 0.0))
+        opts = sorted(str(i) for i in (elig_inches.get(m, ()) or ()) if str(i) in dem)
+        if not opts:                                     # no demanded inch → keep eligible, lowest
+            allo = sorted(str(i) for i in (elig_inches.get(m, ()) or ()) if i)
+            if allo:
+                result[m] = allo[0]
+            continue
+        # pick the inch that most needs another machine = highest demand/(homed cap + this cap)
+        best = max(opts, key=lambda i: (dem[i] / (used[i] + cm + 1.0), dem[i], i))
+        result[m] = best
+        used[best] += cm
     return result
 
 
@@ -1601,8 +1714,8 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
     pre-build, ≤1-day aging). Stage-1 does NOT gate GT (this never touches gt_inventory/cured),
     so it is correct utilization/qty/time accounting plus a feasibility check.
 
-    Returns (carcass_rows, report). report flags any carcass that cannot be supplied within the
-    aging window and any SKU with no eligible Stage-1 machine (a real floor-infeasibility).
+    Returns (carcass_rows, report). This is the STAGE1_CO=OFF path; the CO-charged carcass rows
+    (STAGE1_CO ON) are built from the gate's own production by _stage1_carcass_rows_co.
     """
     import numpy as np
     from datetime import timedelta
@@ -1725,6 +1838,121 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
         "no_elig_units": round(sum(no_elig.values())),
     }
     return rows, report
+
+
+def _stage1_carcass_rows_co(prod_log: list, s2_gt_per_sku: dict, sku_inch: dict,
+                            opening_carcass: dict | None = None) -> tuple:
+    """STAGE1_CO Site 2: build carcass rows + building-CO events from the Stage-2 gate's
+    OWN production log, CAPPED per SKU at what Stage-2 actually consumes (Stage-2 GT minus
+    opening carcass). Pre-built carcass that a Stage-2 machine consumes within the 1-day
+    aging window is KEPT (it's part of consumption); only the gate's never-consumed,
+    aged-out over-production is dropped. CO is recomputed on the resulting consolidated
+    sequence (60 same-inch / 180 diff, no production during the CO). A capped subsequence
+    has ≤ the gate's switches AND ≤ its production, and the gate already fit CO+production
+    in 480 min/shift → each machine-shift still fits (no overbook, no trim), and carcass
+    total == Stage-2 consumption. Returns (rows, report, co_events)."""
+    from datetime import timedelta
+    _SORD = {"A": 0, "B": 1, "C": 2}
+    _si = sku_inch or {}
+    _open = {str(k): float(v) for k, v in (opening_carcass or {}).items() if v and float(v) > 0}
+    # HARD RULE (business): every Stage-2 GT unit is backed 1:1 by carcass. Per SKU the
+    # carcass shown = EXACTLY Stage-2 GT − opening carcass consumed (integer-exact, zero
+    # gap). The Stage-2 carcass GATE already enforces feasibility (Stage-2 GT is clamped to
+    # available carcass, so the gate log holds ≥ this target); here we just render it exactly.
+    gt_int = {str(s): int(round(float(q))) for s, q in s2_gt_per_sku.items()}
+    open_used_sku = {s: min(int(_open.get(s, 0.0)), q) for s, q in gt_int.items()}
+    total_gt = float(sum(gt_int.values()))
+    opening_used = float(sum(open_used_sku.values()))
+    tgt = {s: gt_int[s] - open_used_sku[s] for s in gt_int}          # Stage-1's integer share
+    # Emit each SKU's gate production (chronological) up to its integer target, dropping the
+    # aged-out tail; cumulative rounding + a final top-up make the per-SKU sum EXACT.
+    by_sku: dict = defaultdict(list)
+    for i, e in enumerate(prod_log):
+        by_sku[str(e["sku"])].append((int(e["day"]), _SORD.get(e["shift"], 0), i, e))
+    kept: list = []
+    for s, entries in by_sku.items():
+        T = tgt.get(s, 0)
+        if T <= 0:
+            continue
+        ents = sorted(entries)
+        cum = 0.0; emitted = 0
+        for _k, (_d, _so, _i, e) in enumerate(ents):
+            if emitted >= T:
+                break
+            take = min(float(e["qty"]), T - cum)
+            cum += take
+            qi = int(round(cum)) - emitted
+            if _k == len(ents) - 1 and emitted + qi < T:
+                qi = T - emitted                         # last chunk → force exact
+            if qi <= 0:
+                continue
+            emitted += qi
+            kept.append((int(e["day"]), _SORD.get(e["shift"], 0), e["date"], e["shift"],
+                         str(e["machine"]), s, qi))
+        if emitted < T and kept and kept[-1][5] == s:    # safeguard: hit the target exactly
+            r = kept[-1]
+            kept[-1] = (r[0], r[1], r[2], r[3], r[4], r[5], r[6] + (T - emitted))
+    # Lay out per machine, chronological; recompute CO on the consolidated sequence.
+    bym: dict = defaultdict(list)
+    for row in kept:
+        bym[row[4]].append(row)
+    rows: list = []; co_events: list = []
+    produced = 0.0; co_cnt = 0; co_min_tot = 0.0
+    for m in sorted(bym):
+        cur = ""
+        byds: dict = defaultdict(dict)     # (day,so,date,shift) -> {sku: qty}  (merge same-sku)
+        for (day, so, date, shift, _m, s, q) in bym[m]:
+            d = byds[(day, so, date, shift)]
+            d[s] = d.get(s, 0.0) + q
+        for (day, so, date, shift) in sorted(byds):
+            cursor = _shift_start_dt(date, shift)
+            # continuing SKU (no CO) first, then by sku for determinism
+            order = sorted(byds[(day, so, date, shift)].items(),
+                           key=lambda t: (0 if t[0] == cur else 1, t[0]))
+            for s, q in order:
+                q = int(round(q))
+                if q <= 0:
+                    continue
+                if cur not in ("", s):
+                    comin = int(_co_cost(m, _si.get(cur, ""), _si.get(s, "")))
+                    _cot = ("same_size_CO" if _si.get(cur, "") == _si.get(s, "")
+                            else "diff_size_CO")
+                    _co_start = cursor
+                    cursor = cursor + timedelta(minutes=comin)
+                    # Separate CHANGEOVER row in the Shift Schedule — SAME shape as the GT /
+                    # Stage-2 machines (SKUCode=CHANGEOVER, Qty=0, CO_Mins=comin, no production
+                    # during it). Makes Stage-1 COs show identically to every other machine.
+                    rows.append({
+                        "Machine": m, "Date": date, "Shift": shift, "SKUCode": "CHANGEOVER",
+                        "Qty": 0, "CO_Mins": comin,
+                        "StartTime": _fmt_dt(_co_start), "EndTime": _fmt_dt(cursor),
+                        "Machine_Group": _group_label(m), "CO_Type": _cot,
+                    })
+                    co_events.append({
+                        "Machine": m, "Date": date, "Shift": shift, "Day": day,
+                        "CO_Day_Index": day, "From_SKU": cur, "Target_SKU": s,
+                        "CO_Type": _cot, "CO_Cost_Mins": comin,
+                        "Status": f"Stage-1 carcass CO ({_cot})",
+                    })
+                    co_cnt += 1; co_min_tot += comin
+                ct = _bld_ct_sec(m, s)
+                _st = cursor
+                cursor = cursor + timedelta(minutes=q * ct / 60.0)
+                rows.append({
+                    "Machine": m, "Date": date, "Shift": shift, "SKUCode": s,
+                    "Qty": q, "CO_Mins": 0,     # the CO time lives in the CHANGEOVER row above
+                    "StartTime": _fmt_dt(_st), "EndTime": _fmt_dt(cursor),
+                    "Machine_Group": _group_label(m), "CO_Type": "carcass",
+                })
+                cur = s; produced += q
+    supplied = produced + opening_used
+    report = {
+        "demand": round(total_gt), "supplied": round(supplied),
+        "unmet": round(max(0.0, total_gt - supplied)), "produced": round(produced),
+        "opening_used": round(opening_used), "co_count": co_cnt,
+        "co_mins": round(co_min_tot), "no_elig_skus": [], "no_elig_units": 0,
+    }
+    return rows, report, co_events
 
 
 def _daily_capacity_util(cure_shift_rows: list, bld_shift_rows: list,
@@ -2450,6 +2678,7 @@ def _assign_building_shift(
     machine_last_diff_co_day: dict | None = None, # {machine: last day it did a diff-size CO}
     machine_locked_inches: dict | None = None,   # Part 1: {machine: set(allowed inches)} or None
     machine_day_diff_co: dict | None = None,     # Part 2: {machine: #diff-size COs done today}
+    machine_day_co: dict | None = None,          # S2_CAMPAIGN: {machine: #building COs done today}
     fixed_escape_used: dict | None = None,       # Lever B: {machine: #escape diff-COs spent}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
 ) -> dict:
@@ -2477,6 +2706,7 @@ def _assign_building_shift(
                                 if machine_last_diff_co_day is not None else {})
     machine_locked_inches = machine_locked_inches if machine_locked_inches is not None else {}
     machine_day_diff_co = machine_day_diff_co if machine_day_diff_co is not None else {}
+    machine_day_co = machine_day_co if machine_day_co is not None else {}
     fixed_escape_used = fixed_escape_used if fixed_escape_used is not None else {}
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
@@ -2525,7 +2755,22 @@ def _assign_building_shift(
         if not _BLD_SKU_CAP_ENABLED:
             return False
         _distinct = machine_day_skus.get(m, set()) | set(shift_skus)
-        return sku not in _distinct and len(_distinct) >= MAX_BUILDING_SKUS_PER_DAY
+        _cap = MAX_BUILDING_SKUS_PER_DAY
+        # S2_CAMPAIGN: a tighter distinct-SKU/day cap on Stage-2 GT machines only —
+        # spreads SKUs and cuts round-trips. OFF/non-Stage-2 → plant-wide cap (no-op).
+        if _S2_CAMPAIGN and _MACHINE_GROUP.get(str(m), "") == "STAGE2":
+            _cap = min(_cap, _S2_SKU_CAP)
+        return sku not in _distinct and len(_distinct) >= _cap
+
+    def _s2_co_budget_blocks(m: str) -> bool:
+        """S2_CAMPAIGN per-day CO budget: a Stage-2 machine may do at most
+        _S2_MAX_CO_PER_DAY building COs per calendar day (0 = disabled). Once spent,
+        it can only continue its current SKU. Non-Stage-2 / OFF → never blocks."""
+        if not (_S2_CAMPAIGN and _S2_MAX_CO_PER_DAY > 0):
+            return False
+        if _MACHINE_GROUP.get(str(m), "") != "STAGE2":
+            return False
+        return machine_day_co.get(m, 0) >= _S2_MAX_CO_PER_DAY
 
     def _may_leave_inch(m: str, cur_inch: str, defc, buf, rate: float = 0.0) -> bool:
         """Plant 5-day rule: a machine may change to a DIFFERENT inch only if its
@@ -2843,6 +3088,10 @@ def _assign_building_shift(
                 s = stg[m]
                 if s["remaining"] < MIN_CAMPAIGN_MINS or s["co_count"] >= s["max_cos"]:
                     continue
+                # S2_CAMPAIGN: a Stage-2 machine that has spent its per-day CO budget
+                # takes no more switches this day (it may only continue its current SKU).
+                if _s2_co_budget_blocks(m):
+                    continue
                 buf = _buf_of(m); rate = s["rate"]; dom = s["dom"]
                 cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
                 for sku in machine_skus.get(m, set()):
@@ -2901,7 +3150,14 @@ def _assign_building_shift(
                     _ra = _bld_qty_per_shift(m, sku) / SHIFT_MINS   # per-SKU CT rate
                     mins = min(avail, d / _ra if _ra > 0 else avail)
                     qty = int(mins * _ra)
-                    if mins < MIN_CAMPAIGN_MINS or qty <= 0:
+                    # S2_CAMPAIGN: a Stage-2 CO to a NEW sku must yield a LONG campaign
+                    # (>= S2_MIN_CAMPAIGN_MINS) — block short churn switches so the machine
+                    # idles instead. Same-sku / non-Stage-2 / OFF → plant MIN (no-op).
+                    _min_camp = MIN_CAMPAIGN_MINS
+                    if (_S2_CAMPAIGN and sku != cur
+                            and _MACHINE_GROUP.get(str(m), "") == "STAGE2"):
+                        _min_camp = max(_min_camp, _S2_MIN_CAMPAIGN_MINS)
+                    if mins < _min_camp or qty <= 0:
                         continue
                     tier, primary = _tierg(sku, m, d)
                     # Prefer staying on the CURRENT inch (cheap same-size CO) once the
@@ -3073,6 +3329,7 @@ def _assign_building_shift(
                 if qty <= 0 or mins < MIN_CAMPAIGN_MINS:
                     s["remaining"] -= cost           # pay the CO time, build nothing (cap full)
                     s["co_count"] += 1
+                    machine_day_co[m] = machine_day_co.get(m, 0) + 1   # S2_CAMPAIGN per-day budget
                     s["cur_sku"] = sku
                     continue
             _is_cont = _GLOBAL_SCORE_V2 and sku == s["cur_sku"]   # continuation = CO=0, no CO charged
@@ -3089,6 +3346,7 @@ def _assign_building_shift(
             s["remaining"] -= (cost + mins)
             if not _is_cont:
                 s["co_count"] += 1
+                machine_day_co[m] = machine_day_co.get(m, 0) + 1   # S2_CAMPAIGN per-day budget
             s["cur_sku"] = sku
 
         # ── Phase B2: one-time +3/-3 inch escape for STRANDED machines (experiment) ──
@@ -3209,6 +3467,9 @@ def _assign_building_shift(
                         need_co = (sku != cur)
                         if need_co and s["co_count"] >= s["max_cos"]:
                             continue
+                        # S2_CAMPAIGN per-day CO budget: no more Stage-2 switches once spent.
+                        if need_co and _s2_co_budget_blocks(m):
+                            continue
                         # 4-SKU/day cap: don't let the forward buffer spend the day's 5th SKU.
                         if need_co and _sku_cap_blocks(m, sku, (c[0] for c in s["campaigns"])):
                             continue
@@ -3281,7 +3542,13 @@ def _assign_building_shift(
                     # SKU's remaining demand headroom, even by a min-campaign rounding.
                     qty = min(qty, max(0, int(demand_remaining.get(best, 0.0)
                                               - projected_gt.get(best, 0.0))))
-                    if mins < MIN_CAMPAIGN_MINS or qty <= 0:
+                    # S2_CAMPAIGN: same long-campaign floor for a Stage-2 forward-buffer CO
+                    # to a NEW sku (best != cur) — no short Phase-C churn switches.
+                    _min_camp = MIN_CAMPAIGN_MINS
+                    if (_S2_CAMPAIGN and best != cur
+                            and _MACHINE_GROUP.get(str(m), "") == "STAGE2"):
+                        _min_camp = max(_min_camp, _S2_MIN_CAMPAIGN_MINS)
+                    if mins < _min_camp or qty <= 0:
                         break
                     co_type = ("start" if best == cur
                                else ("same_size_CO" if to_inch == cur_inch else "diff_size_CO"))
@@ -3295,6 +3562,7 @@ def _assign_building_shift(
                     if best != cur:
                         s["cur_sku"] = best
                         s["co_count"] += 1
+                        machine_day_co[m] = machine_day_co.get(m, 0) + 1   # S2_CAMPAIGN per-day budget
 
         return {m: stg[m]["campaigns"] for m in machines if stg[m]["campaigns"]}
 
@@ -3971,18 +4239,19 @@ def _write_rolling_building_excel(
         mach_co_mins[m]  += cost
         mach_co_count[m] += 1
 
-    # All 39 building machines — explicit set so zero-production machines (e.g. 8101)
+    # All 38 building machines — explicit set so zero-production machines (e.g. 8101)
     # are always included regardless of whether they appear in production or CO dicts.
-    _ALL_39_MACHINES = frozenset({
-        "6801","6802","6803","6909","6911","7601","7701",
-        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (15)
+    # (6801/bj1stage1 removed — plant retired it → 14 Stage-1.)
+    _ALL_BUILDING_MACHINES = frozenset({
+        "6802","6803","6909","6911","7601","7701",
+        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (14)
         "8201","8301","8302","8501","8502","7301",                # Stage-2 (6)
         "7001","7002","7003","7004","6001","6002","6003","6004",  # VMI (8)
         "7101","7102","7103","7104","7105","7106","7201",         # BJ (7)
         "7501","7502","7503",                                     # UNI_NARROW (3)
     })
     all_machines = sorted(
-        _ALL_39_MACHINES,
+        _ALL_BUILDING_MACHINES,
         key=lambda m: (
             {"VMI":0,"BJ":1,"UNI_NARROW":2,"Stage-2":3,"Stage-1":4}.get(_mgroup(m), 5),
             m
@@ -5751,8 +6020,12 @@ def run_rolling_pipeline(
                                         planning_days, len(press_state))
         _tgt_s1 = ({_i: (min(_d, _ceil_s1[_i]) if _i in _ceil_s1 else _d)
                     for _i, _d in _inch_dem_s1.items()} if _ANCHOR_CURE_CAP else None)
-        _asg_s1 = _optimal_inch_assignment(_s1_machines, _elig_s1, _cap_s1, _inch_dem_s1,
-                                           target=_tgt_s1)
+        if _S1_BALANCED_INCH:
+            _asg_s1 = _balanced_inch_assignment(_s1_machines, _elig_s1, _cap_s1,
+                                                _tgt_s1 if _tgt_s1 is not None else _inch_dem_s1)
+        else:
+            _asg_s1 = _optimal_inch_assignment(_s1_machines, _elig_s1, _cap_s1, _inch_dem_s1,
+                                               target=_tgt_s1)
         for _m, _i in _asg_s1.items():
             s1_locked_inch[_m]      = _i
             machine_anchor_inch[_m] = _i
@@ -6271,12 +6544,49 @@ def run_rolling_pipeline(
     print("  ROLLING PIPELINE — Day-by-day simulation")
     print("=" * 70)
 
+    # Stage-2 carcass gate: rolling per-SKU carcass BANK (list of [age_shifts_left,
+    # qty]) seeded from opening carcass. Persists across all shifts/days; only used
+    # when _STAGE2_CARCASS_GATE. Empty/unused otherwise (OFF path untouched).
+    _carcass_bank: dict[str, list] = defaultdict(list)
+    if _STAGE2_CARCASS_GATE:
+        _seed_age = max(1, _STAGE1_CARCASS_LEAD + 1)
+        for _s, _q in (opening_carcass or {}).items():
+            if _q and float(_q) > 0:
+                _carcass_bank[str(_s)].append([_seed_age, float(_q)])
+
+    # STAGE1_CO: the carcass SKU each Stage-1 machine is currently set up for, carried
+    # ACROSS shifts. A switch to a different carcass SKU costs a building CO (60 same-inch
+    # / 180 diff-inch, charged in _gate_build). "" = never assigned yet (free first start,
+    # like a GT machine's "start"). Only used when _STAGE1_CO; empty otherwise.
+    machine_cur_carcass: dict[str, str] = {}
+    # STAGE1_CO Site 2: per-(day,shift,machine,sku) carcass the gate actually built, in
+    # build order. The CO-charged carcass rows are built from THIS (capped per SKU at real
+    # Stage-2 consumption, so the gate's pre-build over-production is dropped) with CO
+    # recomputed on the consolidated sequence → carcass total == Stage-2 GT, no overbook.
+    # Only populated when _STAGE1_CO; the OFF path uses the max-flow re-derivation unchanged.
+    _s1_prod_log: list = []
+    _carcass_eod: list = []          # STAGE1_CO: end-of-day carcass buffer (bank after shift C)
+    # S1_INCH_FLEX: the inches each Stage-1 machine is eligible to build carcass for (its
+    # Stage-2-carcass SKUs' inches), for the one-way inch-advance when its inch is done.
+    _s1_elig_inches: dict = defaultdict(set)
+    _s1_visited: dict = defaultdict(set)     # inches each machine has been on (one-way guard)
+    if _STAGE1_CO and _S1_INCH_FLEX:
+        for _s2s, _ms in s1_sku_to_machines.items():
+            _ii = sku_inch.get(str(_s2s), "")
+            if _ii:
+                for _mm in _ms:
+                    if str(_mm) in _S1_MACHINES:
+                        _s1_elig_inches[str(_mm)].add(_ii)
+        for _mm in _S1_MACHINES:
+            _s1_visited[str(_mm)].add(s1_locked_inch.get(str(_mm), ""))
+
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
         machine_day_skus = {str(_m): ({str(_s)} if _s else set())
                             for _m, _s in machine_current_sku.items()}
         machine_day_diff_co = {}                    # Part 2: reset per-day diff-CO budget counter
+        machine_day_co = {}                         # S2_CAMPAIGN: reset per-day total-CO budget counter
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
         if _ROLLING_HORIZON_CO_ENABLED:
@@ -6474,9 +6784,252 @@ def run_rolling_pipeline(
                 machine_last_diff_co_day=machine_last_diff_co_day,
                 machine_locked_inches=machine_locked_inches,
                 machine_day_diff_co=machine_day_diff_co,
+                machine_day_co=machine_day_co,
                 fixed_escape_used=fixed_escape_used,
                 priority_deadline_map=(priority_deadline_map if _prio_active else None),
             )
+
+            _shift_start = _shift_start_dt(date_str, shift)
+
+            def _s1_inch_ok(_m: str, _sku: str) -> bool:
+                """Client inch rules applied to Stage-1 carcass machines too.
+
+                Same anchor +/- band / single-inch lock as the GT machines. Used by
+                BOTH the Stage-2 carcass gate (step 2c) and the post-hoc Step-3b pass.
+                """
+                if not _INCH_RULES_ENABLED:
+                    return True
+                if (_INCH_HIST_LOCK_ENABLED and _INCH_HIST_LOCK_STAGE1
+                        and str(_m) in _MACHINE_ALLOWED_INCH_SET):
+                    return sku_inch.get(_sku, "") in _MACHINE_ALLOWED_INCH_SET[str(_m)]
+                if _STAGE1_SINGLE_INCH and _m in s1_locked_inch:
+                    # S1_INCH_FLEX: honor the machine's CURRENT inch (which may have advanced
+                    # one-way off a completed inch); else the fixed day-0 lock.
+                    _lk = (s1_current_inch.get(_m, s1_locked_inch[_m])
+                           if _S1_INCH_FLEX else s1_locked_inch[_m])
+                    return sku_inch.get(_sku, "") == _lk
+                return _inch_ok(sku_inch.get(_sku, ""),
+                                s1_current_inch.get(_m, ""),
+                                machine_anchor_inch.get(_m, ""),
+                                machine_used_inches.get(_m, set()))
+
+            # ── 2c. Stage-2 carcass GATE (hard constraint, aging-aware) ──────
+            # Cap Stage-2 GT each shift by feasible carcass using a rolling per-SKU
+            # carcass BANK (list of [age_shifts_left, qty]): Stage-1 builds this
+            # shift's shortfall + PRE-BUILDS ahead with residual capacity, bounded by
+            # the <=1-day shelf (CARCASS_SHELF_LIFE_DAYS x 3 shifts). Stage-2 draws
+            # from the bank and WAITS only for carcass that truly cannot be built
+            # within the aging window. Clamp ONLY (no rows/inch here) — the carcass
+            # rows are finalized by the post-plan max-flow (_stage1_carcass_schedule)
+            # and Step-3b; this runs BEFORE Step 3 so curing sees only backed GT.
+            if _STAGE2_CARCASS_GATE:
+                _cage = max(1, _STAGE1_CARCASS_LEAD + 1)      # usable window (shifts)
+                for _bs in list(_carcass_bank):                  # age the bank 1 shift
+                    _kept = [[_a - 1, _q] for (_a, _q) in _carcass_bank[_bs]
+                             if _a - 1 > 0 and _q > 1e-9]
+                    if _kept:
+                        _carcass_bank[_bs] = _kept
+                    else:
+                        del _carcass_bank[_bs]
+                _s2_desired: dict[str, float] = defaultdict(float)
+                for _gm, _gcps in shift_plan.items():
+                    if _MACHINE_GROUP.get(_gm, "") == "STAGE2":
+                        for _gs, _gq, _gct in _gcps:
+                            _s2_desired[_gs] += _gq
+                # Per-Stage-1-machine REMAINING carcass capacity this shift. A machine
+                # may SPLIT its shift capacity across multiple SKUs (exactly like the
+                # plant carcass max-flow, source->machine-shift capped at CAP[m]). The
+                # old one-SKU-per-machine rule under-supplied carcass and made Stage-2
+                # wait needlessly — that was the bulk of the avoidable loss.
+                _gate_cap: dict = {}
+
+                def _s1cap(_m):
+                    if _m not in _gate_cap:
+                        _gate_cap[_m] = float(_bld_qty_per_shift(_m))
+                    return _gate_cap[_m]
+
+                def _bank_avail(_sku):
+                    return sum(_q for (_a, _q) in _carcass_bank.get(_sku, ()))
+
+                def _co_units(_m, _sku):
+                    """STAGE1_CO: capacity (in units) a Stage-1 machine loses to a
+                    building CO when it switches TO _sku from its current carcass SKU.
+                    0 when the machine is already on _sku or never assigned ("" = free
+                    first start, like a GT machine's 'start'). 60 min same-inch / 180
+                    diff-inch, converted to units via the machine's CT."""
+                    _cur = machine_cur_carcass.get(_m, "")
+                    if _cur in ("", _sku):
+                        return 0.0
+                    _comin = _co_cost(_m, sku_inch.get(_cur, ""), sku_inch.get(_sku, ""))
+                    _ct = _bld_ct_sec(_m, _sku)
+                    return (_comin * 60.0 / _ct) if _ct > 0 else 0.0
+
+                def _gate_build(_sku, _target):
+                    """Build <=_target carcass for _sku on its eligible, inch-OK Stage-1
+                    machines, drawing each machine's REMAINING shift capacity (split
+                    across SKUs); bank it fresh. When _STAGE1_CO, a machine switching to a
+                    different carcass SKU first pays a building CO (no production during
+                    it), and machines already set up for _sku are preferred (consolidation
+                    → long carcass campaigns)."""
+                    if _target <= 0:
+                        return 0.0
+                    _elig = [m for m in s1_sku_to_machines.get(_sku, ())
+                             if _s1_inch_ok(m, _sku) and _s1cap(m) > 1e-9]
+                    if _STAGE1_CO:
+                        # co-free machines (already on _sku or unused) first, then most cap
+                        _elig.sort(key=lambda m: (1 if _co_units(m, _sku) > 1e-9 else 0,
+                                                  -_s1cap(m), m))
+                    else:
+                        _elig.sort(key=lambda m: (-_s1cap(m), m))
+                    _got = 0.0
+                    for _m in _elig:
+                        if _got >= _target:
+                            break
+                        if _STAGE1_CO:
+                            _prev = machine_cur_carcass.get(_m, "")
+                            if _prev not in ("", _sku):            # real switch → building CO
+                                _comin = float(_co_cost(_m, sku_inch.get(_prev, ""),
+                                                        sku_inch.get(_sku, "")))
+                                _ct = _bld_ct_sec(_m, _sku)
+                                _cou = (_comin * 60.0 / _ct) if _ct > 0 else 0.0
+                                if _s1cap(_m) <= _cou + 1e-9:
+                                    continue          # not enough time even for the CO
+                                _gate_cap[_m] -= _cou  # charge CO (no production)
+                            machine_cur_carcass[_m] = _sku
+                        _a = min(_s1cap(_m), _target - _got)
+                        _gate_cap[_m] -= _a
+                        _got += _a
+                        if _STAGE1_CO and _a > 0:      # log for Site 2 (rows built later)
+                            _s1_prod_log.append({
+                                "day": day, "date": date_str, "shift": shift,
+                                "machine": _m, "sku": _sku, "qty": _a,
+                            })
+                    if _got > 0:
+                        _carcass_bank[_sku].append([_cage, _got])
+                    return _got
+
+                # ── S1_INCH_FLEX: SURPLUS→SCARCE one-way inch advance (client rule) ──
+                # A Stage-1 machine takes a DIFF-size CO to another inch only when (1) it is
+                # SURPLUS on its own inch — the OTHER machines there can cover that inch's
+                # remaining Stage-2 carcass demand for the rest of the horizon without it —
+                # (2) a genuinely SCARCE eligible inch exists (whose machines cannot cover
+                # their remaining demand), and (3) it has NOT been on that inch before
+                # (one-way, never revert). It moves to the scarcest such inch. Because moves
+                # are surplus-only, toward-scarcer-only, and never-revisit, each machine takes
+                # ≤ (#eligible inches) diff-COs all month → Stage-1 CO stays bounded.
+                if _S1_INCH_FLEX:
+                    _dl = max(1, planning_days - day + 1)          # shifts left ≈ days_left×3
+                    _inch_rem: dict = defaultdict(float)
+                    for _s2s in s1_sku_to_machines:
+                        _ii = sku_inch.get(str(_s2s), "")
+                        if _ii:
+                            _inch_rem[_ii] += max(0.0, demand_remaining.get(str(_s2s), 0.0))
+                    _mach_on: dict = defaultdict(list)
+                    for _m in _S1_MACHINES:
+                        _mach_on[s1_current_inch.get(_m, s1_locked_inch.get(_m, ""))].append(_m)
+
+                    def _cap_left(_ms):
+                        return sum(_bld_qty_per_shift(x) for x in _ms) * 3 * _dl
+
+                    def _scarce(_i):                               # machines on _i can't cover it
+                        return _cap_left(_mach_on.get(_i, [])) < _inch_rem.get(_i, 0.0) - 1e-9
+
+                    for _m in sorted(_S1_MACHINES):
+                        _ci = s1_current_inch.get(_m, s1_locked_inch.get(_m, ""))
+                        _peers = [x for x in _mach_on.get(_ci, []) if x != _m]
+                        if _cap_left(_peers) < _inch_rem.get(_ci, 0.0) - 1e-9:
+                            continue                               # NOT surplus → m needed here
+                        _cands = [(_inch_rem.get(_i, 0.0) / max(1, len(_mach_on.get(_i, []))), _i)
+                                  for _i in _s1_elig_inches.get(_m, ())
+                                  if _i != _ci and _i not in _s1_visited[_m] and _scarce(_i)]
+                        if _cands:
+                            _best = max(_cands, key=lambda t: (t[0], t[1]))[1]
+                            s1_current_inch[_m] = _best
+                            _s1_visited[_m].add(_best)
+                            _mach_on[_ci].remove(_m); _mach_on[_best].append(_m)
+
+                # PASS 1 — cover this shift's Stage-2 need beyond bank carry-in.
+                for _gs, _gneed in sorted(_s2_desired.items(), key=lambda kv: (-kv[1], kv[0])):
+                    _short = _gneed - _bank_avail(_gs)
+                    if _short > 0:
+                        _gate_build(_gs, _short)
+                # PASS 2 — pre-build residual capacity toward a <=1-day buffer for SKUs
+                # the presses are actively pulling (so upcoming bursts stay backed).
+                # A DISTRIBUTED buffer (rate x window, not full-capacity per SKU) banks
+                # for more SKUs and beats concentrating capacity on the top SKU.
+                if _STAGE2_CARCASS_PREBUILD:
+                    # STAGE1_CO: bound the pre-build so the carcass held beyond this shift's
+                    # own consumption (the buffer that can carry overnight) stays under
+                    # MAX_ENDOFDAY_CARCASS_INVENTORY every shift. Measured NET-best across
+                    # months vs an EOD-only bound (the every-shift bound keeps the carcass
+                    # allocation balanced, which cascades to better Stage-2 coverage).
+                    _desired_total = sum(_s2_desired.values())
+                    _buf_cap = (_desired_total + _MAX_EOD_CARCASS) if _STAGE1_CO else float("inf")
+                    def _bank_total():
+                        return sum(_q for _es in _carcass_bank.values() for (_a, _q) in _es)
+                    _cand = set(_s2_desired)
+                    _cand |= {s for s in s1_sku_to_machines
+                              if shift_cure_demand.get(s, 0.0) > 0 and demand_remaining.get(s, 0.0) > 0}
+                    for _gs in sorted(_cand, key=lambda s: (-(shift_cure_demand.get(s, 0.0)
+                                                             + _s2_desired.get(s, 0.0)), s)):
+                        _rate = max(_s2_desired.get(_gs, 0.0), shift_cure_demand.get(_gs, 0.0))
+                        if _rate <= 0:
+                            continue
+                        _buf = min(_rate * (1 + _STAGE1_CARCASS_LEAD),
+                                   max(0.0, demand_remaining.get(_gs, 0.0)))
+                        _extra = _buf - _bank_avail(_gs)
+                        if _STAGE1_CO:                       # keep the carryable buffer ≤ cap
+                            _extra = min(_extra, max(0.0, _buf_cap - _bank_total()))
+                        if _extra > 0:
+                            _gate_build(_gs, _extra)
+                # CLAMP Stage-2 GT per SKU to the bank; consume FIFO (oldest first).
+                _take: dict[str, float] = {}
+                for _gs in _s2_desired:
+                    _t = min(_s2_desired[_gs], _bank_avail(_gs))
+                    _take[_gs] = _t
+                    _rem = _t
+                    for _entry in _carcass_bank.get(_gs, []):
+                        if _rem <= 0:
+                            break
+                        _use = min(_entry[1], _rem)
+                        _entry[1] -= _use
+                        _rem -= _use
+                    if _gs in _carcass_bank:
+                        _carcass_bank[_gs] = [[_a, _q] for (_a, _q) in _carcass_bank[_gs] if _q > 1e-9]
+                for _gm in list(shift_plan):
+                    if _MACHINE_GROUP.get(_gm, "") != "STAGE2":
+                        continue
+                    _gnew = []
+                    for (_gs, _gq, _gct) in shift_plan[_gm]:
+                        _des = _s2_desired.get(_gs, 0.0)
+                        _gq2 = _gq * (_take.get(_gs, 0.0) / _des) if _des > 1e-9 else 0.0
+                        _gnew.append((_gs, _gq2, _gct))
+                    shift_plan[_gm] = _gnew
+                if _STAGE1_CO and shift == "C":   # end-of-day carcass buffer carried overnight
+                    # HARD cap (like the 8k GT cap): the carcass carried overnight must be
+                    # ≤ MAX_ENDOFDAY_CARCASS_INVENTORY. Trim the soonest-to-expire excess
+                    # (lowest age-remaining first — it would age out first anyway).
+                    _tot = sum(_q for _es in _carcass_bank.values() for (_a, _q) in _es)
+                    _excess = _tot - _MAX_EOD_CARCASS
+                    if _excess > 1e-9:
+                        # Trim the soonest-to-expire excess first (lowest age-remaining — it
+                        # would age out first anyway). Rarely binds under the every-shift cap.
+                        _order = sorted(((_sk, _i) for _sk, _es in _carcass_bank.items()
+                                         for _i in range(len(_es))),
+                                        key=lambda t: (_carcass_bank[t[0]][t[1]][0], t[0], t[1]))
+                        for _sk, _i in _order:
+                            if _excess <= 1e-9:
+                                break
+                            _drop = min(_carcass_bank[_sk][_i][1], _excess)
+                            _carcass_bank[_sk][_i][1] -= _drop
+                            _excess -= _drop
+                        for _sk in list(_carcass_bank):
+                            _carcass_bank[_sk] = [[_a, _q] for (_a, _q) in _carcass_bank[_sk]
+                                                  if _q > 1e-9]
+                            if not _carcass_bank[_sk]:
+                                del _carcass_bank[_sk]
+                    _carcass_eod.append(sum(_q for _es in _carcass_bank.values()
+                                            for (_a, _q) in _es))
 
             # ── 2b. Idle-recoverability diagnostic (read-only, plan-neutral) ──
             if _IDLE_DIAG_ON:
@@ -6679,6 +7232,10 @@ def run_rolling_pipeline(
             # assumed to always have spare capacity to supply Stage-2 (validated:
             # Stage-1 util stays well under 100% even at full Stage-2 output), so
             # this can never gate or double-count real GT output.
+            # Carcass rows for THIS shift's Stage-2 output (post gate-clamp). The
+            # post-plan max-flow (_stage1_carcass_schedule) later REPLACES these with
+            # the aging-aware allocation; kept here for Stage-1 inch tracking + the
+            # STAGE1_CARCASS_PASS=0 fallback. Runs on the clamped plan when gated.
             stage2_built_this_shift: dict[str, float] = defaultdict(float)
             for machine, campaigns in shift_plan.items():
                 if _MACHINE_GROUP.get(machine, "") != "STAGE2":
@@ -6692,31 +7249,7 @@ def run_rolling_pipeline(
             # has leftover capacity, instead of splitting it across SKUs with no
             # changeover between them.
             s1_machines_used_this_shift: set = set()
-
-            def _s1_inch_ok(_m: str, _sku: str) -> bool:
-                """Client inch rules applied to Stage-1 carcass machines too.
-
-                Same anchor +/- band and never-revisit rules as the GT machines;
-                Stage-1 keeps its own current-inch tracker because it is scheduled
-                here (Step 3b, derived from Stage-2 output), not in
-                _assign_building_shift.
-                """
-                if not _INCH_RULES_ENABLED:
-                    return True
-                # INCH_HIST_LOCK (Stage-1 sub-toggle, default OFF): bound the carcass
-                # machine to its historical allowed-inch set. OFF → keep the demand-optimal
-                # _STAGE1_SINGLE_INCH lock below (already one-inch + carcass-FEASIBLE).
-                if (_INCH_HIST_LOCK_ENABLED and _INCH_HIST_LOCK_STAGE1
-                        and str(_m) in _MACHINE_ALLOWED_INCH_SET):
-                    return sku_inch.get(_sku, "") in _MACHINE_ALLOWED_INCH_SET[str(_m)]
-                # Rule 2 (S1_SINGLE_INCH): the machine is locked to ONE inch all month —
-                # eligible only for that exact inch's carcass (zero different-size CO).
-                if _STAGE1_SINGLE_INCH and _m in s1_locked_inch:
-                    return sku_inch.get(_sku, "") == s1_locked_inch[_m]
-                return _inch_ok(sku_inch.get(_sku, ""),
-                                s1_current_inch.get(_m, ""),
-                                machine_anchor_inch.get(_m, ""),
-                                machine_used_inches.get(_m, set()))
+            # _s1_inch_ok is defined once per shift above (step 2c) and reused here.
 
             for sku, need in sorted(stage2_built_this_shift.items(), key=lambda kv: (-kv[1], kv[0])):
                 if need <= 0:
@@ -7436,7 +7969,46 @@ def run_rolling_pipeline(
     # max-flow with a 1-2 shift pre-build (≤1-day aging). Does NOT touch gt_inventory /
     # cured — correct utilization/qty/time accounting + a feasibility flag. OFF restores
     # the old undercounting tracking rows. See _stage1_carcass_schedule / _STAGE1_CARCASS_PASS.
-    if _STAGE1_CARCASS_PASS:
+    if _STAGE1_CO and _STAGE2_CARCASS_GATE:
+        # Site 2 (STAGE1_CO): carcass rows from the gate's own production, capped at real
+        # Stage-2 consumption (keeps pre-built-and-consumed carcass within the 1-day aging
+        # window; drops only the never-consumed aged-out over-production), CO recomputed.
+        _s2_gt_per_sku: dict = defaultdict(float)
+        for r in bld_shift_rows:
+            if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
+                    and (r.get("Qty", 0) or 0) > 0):
+                _s2_gt_per_sku[str(r["SKUCode"])] += r["Qty"]
+        _carc_rows, _carc_rep, _carc_co = _stage1_carcass_rows_co(
+            _s1_prod_log, dict(_s2_gt_per_sku), sku_inch,
+            opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None))
+        bld_shift_rows[:] = [r for r in bld_shift_rows if r.get("CO_Type") != "carcass"]
+        bld_shift_rows.extend(_carc_rows)
+        bld_co_events.extend(_carc_co)                # so Stage-1 occupancy counts the CO
+        _cm = len({r["Machine"] for r in _carc_rows})
+        _ou = _carc_rep.get("opening_used", 0)
+        print(f"  [Stage-1 carcass] STAGE1_CO ON: {_carc_rep['produced']:,} carcass units"
+              + (f" (+{_ou:,} opening)" if _ou else "")
+              + f" / {_carc_rep['demand']:,} Stage-2 GT across {_cm} machines; "
+              f"{_carc_rep['co_count']:,} carcass building COs = {_carc_rep['co_mins']:,} min "
+              f"(no production during CO).")
+        if _carc_rep["unmet"] > 0:
+            print(f"  [Stage-1 carcass] ⚠ INFEASIBLE: {_carc_rep['unmet']:,} carcass units cannot "
+                  f"be supplied within the aging window.")
+        else:
+            print("  [Stage-1 carcass] FEASIBLE: Stage-1 supplies 100% of Stage-2 carcass demand "
+                  "(CO-charged, pre-build within 1-day aging).")
+        if _carcass_eod:
+            _n_over = sum(1 for v in _carcass_eod if v > _MAX_EOD_CARCASS + 1)
+            print(f"  [Stage-1 carcass] EOD carcass buffer: max {max(_carcass_eod):>5,.0f} | "
+                  f"mean {sum(_carcass_eod)/len(_carcass_eod):>5,.0f} | "
+                  f"cap {_MAX_EOD_CARCASS:,} | days>cap {_n_over}")
+        if _S1_INCH_FLEX:
+            _adv = [(m, s1_locked_inch.get(m, ""), s1_current_inch.get(m, ""))
+                    for m in sorted(_S1_MACHINES)
+                    if s1_current_inch.get(m, "") != s1_locked_inch.get(m, "")]
+            print(f"  [Stage-1 carcass] S1_INCH_FLEX: {len(_adv)} machines advanced inch "
+                  f"(one-way): {[(m, a+'→'+b) for m, a, b in _adv]}")
+    elif _STAGE1_CARCASS_PASS:
         _carc_rows, _carc_rep = _stage1_carcass_schedule(
             bld_shift_rows, s1_sku_to_machines, planning_days, lead=_STAGE1_CARCASS_LEAD,
             opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None),

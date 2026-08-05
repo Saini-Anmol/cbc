@@ -43,7 +43,7 @@ DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = False
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -53,7 +53,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_demand_tomerJi1.xlsx")
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
@@ -291,7 +291,7 @@ BUILDING_CO_SAME_SIZE = {
     "VMI":      20,   # 6001–6004, 7001–7004  — cheapest CO (4.2% of shift)
     "BJ":       45,   # 7101–7106, 7201
     "STAGE2":   59,   # 8201, 8301, 8302, 8501, 8502, 7301
-    "STAGE1":   60,   # 6801–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101
+    "STAGE1":   60,   # 6802–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 (6801 retired)
     "MID":      60,   # same as Stage-1 (shared group in CO master)
     "UNISTAGE": 110,  # 7501–7503
 }
@@ -357,6 +357,13 @@ MAX_ENDOFDAY_GT_INVENTORY = int(os.environ.get("GT_CAP_MAX", "8000"))
 # (summed over all SKUs, after curing + stale writeoff) cannot exceed this many
 # units. Enforced PROACTIVELY during building (never build past the ceiling) so
 # it is a hard cap, not a reactive writeoff. Bounds the forward-buffer level-load.
+
+# End-of-day CARCASS inventory cap (analogous to the 8k GT cap, but for Stage-1
+# carcass held overnight). Carcass has a 1-day shelf, so a limited buffer of
+# pre-built carcass may be carried between shifts/overnight to back a Stage-2 burst;
+# this bounds that buffer so the plant never hoards carcass. Applied only when the
+# STAGE1_CO carcass-realism model is ON (bounds the gate's pre-build). Env CARCASS_EOD_CAP.
+MAX_ENDOFDAY_CARCASS_INVENTORY = int(os.environ.get("CARCASS_EOD_CAP", "2000"))
 
 GT_BUFFER_SHIFTS        = 2
 # VMI sibling machines (e.g. 6004+7001, both on 16") both need non-zero deficit
@@ -438,6 +445,55 @@ CARCASS_SHELF_LIFE_DAYS = 1
 # realistic and LOWERS the carcass INFEASIBLE count. Default OFF (env CARCASS_INV=1) = A/B;
 # OFF reproduces the current carcass schedule bit-for-bit.
 CARCASS_INV_ENABLED = (os.environ.get("CARCASS_INV", "1") != "0")   # ADOPTED (KPI-neutral realism)
+
+# ── Stage-2 carcass GATE (hard constraint) ───────────────────────────────────
+# When ON, Stage-2 GT each shift is CAPPED by feasible same-shift Stage-1 carcass
+# supply: Stage-2 can NEVER build GT the carcass can't back — it WAITS for carcass.
+# Enforces invariant #3 as a scheduling constraint (not just the post-hoc report),
+# so the plan is physically realizable (Stage-2 GT total == Stage-1 carcass total).
+# Only ever REDUCES Stage-2 GT (demand cap / no-waste-GT safe); can lower cured.
+# Committed default: ON (env STAGE2_CARCASS_GATE=0 forces OFF for A/B). Enforces
+# invariant #3 — Stage-2 never builds GT without carcass. Engine reads this via getattr.
+STAGE2_CARCASS_GATE_ENABLED = (os.environ.get("STAGE2_CARCASS_GATE", "1") != "0")
+
+# ── Stage-1 building CHANGEOVER time (STAGE1_CO) ──────────────────────────────
+# When ON, the 15 Stage-1 (carcass) machines are charged real building CO time —
+# same_size_CO = 60 min, diff_size_CO = 180 min (flat, all 15) — exactly like the
+# 24 GT machines: NO production during the CO block. It is BINDING: a Stage-1
+# machine that changes carcass SKU makes fewer units that shift, so the Stage-2
+# carcass GATE clamps Stage-2 GT where carcass+CO cannot keep up (correctness over
+# KPI; only ever REDUCES cured, demand-cap / no-waste-GT safe). Previously Stage-1
+# changeovers were FREE (0 min) in both the gate feasibility and the post-plan
+# carcass rows — a real-plant modelling gap. Requires the Stage-2 carcass gate ON.
+# ADOPTED default ON (verified July/Aug/June: mould-audit PASS, carcass=Stage-2 GT
+# exactly, EOD carcass ≤ MAX_ENDOFDAY_CARCASS_INVENTORY=2000 with 0 days over,
+# deterministic). Carcass is shown = exactly what Stage-2 consumes (aged-out pre-build
+# dropped; pre-build within the 1-day aging kept). KPI cost (net ~−2.5k over 3 months)
+# is the honest price of the hard 2000 carcass-storage limit + real Stage-1 CO — proven
+# unrecoverable by Stage-1 reallocation (Stage-1 is ~48% idle, 0 inch shortages) or by
+# cutting Stage-2 COs (that STARVES the 6 bottleneck presses — Aug −22k). Env STAGE1_CO=0
+# reverts to the free-Stage-1-CO baseline bit-for-bit. Pinned in main.CLOUD_CONFIG.
+STAGE1_CO_ENABLED = (os.environ.get("STAGE1_CO", "1") != "0")
+
+# ── Stage-2 campaign consolidation (S2_CAMPAIGN) ──────────────────────────────
+# Cuts the churn of the 6 Stage-2 GT machines {8201,8301,8302,8501,8502,7301} so
+# per-shift CARCASS demand is smoother and the FIXED 2000-unit overnight carcass
+# buffer (MAX_ENDOFDAY_CARCASS_INVENTORY, do NOT change) can absorb it — recovering
+# the KPI that spiky carcass demand costs WITHOUT raising the cap. STAGE2-only knobs,
+# all no-ops when OFF (bit-for-bit). The ADOPTED lever is S2_MIN_CAMPAIGN_MINS: a
+# Stage-2 CO to a NEW sku must yield a campaign >= this long (default 185 min), else
+# the machine idles rather than doing a short churn switch — this frees CO time that
+# becomes longer productive campaigns (Stage-2 GT actually rises). 185 is the middle
+# of a measured stable [180,190] step (>=200 regresses sharply, so keep it here). The
+# other two knobs were measured WORSE on July and default to no-ops: S2_SKU_CAP (tighter
+# distinct-SKU/day cap; 4 = the plant-wide cap = no-op, tighter HURT) and S2_MAX_CO_PER_DAY
+# (blunt per-day CO budget; 0 = disabled, budget<=2 collapses production). July, STAGE1_CO=1:
+# OFF 663,700 / 217 Stage-2 COs -> ON 665,599 (+1,899) / 142 COs, carcass=GT, EOD<=2000,
+# mould-audit PASS, deterministic. Committed default OFF (env S2_CAMPAIGN=1 to enable).
+S2_CAMPAIGN_ENABLED = (os.environ.get("S2_CAMPAIGN", "0") != "0")
+S2_SKU_CAP = int(os.environ.get("S2_SKU_CAP", "4"))               # 4 = no-op (tighter HURT July)
+S2_MIN_CAMPAIGN_MINS = int(os.environ.get("S2_MIN_CAMPAIGN_MINS", "185"))  # mid of the [180,190] plateau
+S2_MAX_CO_PER_DAY = int(os.environ.get("S2_MAX_CO_PER_DAY", "0"))  # 0 = disabled (blunter alt to min-camp)
 
 # ── Delivery-date / priority-flag committed-delivery SKUs (DELIVERY_PRIORITY) ──
 # Client feature: the demand file may carry two optional columns —
@@ -541,7 +597,7 @@ GT_MACHINES = frozenset({
 # not found here falls back to "NA".
 BUILDING_MACHINE_NAMES = {
     "6001": "VMIExxium01", "6002": "VMIExxium02", "6003": "VMIExxium03", "6004": "VMIExxium04",
-    "6801": "bj1stage1",   "6802": "bj2stage1",   "6803": "bj3stage1",
+    "6802": "bj2stage1",   "6803": "bj3stage1",
     "6909": "nrm9stage1",  "6911": "nrm11stage1",
     "7001": "vmi1Maxx",    "7002": "vmi2Maxx",    "7003": "vmi3Maxx",    "7004": "vmi4Maxx",
     "7101": "bj4", "7102": "bj5", "7103": "bj6", "7104": "bj7", "7105": "bj9", "7106": "bj10",
