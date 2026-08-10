@@ -1,0 +1,296 @@
+"""Rolling receding-horizon driver for the CP-SAT window scheduler.
+
+Chains fixed-size windows across the whole month. Each step COMMITS 10 days but is
+SOLVED over a window of up to 13 days (10 committed + up to a 3-day lookahead tail so
+the 3-day GT-shelf seam is seen inside the window). Carry-over state (GT inventory,
+carcass inventory, per-SKU running press counts) at the last committed shift seeds the
+next window; committed cured is subtracted from a shrinking per-SKU demand so the
+sacred demand cap holds across the whole month, not just one window.
+
+Deterministic: sorted iteration throughout, fixed seed forwarded to the solver.
+
+Do NOT edit optimizer/model.py or optimizer/data.py — this module only orchestrates
+the stable build_and_solve interface.
+"""
+from __future__ import annotations
+
+import copy
+import os
+from datetime import timedelta
+
+from optimizer.data import load_model_inputs
+from optimizer.model import build_and_solve
+from optimizer.warmstart import greedy_hint
+from optimizer.greedy_warmstart import extract_month_greedy, window_hint
+from optimizer.writer import recover_assignment
+
+_SHIFT_LABEL = ("A", "B", "C")
+
+COMMIT_DAYS = 10          # days committed per rolling step
+LOOKAHEAD_TAIL = 3        # extra lookahead days (3-day GT shelf seam)
+MAX_WINDOW_DAYS = COMMIT_DAYS + LOOKAHEAD_TAIL   # 13
+
+# Warm-start mode (env WARMSTART): 'none' -> PURE CP-SAT (all-zero seed + let it search;
+# evidence: ~matches a hint, cleaner, no greedy dependency); 'simple' -> constructive
+# greedy_hint; 'greedy' -> slice the real greedy month plan (regressed). Default 'none'.
+WARMSTART = os.environ.get("WARMSTART", "none")
+
+
+def _accumulate_window_rows(sol, mi, day_start, commit_days, building_rows, curing_rows):
+    """Append this window's COMMITTED-days plan (t=0..commit_days*3-1) to the two
+    month-global row lists, mapping window-local shift t to a global Day/Date/Shift.
+
+    Building rows come from the plan's g (S2/UNI GT) + gc (S1 carcass); curing rows
+    come from optimizer.writer.recover_assignment(sol, mi) — the PHYSICAL press->SKU
+    map recovered from the CP-SAT count vector — with the shift's model-cured units
+    distributed across the presses assigned to each SKU. recover_assignment is called
+    HERE, per window, because sol is per-window (window-local t).
+    """
+    plan = sol["plan"]
+    commit_shifts = commit_days * 3
+
+    def _stamp(t):
+        # window-local t -> (global_day, date_str, shift_label)
+        local_day = t // 3 + 1
+        global_day = (day_start - 1) + local_day
+        date_str = (mi.plan_start + timedelta(days=global_day - 1)).strftime("%Y-%m-%d")
+        return global_day, date_str, _SHIFT_LABEL[t % 3]
+
+    # ---- building: g = GT (S2/UNI), gc = carcass (S1) ----
+    for kind, book in (("GT", plan.get("g", {})), ("carcass", plan.get("gc", {}))):
+        for (m, s, t), q in book.items():
+            if t >= commit_shifts or q <= 0:
+                continue
+            gday, date_str, shift = _stamp(t)
+            building_rows.append({
+                "Day": gday, "Date": date_str, "Shift": shift,
+                "Machine": m, "Group": mi.machine_group.get(m, ""),
+                "Type": kind, "SKUCode": s, "Inch": mi.sku_inch.get(s, ""),
+                "Qty": int(q),
+            })
+
+    # ---- curing: physical press assignment recovered from the counts ----
+    cured_plan = plan.get("cured", {})
+    assignment, _infeasible = recover_assignment(sol, mi)
+    for t in range(commit_shifts):
+        assign_t = assignment.get(t, {})
+        if not assign_t:
+            continue
+        gday, date_str, shift = _stamp(t)
+        # group the assigned presses by SKU, then split the shift's cured units
+        by_sku: dict = {}
+        for press, s in assign_t.items():
+            by_sku.setdefault(s, []).append(press)
+        for s, presses in by_sku.items():
+            total = int(cured_plan.get((s, t), 0))
+            if total <= 0:
+                continue
+            presses = sorted(presses)
+            k = len(presses)
+            base, rem = divmod(total, k)
+            for i, press in enumerate(presses):
+                q = base + (1 if i < rem else 0)
+                if q <= 0:
+                    continue
+                curing_rows.append({
+                    "Day": gday, "Date": date_str, "Shift": shift,
+                    "Press": press, "SKUCode": s, "Inch": mi.sku_inch.get(s, ""),
+                    "Qty": int(q),
+                })
+
+
+def run_rolling(mi, det_time_s: float = 90.0, workers: int = 8, seed: int = 1,
+                verbose: bool = True) -> dict:
+    """Roll fixed windows over mi.planning_days. Returns per-window records + month totals.
+
+    For each step:
+      1. win_mi = copy.copy(mi) with demand replaced by the *remaining* per-SKU demand.
+      2. Solve a window of min(MAX_WINDOW_DAYS, days_left) days, seeded with carry-over state.
+      3. Commit min(COMMIT_DAYS, days_left) days: accumulate committed cured, shrink demand.
+      4. Carry over GT/carcass/press-count state at the last committed shift.
+    """
+    total_demand = sum(mi.demand.values())
+    demand_remaining = dict(mi.demand)          # sacred cap tracker, shrinks as we commit
+
+    # ---- REAL-GREEDY per-window warm-start: extract the greedy's month plan ONCE ----
+    greedy_n = greedy_g = None
+    if WARMSTART == "greedy":
+        try:
+            greedy_n, greedy_g, gmeta = extract_month_greedy(mi)
+            if verbose:
+                print(f"  [GREEDY_WARM] using real-greedy month plan "
+                      f"({len(greedy_n):,} n / {len(greedy_g):,} g entries); meta={gmeta}")
+        except Exception as _e:
+            greedy_n = greedy_g = None
+            if verbose:
+                print(f"  [GREEDY_WARM] extraction failed ({_e}); "
+                      f"falling back to constructive greedy_hint")
+
+    # carry-over state (None on the first window -> model uses opening state)
+    cur_gt = None
+    cur_carc = None
+    cur_n = None
+
+    windows: list = []
+    total_cured = 0
+    total_co = 0
+    total_wall_s = 0.0
+
+    # month-global committed-days plan rows (for the Excel schedule writer)
+    building_rows: list = []
+    curing_rows: list = []
+
+    day_start = 1
+    days_left = int(mi.planning_days)
+
+    while days_left > 0:
+        win_days = min(MAX_WINDOW_DAYS, days_left)
+        commit_days = min(COMMIT_DAYS, days_left)
+
+        win_mi = copy.copy(mi)
+        win_mi.demand = dict(demand_remaining)
+
+        # Greedy warm-start incumbent for this window.
+        #  GREEDY_WARM=1: SLICE the real greedy engine's month plan for this window's days
+        #                 (local_t=0..win_days*3-1 -> gt=(day_start-1)*3+local_t). This starts
+        #                 the solver from greedy's own PACED plan; it can only improve.
+        #  GREEDY_WARM=0: the simple constructive greedy_hint (prior behaviour).
+        # NB: the sliced hint reflects GREEDY's own carry-over state for these days, which may
+        # not match this window's init_gt/init_n (from the PREVIOUS committed CP-SAT solution).
+        # AddHint is advisory — CP-SAT repairs any inconsistency — so a mismatched hint still
+        # seeds search, but the alignment is imperfect (documented in the deliverable).
+        if WARMSTART == "greedy" and greedy_n is not None:
+            try:
+                win_hint = window_hint(mi, greedy_n, greedy_g, day_start, win_days)
+            except Exception as _e:
+                win_hint = None
+                if verbose:
+                    print(f"  [window day {day_start}] real-greedy slice failed ({_e}); all-zero start")
+        elif WARMSTART == "simple":
+            try:
+                win_hint = greedy_hint(win_mi, day_start, win_days)
+            except Exception as _e:
+                win_hint = None
+                if verbose:
+                    print(f"  [window day {day_start}] greedy_hint failed ({_e}); all-zero start")
+        else:
+            win_hint = None    # PURE CP-SAT: build_and_solve applies the minimal all-zero seed
+
+        sol = build_and_solve(
+            win_mi, day_start, n_days=win_days, commit_days=commit_days,
+            init_gt=cur_gt, init_n=cur_n, init_carc=cur_carc,
+            det_time_s=det_time_s, seed=seed, workers=workers, hint=win_hint,
+        )
+
+        status = sol.get("status", "UNKNOWN")
+        wall_s = float(sol.get("wall_s", 0.0) or 0.0)
+        total_wall_s += wall_s
+
+        ok = status in ("OPTIMAL", "FEASIBLE") and "plan" in sol
+        commit_shifts = range(commit_days * 3)      # t = 0 .. commit_days*3 - 1
+        tc = commit_days * 3 - 1                     # last committed shift index
+
+        cured_committed = 0
+        if ok:
+            plan = sol["plan"]
+            cured_plan = plan["cured"]
+            inv_plan = plan["inv"]
+            carc_plan = plan["carc"]
+            n_plan = plan["n"]
+
+            # committed cured per SKU over the committed shifts -> shrink demand
+            for s in mi.skus:
+                c = 0
+                for t in commit_shifts:
+                    c += int(cured_plan.get((s, t), 0))
+                if c:
+                    cured_committed += c
+                    demand_remaining[s] = max(0, demand_remaining[s] - c)
+
+            # carry-over state at the last committed shift
+            cur_gt = {s: inv_plan.get((s, tc), 0) for s in mi.skus}
+            cur_carc = {s: carc_plan.get((s, tc), 0) for s in mi.skus}
+            cur_n = {s: n_plan.get((s, tc), 0) for s in mi.skus}
+
+            # accumulate this window's committed-days plan into the month schedule
+            try:
+                _accumulate_window_rows(sol, mi, day_start, commit_days,
+                                        building_rows, curing_rows)
+            except Exception as _e:
+                if verbose:
+                    print(f"  [window day {day_start}] schedule-row accumulation "
+                          f"failed ({_e}); continuing")
+        else:
+            # window failed to produce a usable plan: commit nothing, keep prior
+            # carry-over state, and advance (robust to infeasible/unknown windows).
+            if verbose:
+                print(f"  [window day {day_start}] status={status} -> no plan, "
+                      f"committed cured=0, carrying prior state")
+
+        # Count ONLY committed-day COs (t in commit_shifts), not the 3-day lookahead
+        # tail — else each window's tail COs are double-counted across the horizon.
+        if ok:
+            co_plan = sol["plan"].get("co", {})
+            total_co += sum(int(co_plan.get((s, t), 0))
+                            for s in mi.skus for t in commit_shifts if (s, t) in co_plan)
+        total_cured += cured_committed
+
+        gap = sol.get("gap")
+        rec = {
+            "day_start": day_start,
+            "win_days": win_days,
+            "commit_days": commit_days,
+            "status": status,
+            "cured_committed": cured_committed,
+            "gap": gap,
+            "wall_s": wall_s,
+        }
+        windows.append(rec)
+
+        if verbose:
+            gap_s = f"{gap:.3f}" if isinstance(gap, (int, float)) else "  -  "
+            print(f"  window day {day_start:>2} (win={win_days}d commit={commit_days}d) "
+                  f"status={status:<8} cured_committed={cured_committed:>7,} "
+                  f"gap={gap_s} wall={wall_s:>6.1f}s")
+
+        day_start += COMMIT_DAYS
+        days_left -= commit_days
+
+    coverage = (total_cured / total_demand) if total_demand else 0.0
+    return {
+        "windows": windows,
+        "total_demand": total_demand,
+        "total_cured": total_cured,
+        "total_co": total_co,
+        "total_wall_s": round(total_wall_s, 1),
+        "coverage": coverage,
+        "building_rows": building_rows,
+        "curing_rows": curing_rows,
+    }
+
+
+if __name__ == "__main__":
+    import bc_config
+
+    mi = load_model_inputs()
+    print("ModelInputs:", mi.summary())
+    print(f"Month: plan_start={mi.plan_start} planning_days={mi.planning_days} "
+          f"total_demand={sum(mi.demand.values()):,}")
+    print(f"Rolling driver: commit={COMMIT_DAYS}d window<=%d d det_time=90s workers=8 seed=1"
+          % MAX_WINDOW_DAYS)
+    print("-" * 78)
+
+    res = run_rolling(mi, det_time_s=90.0, workers=8, seed=1, verbose=True)
+
+    print("-" * 78)
+    print(f"FULL MONTH: cured={res['total_cured']:,} / demand={res['total_demand']:,} "
+          f"= coverage {res['coverage'] * 100:.2f}%")
+    print(f"           curing COs={res['total_co']:,}  total wall={res['total_wall_s']:,}s "
+          f"({res['total_wall_s'] / 60:.1f} min)  windows={len(res['windows'])}")
+
+    # Write the committed month plan to inspectable Excel in main_output/.
+    from optimizer.output import write_schedules
+    paths = write_schedules(res, mi, out_dir="main_output")
+    print("-" * 78)
+    print(f"Building schedule: {paths['building']}  ({paths['n_building_rows']:,} rows)")
+    print(f"Curing schedule:   {paths['curing']}  ({paths['n_curing_rows']:,} rows)")

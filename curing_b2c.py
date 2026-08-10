@@ -269,10 +269,10 @@ def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
         rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
         mms = _sql(engine,
-            f"SELECT MouldNo, `Matl.Code` AS sku, `Active Flag` AS flag "
+            f"SELECT `Mold_Name` AS MouldNo, `Item_Code` AS sku "
             f"FROM {DB}.Master_Mapping_Mould_SKU")
 
-        active = mms[mms["flag"].astype(str).str.strip().str.upper() == "X"]
+        active = mms   # 2026-08 schema has NO active flag — all rows count
         compat = (active.groupby("MouldNo")["sku"]
                         .apply(lambda x: ", ".join(x.astype(str).str.strip()))
                         .reset_index()

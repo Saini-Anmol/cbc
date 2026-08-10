@@ -1,0 +1,240 @@
+"""optimizer/writer.py — recover a physical press<->SKU assignment from the
+CP-SAT COUNT solution and VERIFY it against the EXACT mould-feasibility audit.
+
+WHY THIS EXISTS
+    optimizer/model.py models curing by per-SKU press COUNTS  n[(sku, t)]  = how
+    many presses cure `sku` at shift t — NOT which physical press. That is a
+    COUNT-RELAXATION of the real per-shift bipartite constraint:
+        * each RUNNING press needs 2 eligible FREE moulds for its SKU, and
+        * a mould serves exactly ONE press per shift (contention).
+    The model only approximates that with (a) the total press-count cap
+    (sum n <= n_press), (b) the per-SKU domain cap min(mould_pairs, elig_presses),
+    and (c) a union-find shared-mould component cap. None of those is the exact
+    bipartite b-matching, so the counts can be INFEASIBLE to realise physically.
+
+    This module closes the loop: it recovers an actual {press: sku} per shift and
+    runs the SAME exact bipartite audit that scratch_mould_audit.py enforces on the
+    greedy engine's output. A PASS proves the count-relaxation was tight for this
+    plan; a FAIL quantifies exactly how loose it is (which shifts / SKUs, by how
+    many mould-slots or presses).
+
+TWO INDEPENDENT FEASIBILITY LAYERS (both must hold for a shift to be realisable):
+  1. PRESS ELIGIBILITY — can we hand each SKU s exactly n[s,t] DISTINCT presses,
+     each eligible for s (press in sku_presses[s]), no press serving two SKUs?
+     The model's only guard here is the loose total-count cap sum n <= n_press;
+     a press eligible for just a few SKUs can still be over-subscribed. Solved as
+     a bipartite matching (demand-nodes x presses) via maximum_bipartite_matching.
+  2. MOULD FEASIBILITY — given the SAME counts, split each serving press into 2
+     slots, connect each slot to its SKU's eligible moulds, require a PERFECT
+     matching of all slots to distinct moulds. This depends ONLY on the counts
+     n[s,t] (moulds are eligible per-SKU, not per-press), so it is identical to
+     the scratch_mould_audit.py check applied to the recovered press->sku map.
+     Exact via scipy.sparse.csgraph.maximum_bipartite_matching (no greedy
+     false-positives).
+
+The mould eligibility used here mirrors scratch_mould_audit.py EXACTLY: the base
+`load_mould_eligibility()` map (carried in mi.sku_moulds) PLUS the Day-0 mounted
+(mould, SKU) pairs folded in from mi.press_init_moulds / mi.press_init_sku (the
+scheduler treats those orphan mounted moulds as eligible, so a fair audit must
+too — otherwise a running press is falsely flagged short by a slot).
+
+Interfaces used (STABLE):
+    optimizer.data.load_model_inputs -> mi (presses, sku_presses, press_allowed_skus,
+        sku_moulds, mould_pairs, press_init_sku, press_init_moulds, ...)
+    optimizer.model.build_and_solve  -> sol; sol['plan']['n'] = {(sku,t): count};
+        sol['meta']['W'] = #shifts.
+"""
+from __future__ import annotations
+
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import maximum_bipartite_matching
+
+
+# ----------------------------------------------------------------------------
+# Mould eligibility — reproduce scratch_mould_audit.py's fold of Day-0 mounted
+# moulds into the per-SKU eligibility pool (so the audit is the SAME fair test).
+# ----------------------------------------------------------------------------
+def _mould_eligibility(mi) -> dict:
+    """sku -> set(mould_id), = mi.sku_moulds + Day-0 mounted (press_init_moulds)."""
+    sku_moulds = {s: set(v) for s, v in mi.sku_moulds.items()}
+    for p, s in mi.press_init_sku.items():
+        if not s:                                   # idle press at t0 -> nothing to fold
+            continue
+        for md in mi.press_init_moulds.get(p, ()):  # orphan moulds mounted at Day 0
+            md = str(md).strip()
+            if md and md.lower() != "nan":
+                sku_moulds.setdefault(s, set()).add(md)
+    return sku_moulds
+
+
+def _bipartite_match(rows, cols, n_rows, n_cols):
+    """Max bipartite matching. Returns match array (len n_rows): matched col or -1."""
+    if n_rows == 0:
+        return np.empty(0, dtype=int)
+    if not rows or n_cols == 0:                     # no edges -> nothing matchable
+        return np.full(n_rows, -1, dtype=int)
+    graph = csr_matrix((np.ones(len(rows), dtype=int), (rows, cols)),
+                       shape=(n_rows, n_cols))
+    return maximum_bipartite_matching(graph, perm_type="column")
+
+
+# ----------------------------------------------------------------------------
+# recover_assignment — per shift, turn the COUNT vector n[s,t] into a concrete
+# {press: sku} map and flag where the counts cannot be physically realised.
+# ----------------------------------------------------------------------------
+def recover_assignment(sol, mi):
+    """Recover a physical press->SKU assignment for every shift of `sol`.
+
+    Returns:
+        assignment : {t: {press: sku}}   the concrete presses actually assigned
+                     (a press appears iff it was successfully matched to its SKU)
+        infeasible : list of (t, sku, shortfall, reason) where the counts cannot
+                     be realised.  reason == "press"  -> not enough DISTINCT
+                     eligible presses for that SKU this shift (shortfall = #presses
+                     unassignable);  reason == "mould" -> not enough disjoint
+                     eligible moulds (shortfall = #mould-SLOTS unfillable; 2 slots
+                     == 1 press).  Per-SKU attribution of a *mould* shortfall is
+                     best-effort (which slot the matcher leaves unmatched under
+                     contention is arbitrary); the per-shift TOTAL is exact.
+    """
+    plan = sol["plan"]
+    n_by = plan["n"]                                # {(sku, t): count}
+    W = sol["meta"]["W"]
+
+    presses = mi.presses
+    press_idx = {p: i for i, p in enumerate(presses)}
+    n_presses = len(presses)
+    sku_moulds = _mould_eligibility(mi)
+
+    assignment: dict = {}
+    infeasible: list = []
+
+    for t in range(W):
+        # required press count per SKU this shift
+        req = {}
+        for (s, tt), c in n_by.items():
+            if tt == t and c > 0:
+                req[s] = req.get(s, 0) + int(c)
+
+        assign_t: dict = {}
+        assignment[t] = assign_t
+        if not req:
+            continue
+
+        # ---------- Layer 1: PRESS-ELIGIBILITY assignment ----------
+        # demand-nodes (one per required press-slot of a SKU) x presses.
+        row_sku = []
+        rows, cols = [], []
+        for s, c in req.items():
+            elig = [press_idx[p] for p in mi.sku_presses.get(s, ()) if p in press_idx]
+            for _ in range(c):
+                r = len(row_sku)
+                row_sku.append(s)
+                for ci in elig:
+                    rows.append(r); cols.append(ci)
+        match = _bipartite_match(rows, cols, len(row_sku), n_presses)
+        press_short: dict = {}
+        for r, s in enumerate(row_sku):
+            col = match[r]
+            if col == -1:
+                press_short[s] = press_short.get(s, 0) + 1
+            else:
+                assign_t[presses[col]] = s
+        for s, short in press_short.items():
+            infeasible.append((t, s, short, "press"))
+
+        # ---------- Layer 2: EXACT MOULD b-matching ----------
+        # 2 slots per required press; each slot -> its SKU's eligible moulds;
+        # perfect matching to DISTINCT moulds required (a mould serves 1 press).
+        mset = set()
+        for s in req:
+            mset.update(sku_moulds.get(s, ()))
+        moulds = sorted(mset)
+        midx = {md: i for i, md in enumerate(moulds)}
+
+        slot_sku = []
+        srows, scols = [], []
+        for s, c in req.items():
+            sm = [midx[md] for md in sku_moulds.get(s, ()) if md in midx]
+            for _ in range(2 * c):
+                r = len(slot_sku)
+                slot_sku.append(s)
+                for ci in sm:
+                    srows.append(r); scols.append(ci)
+        smatch = _bipartite_match(srows, scols, len(slot_sku), len(moulds))
+        mould_short: dict = {}
+        for r, s in enumerate(slot_sku):
+            if smatch[r] == -1:
+                mould_short[s] = mould_short.get(s, 0) + 1
+        for s, short in mould_short.items():
+            infeasible.append((t, s, short, "mould"))
+
+    return assignment, infeasible
+
+
+# ----------------------------------------------------------------------------
+# audit_solution — run the recovery across all shifts and summarise PASS/FAIL.
+# ----------------------------------------------------------------------------
+def audit_solution(sol, mi):
+    """Recover + exact-audit every shift. Returns a PASS/FAIL summary dict."""
+    assignment, infeasible = recover_assignment(sol, mi)
+    W = sol["meta"]["W"]
+    bad_shifts = sorted({t for (t, _, _, _) in infeasible})
+    return {
+        "feasible_shifts":   W - len(bad_shifts),
+        "infeasible_shifts": len(bad_shifts),
+        "overall":           "PASS" if not infeasible else "FAIL",
+        # worst first, by shortfall magnitude
+        "violations":        sorted(infeasible, key=lambda v: -v[2]),
+        "assignment":        assignment,
+    }
+
+
+# ----------------------------------------------------------------------------
+# CLI — solve a 10-day August window and audit it.
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    from optimizer.data import load_model_inputs
+    from optimizer.model import build_and_solve
+
+    mi = load_model_inputs()                        # month = bc_config (Aug set)
+    print("Inputs:", mi.summary())
+    print("Solving a 10-day August window (day_start=1, workers=8, det_time=60s, seed=1)...")
+    sol = build_and_solve(mi, day_start=1, n_days=10,
+                          det_time_s=60.0, seed=1, workers=8)
+    print(f"  solve status={sol['status']}  cured={sol['cured']:,}  "
+          f"n_co={sol['n_co']}  gap={sol.get('gap')}  wall={sol['wall_s']}s")
+    if "plan" not in sol:
+        print("  no solution to audit (status not OPTIMAL/FEASIBLE) — abort.")
+        raise SystemExit(1)
+
+    res = audit_solution(sol, mi)
+    W = sol["meta"]["W"]
+    print("\n===== EXACT MOULD-FEASIBILITY AUDIT (count-relaxation gate) =====")
+    print(f"RESULT: {res['overall']}")
+    print(f"shifts audited     : {W}")
+    print(f"feasible shifts    : {res['feasible_shifts']}")
+    print(f"infeasible shifts  : {res['infeasible_shifts']}")
+
+    viol = res["violations"]
+    if not viol:
+        print("Every shift's press-count vector is PHYSICALLY REALISABLE "
+              "(distinct eligible presses + disjoint 2-mould assignment). "
+              "The count-relaxation is TIGHT for this plan.")
+    else:
+        n_press_v = sum(1 for v in viol if v[3] == "press")
+        n_mould_v = sum(1 for v in viol if v[3] == "mould")
+        tot_press = sum(v[2] for v in viol if v[3] == "press")
+        tot_mould = sum(v[2] for v in viol if v[3] == "mould")
+        print(f"violations         : {len(viol)}  "
+              f"(press={n_press_v} totalling {tot_press} presses, "
+              f"mould={n_mould_v} totalling {tot_mould} mould-slots ~= "
+              f"{tot_mould/2:.1f} presses)")
+        print("\nworst violations (shift t, SKU, shortfall, reason):")
+        for t, s, short, reason in viol[:12]:
+            day = t // 3 + 1
+            shift = "ABC"[t % 3]
+            unit = "presses" if reason == "press" else "mould-slots"
+            print(f"    t={t:>3} (day {day:>2} shift {shift})  {s}  "
+                  f"short {short} {unit}  [{reason}]")

@@ -491,7 +491,7 @@ _DYNAMIC_CO_TRACKER_ENABLED = True
 # proactively reassign a press ahead of a deadline the way a whole-horizon
 # simulation can. Code kept in place, toggle permanently off. Superseded by
 # _ROLLING_HORIZON_CO_ENABLED below.
-_DYNAMIC_CO_PLANNER_ENABLED = False
+_DYNAMIC_CO_PLANNER_ENABLED = (os.environ.get("DYNCO", "0") == "1")  # env-gated for A/B; default OFF = bit-for-bit
 
 # Nested sub-toggle (only meaningful when _DYNAMIC_CO_PLANNER_ENABLED=True):
 # adds sku_campaign_tier (building's primary/secondary/tertiary campaign
@@ -897,6 +897,19 @@ _INCH_PLUS3_ENABLED      = os.environ.get("INCH_PLUS3", "0") != "0"
 _P3DBG                   = os.environ.get("INCH_PLUS3_DEBUG") is not None
 _PLUS3_DBG               = [0, 0, 0, 0]   # [has-room, stranded, dwell-ok, has-±3-SKU]
 _INCH_BAND_WIDTH         = int(os.environ.get("INCH_BAND", "2"))   # Rule 2: anchor +/- N
+# Stepwise inch-DRIFT (Phase-0a): bounded ±1-step relaxation of the hist-lock for a stranded
+# idle machine, DB-certified only, cumulative cap _INCH_STEP_MAX, no direct ±3. Default OFF =
+# today bit-for-bit. See bc_config.INCH_STEP_DRIFT_ENABLED / the drift block after Phase-B2.
+_INCH_STEP_DRIFT         = (os.environ.get("INCH_STEP_DRIFT",
+                            "1" if bool(getattr(_bc_cfg, "INCH_STEP_DRIFT_ENABLED", False)) else "0") != "0")
+_INCH_STEP_MAX           = int(os.environ.get("INCH_STEP_MAX",
+                               str(getattr(_bc_cfg, "INCH_STEP_MAX", 2))))
+_STEP_DBG                = [0, 0, 0]   # [idle+room, stranded, drifted]
+# Lookahead buffer (Phase-1a): size _dyn_H + the forward-buffer risk gate to the ANTICIPATED peak
+# draw (running + incoming-CO presses today) instead of only the current shift's draw. Default OFF
+# = today bit-for-bit. See bc_config.LOOKAHEAD_BUF_ENABLED.
+_LOOKAHEAD_BUF           = (os.environ.get("LOOKAHEAD_BUF",
+                            "1" if bool(getattr(_bc_cfg, "LOOKAHEAD_BUF_ENABLED", False)) else "0") != "0")
 # Variant A (True): the +/-2 band REPLACES the _HARD dominant-inch locks.
 # Variant B (False): keep _HARD as well, so the machine is bound by the
 # intersection (most restrictive). Chosen by measurement — see plan.
@@ -1132,6 +1145,16 @@ _CONCENTRATION = (os.environ.get("CONC_ALLOC",
                   "1" if bool(getattr(_bc_cfg, "CONCENTRATION_ENABLED", False)) else "0") != "0")
 _CONC_STARV_SHIFTS = float(os.environ.get("CONC_STARV_SHIFTS",
                            str(getattr(_bc_cfg, "CONC_STARV_SHIFTS", 1.0))))
+
+# IDLE_PRESS_ACTIVATE (env IDLE_PRESS_ACT, default OFF): the authoritative curing roster is the
+# 170 presses in Master_Curing_Allowable_Machines_source (cetl.load_allowable_press_ids()). Any
+# of the 170 NOT present in the Day-0 running-moulds snapshot (idle / mid-CO / clean at 07:00 on
+# Day 1) is brought online via a cold-start curing CO (nothing -> SKU) in Day-1 Shift A, then
+# produces from Day-1 Shift B. Target = neediest allowable SKU with 2 free moulds (reuses
+# _pick_retarget). Pair with PRESS_ALLOWABLE_ONLY=1 to also DROP any running press NOT in the 170,
+# so every month simulates EXACTLY the 170 roster presses. OFF = current behaviour bit-for-bit.
+_IDLE_PRESS_ACTIVATE = (os.environ.get("IDLE_PRESS_ACT",
+                        "1" if bool(getattr(_bc_cfg, "IDLE_PRESS_ACTIVATE_ENABLED", False)) else "0") != "0")
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1585,14 +1608,22 @@ def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int
     bjus_lock = {m: anchor[m] for m in gt
                  if _MACHINE_GROUP.get(m, "") == "UNISTAGE" and m in anchor}
     buildable: dict[str, float] = {}
+    sku_machines: dict[str, list] = {}      # PERSKU_FEED: SKU -> lock-aware eligible GT machines
+    machine_la_skus: dict[str, set] = {}    # PERSKU_FEED: machine -> lock-aware SKUs it builds (contention)
+    machine_gtday: dict[str, float] = {}    # PERSKU_FEED: machine -> GT/day
     for m, skus in machine_skus.items():
         _locked = bjus_lock.get(m)                                  # only BJ/US are locked
         m_day = _bld_qty_per_shift(m) * 3
+        machine_gtday[m] = m_day
         for s in skus:
             if _locked is not None and sku_inch.get(str(s), "") != _locked:
                 continue                                            # locked machine can't build off-inch
             buildable[s] = buildable.get(s, 0.0) + m_day
-    return {"bjus_lock": bjus_lock, "building_inch_capacity": dict(inch_cap), "buildable": buildable}
+            sku_machines.setdefault(str(s), []).append(m)
+            machine_la_skus.setdefault(m, set()).add(str(s))
+    return {"bjus_lock": bjus_lock, "building_inch_capacity": dict(inch_cap), "buildable": buildable,
+            "feed_ctx": {"sku_machines": sku_machines, "machine_skus": machine_la_skus,
+                         "machine_gtday": machine_gtday}}
 
 
 def _shift_start_dt(date_str: str, shift: str) -> "datetime":
@@ -2755,6 +2786,9 @@ def _assign_building_shift(
     machine_day_diff_co: dict | None = None,     # Part 2: {machine: #diff-size COs done today}
     machine_day_co: dict | None = None,          # S2_CAMPAIGN: {machine: #building COs done today}
     fixed_escape_used: dict | None = None,       # Lever B: {machine: #escape diff-COs spent}
+    machine_step_drift: dict | None = None,      # INCH_STEP_DRIFT: {machine: signed cumulative drift}
+    machine_db_skus: dict | None = None,         # INCH_STEP_DRIFT: {machine: un-stripped DB SKUs}
+    lookahead_draw: dict | None = None,          # LOOKAHEAD_BUF: {sku: anticipated peak draw today}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
 ) -> dict:
     """
@@ -2783,6 +2817,16 @@ def _assign_building_shift(
     machine_day_diff_co = machine_day_diff_co if machine_day_diff_co is not None else {}
     machine_day_co = machine_day_co if machine_day_co is not None else {}
     fixed_escape_used = fixed_escape_used if fixed_escape_used is not None else {}
+    machine_step_drift = machine_step_drift if machine_step_drift is not None else {}
+    machine_db_skus    = machine_db_skus    if machine_db_skus    is not None else {}
+    lookahead_draw     = lookahead_draw     if lookahead_draw     is not None else {}
+
+    def _eff_draw(sku: str) -> float:
+        """LOOKAHEAD_BUF: the draw used to SIZE pre-build (_dyn_H + forward-buffer gate) — the
+        ANTICIPATED peak (running + incoming-CO presses today), not just this shift's draw. OFF →
+        the current shift's draw, bit-for-bit."""
+        _b = shift_cure_demand.get(sku, 0.0)
+        return max(_b, lookahead_draw.get(sku, 0.0)) if _LOOKAHEAD_BUF else _b
 
     def _inch_gate(m: str, to_inch: str, cur_inch: str) -> bool:
         """Rule 2 (+/-2 band) for a candidate (machine, to_inch), PLUS the Part-1 locked
@@ -2991,7 +3035,7 @@ def _assign_building_shift(
             floor = (DYN_BUF_FLOOR_VMI
                      if any(_MACHINE_GROUP.get(m, "") == "VMI" for m in _fs)
                      else DYN_BUF_FLOOR_OTHER)
-            draw = shift_cure_demand.get(sku, 0.0)
+            draw = _eff_draw(sku)                       # LOOKAHEAD_BUF: anticipated peak draw
             if draw <= 0:
                 return float(floor)
             risk_short = max(0.0, 1.0 - projected_gt.get(sku, 0.0) / draw)
@@ -3526,6 +3570,74 @@ def _assign_building_shift(
                 s["cur_sku"]   = _best
                 machine_plus3_used.add(m)                  # one escape per machine per month
 
+        # ── Phase B3: stepwise inch-DRIFT for STRANDED idle machines (INCH_STEP_DRIFT) ──
+        # A machine Phase A/B left IDLE this shift whose current eligible set has no deficit may
+        # migrate ONE inch step (±1) via a normal diff-size CO to a DB-CERTIFIED adjacent inch with
+        # real deficit + demand. One-way (once a direction is chosen it never reverses), cumulative
+        # reach capped at _INCH_STEP_MAX from the historical anchor, NEVER a direct ±3 (must step
+        # 14→15→16). Extends the machine's runtime eligibility + locked-inch set so Phase A/B keeps
+        # building the drifted inch next shift. OFF → no-op (bit-for-bit today's plan).
+        if _INCH_STEP_DRIFT and machine_db_skus:
+            _step_dbg = os.environ.get("INCH_STEP_DEBUG") is not None
+            for m in sorted(machines):
+                s = stg[m]; rate = s["rate"]
+                if rate <= 0 or s["campaigns"]:            # only a machine idle THIS shift may drift
+                    continue
+                _base = _inch_num(machine_anchor_inch.get(m, "")
+                                  or _MACHINE_DOMINANT_INCH.get(str(m), ""))
+                if _base is None:
+                    continue
+                _drift = machine_step_drift.get(m, 0)
+                if abs(_drift) >= _INCH_STEP_MAX:          # already at the cumulative cap
+                    continue
+                if _step_dbg: _STEP_DBG[0] += 1
+                _buf = _buf_of(m)
+                # STRANDED: the machine's CURRENT eligible set has no WHOLE-MONTH remaining demand
+                # (demand_remaining − projected_gt), NOT just this-shift buffered deficit. The buffered
+                # version premature-abandons a machine whose inch still has real month demand (CLAUDE.md
+                # Lever-B finding: buffered _defc → −31.7k). Only a genuinely-DONE inch may drift.
+                if any(demand_remaining.get(x, 0.0) - projected_gt.get(x, 0.0) > 0
+                       for x in machine_skus.get(m, set())):
+                    continue
+                if _step_dbg: _STEP_DBG[1] += 1
+                _cur_inch = sku_inch.get(s["cur_sku"], "")
+                _reach = _base + _drift                    # the furthest inch it currently builds
+                _dirs = [1, -1] if _drift == 0 else [1 if _drift > 0 else -1]   # one-way after step 1
+                _best = None; _best_key = None; _best_ni = None; _best_dir = 0
+                for _dir in _dirs:
+                    if abs(_drift + _dir) > _INCH_STEP_MAX:
+                        continue
+                    _nis = str(_reach + _dir)              # the single adjacent inch (±1 step)
+                    for x in machine_db_skus.get(m, set()):
+                        if sku_inch.get(x, "") != _nis or demand_remaining.get(x, 0.0) <= 0:
+                            continue
+                        _d = _defc(x, _buf)
+                        if _d <= 0:
+                            continue
+                        _k = (_d, x)
+                        if _best is None or _k > _best_key:
+                            _best = x; _best_key = _k; _best_ni = _reach + _dir; _best_dir = _dir
+                if _best is None:
+                    continue
+                _co = _co_cost(m, _cur_inch or str(_reach), str(_best_ni))
+                if s["remaining"] < _co:                   # the diff-size CO must fit this shift
+                    continue
+                # take the ±1 step: CO-only this shift (production begins next shift via Phase A)
+                s["campaigns"].append((_best, 0, "diff_size_CO"))
+                s["remaining"] -= _co
+                s["co_count"] += 1
+                s["cur_sku"] = _best
+                machine_last_diff_co_day[m] = day
+                machine_step_drift[m] = _drift + _best_dir
+                # extend runtime eligibility so Phase A/B keeps building the drifted inch
+                for x in machine_db_skus.get(m, set()):
+                    if sku_inch.get(x, "") == str(_best_ni):
+                        machine_skus.setdefault(m, set()).add(x)
+                _ls = machine_locked_inches.get(m)
+                if _ls is not None:
+                    _ls.add(str(_best_ni))
+                if _step_dbg: _STEP_DBG[2] += 1
+
         # ── Phase C: forward-buffer slack-fill (level-loading) ──
         # Use building capacity that Phase A/B left idle to PRE-BUILD a shelf-life-safe
         # forward buffer for SKUs that WILL be cured in the next 3 days. Builds ONLY
@@ -3549,7 +3661,7 @@ def _assign_building_shift(
                     dom = s["dom"]; cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
                     best = None; best_key = None; best_room = 0.0
                     for sku in machine_skus.get(m, set()):
-                        draw = shift_cure_demand.get(sku, 0.0)
+                        draw = _eff_draw(sku)              # LOOKAHEAD_BUF: anticipated peak draw
                         if draw <= 0:                      # not needed soon → not "required"
                             continue
                         dr = demand_remaining.get(sku, 0.0)
@@ -5301,6 +5413,7 @@ def run_rolling_pipeline(
     # buildable_rate, computed BEFORE curing so the Phase-0 scheduler can supply-match its draw.
     _coplan_lock: dict = {}
     _building_inch_capacity: dict | None = None
+    _feed_ctx: dict | None = None                   # PERSKU_FEED: lock-aware SKU->machines + GT/day
     if _GROUP_INCH_POLICY and _early_sku_inch:
         try:
             from cbc_env import make_engine as _mk_cp
@@ -5308,6 +5421,7 @@ def run_rolling_pipeline(
             _coplan_lock = _cp["bjus_lock"]
             _building_inch_capacity = _cp["building_inch_capacity"]
             _buildable_rate = _cp["buildable"]      # override with the LOCK-AWARE rate
+            _feed_ctx = _cp.get("feed_ctx")
             print(f"  [Rolling] CO-PLAN: {len(_coplan_lock)} BJ/US locks; building_inch_capacity "
                   f"{ {k: round(v) for k, v in sorted(_building_inch_capacity.items())} }")
         except Exception as _e:
@@ -5319,6 +5433,7 @@ def run_rolling_pipeline(
         buildable_rate=_buildable_rate,
         sku_inch=_early_sku_inch,
         building_inch_capacity=_building_inch_capacity,
+        feed_ctx=_feed_ctx,
         priority_deadline_map=(priority_deadline_map if _prio_active else None),
     )
     co_events = cc_result["co_events"]
@@ -5363,6 +5478,9 @@ def run_rolling_pipeline(
 
     machine_skus: dict[str, set]  = defaultdict(set)
     sku_machine_map: dict[str, set] = defaultdict(set)
+    # INCH_STEP_DRIFT: the UN-stripped DB-allowable GT eligibility per machine (before the
+    # hist-lock inch strip below) — the source the stepwise drift re-adds from. Empty when OFF.
+    _machine_db_skus: dict[str, set] = defaultdict(set)
     s1_sku_to_machines: dict[str, set] = defaultdict(set)  # Stage-1 carcass eligibility (kept
     # OUT of machine_skus/sku_machine_map so it never feeds the Stage-2 deficit signal — see
     # the STAGE1 skip below. Used only for Step 3b carcass-utilization simulation.
@@ -5420,6 +5538,10 @@ def run_rolling_pipeline(
         for idx, row in df_allow.iterrows():
             sku = str(row["SKUCode"]); si = sku_inch.get(sku, "")
             ml  = list(row.get("Machines", []) or [])
+            if _INCH_STEP_DRIFT:                        # capture DB eligibility BEFORE the hist-lock strip
+                for _m in ml:
+                    if _MACHINE_GROUP.get(str(_m), "") != "STAGE1":
+                        _machine_db_skus[str(_m)].add(sku)
             df_allow.at[idx, "Machines"] = [
                 m for m in ml
                 if (str(m) not in _HARD or si in _HARD[str(m)])
@@ -5489,6 +5611,20 @@ def run_rolling_pipeline(
     press_count: dict[str, int] = defaultdict(int)
     for st in press_state.values():
         press_count[st["sku"]] += 1
+
+    # IDLE_PRESS_ACTIVATE: roster presses (the 170 in the allowable matrix) that are NOT in the
+    # Day-0 running snapshot. Seeded into press_state via a Day-1 cold-start CO in the day loop
+    # (they are NOT added to press_state here — so pre-day-loop state stays identical to OFF).
+    _idle_presses: list = []
+    if _IDLE_PRESS_ACTIVATE:
+        try:
+            _roster_ids = {str(p) for p in cetl.load_allowable_press_ids()}
+            _idle_presses = sorted(p for p in _roster_ids if p not in press_state)
+            print(f"  [Rolling] IDLE_PRESS_ACTIVATE ON — {len(_idle_presses)} roster press(es) "
+                  f"absent from Day-0 snapshot to cold-start Day-1 Shift A: {_idle_presses}")
+        except Exception as _e:
+            _idle_presses = []
+            print(f"  [Rolling] IDLE_PRESS_ACTIVATE: roster load failed ({_e}); none activated")
 
     # ── C2: Mould pool (client mould-availability gate) ───────────────────────
     # sku_moulds[sku] = eligible mould IDs; mould_owner[mould] = press it's mounted
@@ -5895,6 +6031,9 @@ def run_rolling_pipeline(
     machine_day_skus:   dict[str, set] = {}
     # Machines that have spent their one-time +3/-3 inch escape this month (experiment).
     machine_plus3_used: set = set()
+    # INCH_STEP_DRIFT: signed cumulative inch drift per machine (−MAX..+MAX from its historical
+    # anchor). Persists across the horizon; one-way once a direction is chosen. {} when OFF.
+    machine_step_drift: dict[str, int] = {}
     # Stage-1 carcass machines are scheduled in Step 3b, not in
     # _assign_building_shift, so they need their own current-inch tracker.
     s1_current_inch: dict[str, str] = {}
@@ -6782,6 +6921,29 @@ def run_rolling_pipeline(
         # Phase 4 — global mould optimiser: proactively move scarce moulds toward the
         # most-under-served SKUs (adds COs within the daily cap). No-op unless enabled.
         today_cos = _global_mould_boost(day, today_cos)
+
+        # ── IDLE_PRESS_ACTIVATE (Day 1 only) ──────────────────────────────────────
+        # Bring roster presses absent from the Day-0 snapshot online via a cold-start
+        # curing CO (nothing -> SKU). Injected AFTER the normal CO solve + daily_co_count
+        # bump, so these one-time setup COs are EXEMPT from MAX_CHANGEOVERS_PER_DAY and take
+        # whatever moulds remain free after the demand-driven COs (contention-safe). Modeled
+        # as a planned CO with old_sku=None: co_shift_idx resolves to Shift A (no old demand),
+        # so the press is CHANGEOVER in Shift A and RUNNING its target from Shift B.
+        if _IDLE_PRESS_ACTIVATE and day == 1 and _idle_presses:
+            _cold = []
+            for _ip in _idle_presses:
+                _tgt = _pick_retarget(_ip)          # neediest allowable SKU w/ 2 free moulds
+                if _tgt is None:
+                    continue
+                if not _try_mount(_ip, _tgt, defer_free=False):
+                    continue
+                press_state[_ip] = {"sku": _tgt, "status": "RUNNING"}
+                _cold.append((_ip, None, _tgt))
+            if _cold:
+                today_cos = list(today_cos) + _cold
+                print(f"  [Rolling] Day 1: cold-started {len(_cold)} idle press(es) "
+                      f"{[(c[0], c[2]) for c in _cold]}")
+
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
         # SKUs that curing presses are switching TO today — building must pre-build for these
         co_target_skus_today: frozenset = frozenset(co_press_map.values())
@@ -6806,6 +6968,18 @@ def run_rolling_pipeline(
                     _n     = math.ceil(_rem / _odraw) if _odraw > 0 else 99
                     _idx   = _n if _n <= 2 else 0      # >2 shifts ⇒ won't finish ⇒ preempt in A
             co_shift_idx[_p] = _idx
+
+        # LOOKAHEAD_BUF: anticipated PEAK curing draw per SKU today = (presses running it now +
+        # presses scheduled to CO onto it today) × cure-rate. Deterministic from the CO plan; lets
+        # the dynamic + forward buffers pre-build for a KNOWN incoming draw spike. {} when OFF.
+        _lookahead_draw: dict[str, float] = {}
+        if _LOOKAHEAD_BUF:
+            _joining: dict[str, int] = defaultdict(int)
+            for _p, _os, _ns in today_cos:
+                _joining[str(_ns)] += 1
+            for _s in set(press_count) | set(_joining):
+                _rate = _cure_qty_per_shift(cure_ct_map.get(_s, DEFAULT_CURING_CT))
+                _lookahead_draw[_s] = (press_count.get(_s, 0) + _joining.get(_s, 0)) * _rate
 
         # Per-shift simulation: build → cure for each shift independently.
         # Building assignment runs once per shift (not once per day) so each
@@ -6907,6 +7081,9 @@ def run_rolling_pipeline(
                 machine_day_diff_co=machine_day_diff_co,
                 machine_day_co=machine_day_co,
                 fixed_escape_used=fixed_escape_used,
+                machine_step_drift=machine_step_drift,      # INCH_STEP_DRIFT state
+                machine_db_skus=_machine_db_skus,           # INCH_STEP_DRIFT: un-stripped DB eligibility
+                lookahead_draw=_lookahead_draw,             # LOOKAHEAD_BUF: anticipated peak draw
                 priority_deadline_map=(priority_deadline_map if _prio_active else None),
             )
 
@@ -7885,7 +8062,9 @@ def run_rolling_pipeline(
         # today_cos was already mould-gated at day-start (moulds committed there),
         # so every entry here is feasible — just apply the transition.
         for press, old_sku, new_sku in today_cos:
-            press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
+            # old_sku is None for an IDLE_PRESS_ACTIVATE cold-start (no prior SKU to release).
+            if old_sku is not None:
+                press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
             press_count[new_sku] = press_count.get(new_sku, 0) + 1
             press_state[press]   = {"sku": new_sku, "status": "RUNNING"}
             curing_allowable[new_sku].append(press)
@@ -7902,9 +8081,9 @@ def run_rolling_pipeline(
                 "Day":        day,
                 "Shift":      SHIFTS[co_shift_idx.get(press, 0)],
                 "Press":      press,
-                "From_SKU":   old_sku,
+                "From_SKU":   (old_sku if old_sku is not None else "IDLE-START"),
                 "Target_SKU": new_sku,
-                "CO_Type":    "Planned",
+                "CO_Type":    ("Planned" if old_sku is not None else "Cold-Start"),
             })
 
         # The planned COs have now completed for the day — release the old moulds

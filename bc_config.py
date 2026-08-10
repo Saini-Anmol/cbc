@@ -253,6 +253,44 @@ INCH_PLUS3_MIN_DAYS_LEFT = 5
 # Only allow the +3/-3 escape when at least this many plan days remain, so the 8h CO is
 # amortised by enough remaining production. Enforced when _INCH_PLUS3_ENABLED.
 
+# ── Stepwise inch-DRIFT (INCH_STEP_DRIFT) — bounded relaxation of the historical inch-lock ──
+# A STRANDED building machine (its historical inch's servable demand is done and it would
+# otherwise sit IDLE this shift) may migrate its inch by ONE step (±1 adjacent inch) via a
+# normal diff-size CO, one-way (never revert), to a DB-CERTIFIED adjacent inch that has real
+# deficit + demand. Cumulative reach is capped at INCH_STEP_MAX (2) from the machine's
+# historical inch, and a DIRECT ±3 jump is never allowed (must step 14→15→16, not 14→17).
+# This re-enables DB-allowable capability the 4-month hist-lock stripped (invents no pairs),
+# attacking the lock's SHIFT-LEVEL stranding (the temporal gap the monthly upper bound exposed)
+# while KEEPING the lock as the base policy for machines that have their own work.
+# Default OFF (env INCH_STEP_DRIFT=1) → today's plan bit-for-bit. Replaces the +3/-3 escape.
+#
+# MEASURED as a standalone GREEDY lever (July): the safe whole-month gate fires 0x (== OFF,
+# 664,345) — a genuinely-done inch only frees late-month, too late to redirect profitably; the
+# looser this-shift gate fires (6002/7003 15->14, 7106 13->14, 7501 12->13) but regresses -6,049
+# (pulls capacity OFF scarce 15"/13" onto 14", one-way, can't return). Same trap as FIXED_ESCAPE.
+# CONCLUSION: inch relaxation cannot pay off as a greedy per-shift reaction — the drift decision
+# is myopic. The mechanism (DB-certified adjacent-inch, one-way, capped) is RETAINED OFF as the
+# inch-relaxation CONSTRAINT MODEL for the Phase-2 global time-indexed optimizer, which can decide
+# ahead of time to reserve a machine's drift for when the scarce inch actually needs it.
+INCH_STEP_DRIFT_ENABLED = (os.environ.get("INCH_STEP_DRIFT", "0") != "0")
+INCH_STEP_MAX = int(os.environ.get("INCH_STEP_MAX", "2"))   # max cumulative ±inch drift from base
+
+# ── Lookahead buffer (LOOKAHEAD_BUF) — Phase-1a time-indexed pre-build sizing ──
+# The dynamic buffer (_dyn_H) and the forward-buffer starvation-risk gate size a SKU's pre-build
+# to the CURRENT shift's curing draw only — blind to a KNOWN incoming draw SPIKE (N presses
+# scheduled to change over ONTO the SKU today). The spike is fully deterministic from the CO plan
+# (co_press_map). When ON, both size to the ANTICIPATED peak draw = (presses running it + presses
+# CO'ing to it today) × cure-rate, so a SKU about to get more presses is pre-built AHEAD instead of
+# starving on the spike shift. Still bounded by demand cap + 3-day shelf + the 8k EOD GT cap → no
+# waste GT (unlike IDLE_GAP_FILL, which clogged the cap −56k). Default OFF → today bit-for-bit.
+#
+# MEASURED (June/July/Aug, mould-audit PASS, deterministic): REJECTED — June −694 / July −3,552 /
+# Aug −8,001 (= −12,247), and starvation UP on all three. Sizing to the anticipated PEAK over-buffers:
+# it front-loads GT for spike-SKUs and diverts building from SKUs that need it NOW → they starve.
+# Same front-loading failure mode as IDLE_GAP_FILL. Confirms the temporal gap is protected by the
+# 3-day GT shelf (scarce GT can't be pre-built and banked) — a greedy pre-build lever can't beat it.
+LOOKAHEAD_BUF_ENABLED = (os.environ.get("LOOKAHEAD_BUF", "0") != "0")
+
 MAX_BUILDING_SKUS_PER_DAY = 4
 # Plant rule: a single building machine may produce at most this many DISTINCT SKUs in
 # one calendar day — the overnight carryover SKU counts as #1, so ≤3 changeovers after it.
@@ -589,8 +627,19 @@ CURING_PRESS_COUNT = 170
 # (assume no other press exists); their Day-0 moulds return to the free pool.
 # LOCAL-ONLY: local_main.py passes this flag into run_rolling_pipeline; the cloud
 # path (main.py) never passes it, so cloud is unaffected regardless of this value.
-# Default OFF → bit-for-bit prior behaviour. Env PRESS_ALLOWABLE_ONLY=1 enables.
-RESTRICT_PRESSES_TO_ALLOWABLE = (os.environ.get("PRESS_ALLOWABLE_ONLY", "0") == "1")
+# ADOPTED business rule (default ON): only the 170 DB-allowable presses exist.
+# Env PRESS_ALLOWABLE_ONLY=0 reverts to including stray non-roster presses.
+RESTRICT_PRESSES_TO_ALLOWABLE = (os.environ.get("PRESS_ALLOWABLE_ONLY", "1") != "0")
+
+# IDLE_PRESS_ACTIVATE — the other half of the 170-press business rule (default ON):
+# any of the 170 roster presses ABSENT from the Day-0 running-moulds snapshot is
+# brought online via a cold-start curing CO (nothing -> SKU) in Day-1 Shift A, then
+# produces from Day-1 Shift B. Target = neediest allowable SKU with 2 free moulds.
+# Together with RESTRICT_PRESSES_TO_ALLOWABLE this makes every run simulate EXACTLY
+# the 170 certified presses. Env IDLE_PRESS_ACT=0 reverts. Logic in b2c_pipeline.py.
+# KPI vs OFF (measured, mould-audit PASS, deterministic): June +8,118 / July -917 /
+# Aug -3,839 (net +3,362) — adopted as a business/correctness rule, not a KPI lever.
+IDLE_PRESS_ACTIVATE_ENABLED = (os.environ.get("IDLE_PRESS_ACT", "1") != "0")
 
 # ── Curing press changeover times ────────────────────────────────────────────
 # A curing press CO occupies 2 consecutive shifts:
@@ -673,14 +722,3 @@ ROLLING_OUTPUT     = os.path.join(_MAIN_OUT, "bc_rolling_schedule.xlsx")
 # 9 runs executing (~12 min): 3 months × {baseline, rules@cap12, rules@cap14}, all on Daily_Running_Moulds.
 
 # -- 
-#  
-
-# As of now, we were not using the mould to SKU mapping data from the db table we have to use this- SELECT * FROM jkplanningV1.Master_Mapping_Mould_SKU; I have already added the updated data in the above table ,,,; now, we must have to incorporate this mould to SKU mapping in our codebase, now if a press is allowable to a SKU and it's mould is also available then only we can able to cure that, otherwise if press is there and mould is not present then we cannot cure, we must to idle the press until mould is available. And, another imp. point there are some cases in which one mould can serve to multiple sku as well and 2 moulds are needed for one press to run and cure the tyre. Any doubt in the logic then please ask me. Then, designed a complete implementation plan for incorporating this work.
-
-# Now, i have incoprated the mould to sku mapping data. So, first we will get some reduction in our baseline output, but this will be our real and actual output. Now, can we increase this baseline output? because now we have to assign the assign sku to press based on it's allowable press and available moulds. Should be needs to improve our logic on this, if yes, provide me the insights from. this. How we can increase our KPIs here, note- we will consider the deafult mould life to be 3k as per our old logic only, then in the next verison we will incorporate the real mould life and fetch this mould life from this same table only. After this optimization this is new baseline for the KPIs. 
-
-# Initially in the different size CO i told that- if we are going from size 14 to size 15, then we cannot revert back to size 14 again on that particular machine, so we decided we can only go from 14 to 15 inch when demand of 14 is completed on that machine, otherwise it will not revert back to that machine anymore. But, there is one relaxation is this rule- we can revert back from one size to another [diff. size] once in a 5 days. But, this diff size CO is allowed for +2/-2 size only, and we can take as many same size CO on machine respecting our business rule, and this one hard rule will remain the same- more than +2/-2 diff size CO will not be possible on a particular machine based on what we decide on day1 of that machine [means +3/-3 and more than this will not be possible]. => Initially greedy decision will be solved by taking building running machine data [this we will take in the next version of this project]. I hope and everything is clear and better now. Any doubt in the rule and logic now. Please ask all your doubts if any, and then design a perfect implementation plan for executing this logic [by turing on the plan mode]. 
-
-# What we should proceed first, this mould to sku mapping work? or this relaxation of 5 days in the diff size CO? What yours plan? 
-
-# First download the current data present in this table using a python script- SELECT * FROM jkplanningV1.Master_Mapping_Mould_SKU; 

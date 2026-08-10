@@ -1,0 +1,210 @@
+"""Model-input assembly for the CP-SAT optimizer.
+
+Reuses the EXISTING ETLs + engine helpers (no re-derivation) so the optimizer sees
+byte-identical data to the greedy engine — same demand, cycle times, allowable
+matrices, mould bipartite, inch-lock sets, and opening inventories.
+
+Month context (RUNNING_MOULDS_MONTH / PLAN_MONTH) is read from bc_config, which the
+caller configures via env before import (same discipline as scratch_parity_run.py).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import bc_config
+from curing_consumption import ConsumptionETL
+from building_b2c import B2C_ETL
+from cbc_env import make_engine
+
+# Reuse the engine's own rate/inch tables + helpers (source of truth).
+from b2c_pipeline import (
+    _bld_ct_sec,             # (machine, sku) -> building seconds/unit
+    _cure_qty_per_shift,     # (ct_min)      -> cured units/press/shift (x2 cavities)
+    _MACHINE_ALLOWED_INCH_SET,  # machine -> historical allowed-inch set (hist-lock)
+    DEFAULT_CURING_CT,
+    SHIFT_MINS,              # 480
+)
+
+# Building machine groups (authoritative, per CLAUDE.md / bc.md).
+STAGE1 = {"6802", "6803", "6909", "6911", "7601", "7701",
+          "7801", "7802", "7803", "7804", "8001", "8002", "8003", "8101"}
+STAGE2 = {"8201", "8301", "8302", "8501", "8502", "7301"}
+UNISTAGE = {"6001", "6002", "6003", "6004", "7001", "7002", "7003", "7004",
+            "7101", "7102", "7103", "7104", "7105", "7106", "7201",
+            "7501", "7502", "7503"}
+_GT_MACHINES = STAGE2 | UNISTAGE          # machines that produce GT (Stage-1 = carcass only)
+
+
+def _inch_of(sku: str) -> str:
+    """SKU inch class — the engine's documented fallback: chars [8:10] of the code."""
+    return sku[8:10] if len(sku) >= 10 else ""
+
+
+@dataclass
+class ModelInputs:
+    # --- horizon (set by the driver per window) ---
+    plan_start:    object                       # datetime of shift 0
+    planning_days: int
+
+    # --- SKUs ---
+    skus:        list = field(default_factory=list)          # sorted SKU codes, demand>0
+    demand:      dict = field(default_factory=dict)          # sku -> units (int)
+    cure_rate:   dict = field(default_factory=dict)          # sku -> cured units/press/shift
+    sku_inch:    dict = field(default_factory=dict)          # sku -> "14" etc.
+
+    # --- building machines ---
+    machines:            list = field(default_factory=list)  # sorted machine ids
+    machine_group:       dict = field(default_factory=dict)  # machine -> "S1"|"S2"|"UNI"
+    machine_allowed_skus: dict = field(default_factory=dict) # machine -> sorted [sku] (DB, in-demand)
+    build_rate:          dict = field(default_factory=dict)  # (machine,sku) -> built units/shift
+    machine_allowed_inches: dict = field(default_factory=dict) # machine -> set(inch) (hist-lock)
+
+    # --- curing presses ---
+    presses:          list = field(default_factory=list)     # sorted 170 roster
+    press_allowed_skus: dict = field(default_factory=dict)   # press -> sorted [sku] (DB, in-demand)
+    sku_presses:      dict = field(default_factory=dict)     # sku -> sorted [press] eligible
+    press_init_sku:   dict = field(default_factory=dict)     # press -> sku running at t0 (None=idle)
+    mould_life:       dict = field(default_factory=dict)     # press -> remaining cycles at t0
+
+    # --- moulds (bipartite) ---
+    sku_moulds:  dict = field(default_factory=dict)          # sku -> sorted [mould id]
+    mould_pairs: dict = field(default_factory=dict)          # sku -> #mould-pairs (len//2), cap on presses
+    press_init_moulds: dict = field(default_factory=dict)    # press -> [mould ids] mounted at t0
+
+    # --- opening inventory ---
+    opening_gt:      dict = field(default_factory=dict)      # sku -> GT units on hand at t0
+    opening_carcass: dict = field(default_factory=dict)      # sku -> carcass units at t0
+
+    def summary(self) -> str:
+        return (f"SKUs={len(self.skus)} demand={sum(self.demand.values()):,} | "
+                f"machines={len(self.machines)} (S1={sum(1 for m in self.machines if self.machine_group[m]=='S1')},"
+                f"S2={sum(1 for m in self.machines if self.machine_group[m]=='S2')},"
+                f"UNI={sum(1 for m in self.machines if self.machine_group[m]=='UNI')}) | "
+                f"presses={len(self.presses)} idle@t0={sum(1 for p in self.presses if not self.press_init_sku.get(p))} | "
+                f"moulded_skus={sum(1 for s in self.skus if self.mould_pairs.get(s,0)>=1)} | "
+                f"openGT={sum(self.opening_gt.values()):,.0f} openCarcass={sum(self.opening_carcass.values()):,.0f}")
+
+
+def load_model_inputs(demand_path: str | None = None,
+                      plan_start=None, planning_days: int | None = None) -> ModelInputs:
+    """Assemble ModelInputs from the live DB + demand file (reuses the engine ETLs)."""
+    demand_path   = demand_path   or bc_config.DEMAND_FILE
+    plan_start    = plan_start    or bc_config.PLAN_START
+    planning_days = planning_days or bc_config.PLANNING_DAYS
+
+    engine = make_engine()
+    cetl   = ConsumptionETL(engine)
+    betl   = B2C_ETL(engine)
+
+    mi = ModelInputs(plan_start=plan_start, planning_days=planning_days)
+
+    # ---- demand + cure rate + inch ----
+    dem_df = cetl.load_demand(demand_path)
+    mi.demand = {str(r.SKUCode): int(round(r.Quantity)) for r in dem_df.itertuples()}
+    mi.skus   = sorted(mi.demand)
+    ct_df = cetl.load_cycle_times()
+    ct_map = {str(r.SKUCode): float(r.CycleTime_min) for r in ct_df.itertuples()}
+    for s in mi.skus:
+        mi.cure_rate[s] = _cure_qty_per_shift(ct_map.get(s, DEFAULT_CURING_CT))
+        mi.sku_inch[s]  = _inch_of(s)
+    _demand_set = set(mi.skus)
+
+    # ---- building machines (allowable matrix, DB) ----
+    ba_df = betl.load_machine_allowable()          # rows: machine + allowable SKU list
+    # load_machine_allowable returns a df with a 'Machines' comma-list per SKU OR per-machine;
+    # normalise to machine -> set(sku). Detect schema by columns.
+    m_alw: dict = {}
+    cols = [c.lower() for c in ba_df.columns]
+    if "machines" in cols:                          # schema: SKUCode + comma 'Machines'
+        skucol = ba_df.columns[[c.lower().startswith("sku") or c.lower() in ("sapcode",) for c in ba_df.columns].index(True)]
+        for r in ba_df.itertuples(index=False):
+            sku = str(getattr(r, skucol)).strip()
+            if sku not in _demand_set:
+                continue
+            raw = getattr(r, "Machines")
+            ms = raw if isinstance(raw, (list, tuple, set)) else str(raw).split(",")
+            for m in ms:
+                m = str(m).strip()
+                if m:
+                    m_alw.setdefault(m, set()).add(sku)
+    else:                                           # schema: Machine + SKUCode rows
+        mcol, scol = ba_df.columns[0], ba_df.columns[1]
+        for r in ba_df.itertuples(index=False):
+            m, sku = str(getattr(r, mcol)).strip(), str(getattr(r, scol)).strip()
+            if sku in _demand_set:
+                m_alw.setdefault(m, set()).add(sku)
+
+    for m in sorted(m_alw):
+        grp = "S1" if m in STAGE1 else "S2" if m in STAGE2 else "UNI" if m in UNISTAGE else None
+        if grp is None:                              # machine not in a known group -> skip
+            continue
+        mi.machines.append(m)
+        mi.machine_group[m] = grp
+        mi.machine_allowed_skus[m] = sorted(m_alw[m])
+        mi.machine_allowed_inches[m] = set(_MACHINE_ALLOWED_INCH_SET.get(m, set()))
+        for s in m_alw[m]:
+            ct_sec = _bld_ct_sec(m, s)
+            mi.build_rate[(m, s)] = int(SHIFT_MINS * 60 / ct_sec) if ct_sec > 0 else 0
+    mi.machines.sort()
+
+    # ---- curing presses (170 roster) ----
+    roster = {str(p) for p in cetl.load_allowable_press_ids()}
+    mi.presses = sorted(roster)
+    ca_df = cetl.load_curing_allowable()             # SKUCode + Machines(list of presses)
+    for r in ca_df.itertuples(index=False):
+        sku = str(r.SKUCode).strip()
+        if sku not in _demand_set:
+            continue
+        raw = r.Machines
+        ps = raw if isinstance(raw, (list, tuple, set)) else str(raw).split(",")
+        elig = sorted(str(p).strip() for p in ps if str(p).strip() in roster)
+        if elig:
+            mi.sku_presses[sku] = elig
+    for p in mi.presses:
+        mi.press_allowed_skus[p] = sorted(s for s, ps in mi.sku_presses.items() if p in ps)
+
+    # ---- moulds (bipartite) ----
+    elig = cetl.load_mould_eligibility()             # {"sku_moulds": {sku:set}, ...}
+    sku_moulds = elig.get("sku_moulds", {})
+    for s in mi.skus:
+        ms = sorted(str(m) for m in sku_moulds.get(s, ()))
+        mi.sku_moulds[s]  = ms
+        mi.mould_pairs[s] = len(ms) // 2
+
+    # ---- initial press state (running moulds snapshot) ----
+    rm_df = cetl.load_running_moulds()               # [Machine, SKUCode, MouldNos, MouldLife_remaining, Num_Moulds]
+    running = {}
+    for r in rm_df.itertuples(index=False):
+        pid = str(r.Machine).strip()
+        running[pid] = (str(r.SKUCode).strip(),
+                        [str(x) for x in (r.MouldNos or [])],
+                        int(r.MouldLife_remaining) if r.MouldLife_remaining is not None else bc_config.MOULD_CLEAN_CYCLES)
+    for p in mi.presses:
+        sku, moulds, life = running.get(p, (None, [], bc_config.MOULD_CLEAN_CYCLES))
+        mi.press_init_sku[p]    = sku if sku in _demand_set else None   # idle if its SKU has no demand
+        mi.press_init_moulds[p] = moulds
+        mi.mould_life[p]        = life
+
+    # ---- opening inventories ----
+    try:
+        from curing_b2c import _load_opening_gt, _load_opening_carcass
+        mi.opening_gt      = {str(k): float(v) for k, v in (_load_opening_gt(engine) or {}).items() if v}
+        mi.opening_carcass = {str(k): float(v) for k, v in (_load_opening_carcass(engine) or {}).items() if v}
+    except Exception as e:                            # opening inv is optional
+        print(f"  [opt.data] opening inventory load failed ({e}); assuming 0")
+
+    return mi
+
+
+if __name__ == "__main__":
+    # Smoke test: python -m optimizer.data  (month comes from bc_config / env)
+    mi = load_model_inputs()
+    print("ModelInputs:", mi.summary())
+    # spot-checks
+    _s = mi.skus[0]
+    print(f"  sample SKU {_s}: demand={mi.demand[_s]} cure_rate={mi.cure_rate[_s]}/press/shift "
+          f"inch={mi.sku_inch[_s]} pairs={mi.mould_pairs[_s]} presses={len(mi.sku_presses.get(_s,[]))}")
+    _m = mi.machines[0]
+    print(f"  sample machine {_m}: group={mi.machine_group[_m]} allowed_skus={len(mi.machine_allowed_skus[_m])} "
+          f"inches={sorted(mi.machine_allowed_inches[_m])}")
+    print(f"  build_rate entries={len(mi.build_rate)}  sku_presses={len(mi.sku_presses)}")

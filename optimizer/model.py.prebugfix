@@ -1,0 +1,439 @@
+"""Single-window joint building+curing CP-SAT model (v1 core).
+
+Key formulation choice: for a MAX-CURED objective the curing side is modeled by
+per-SKU **press COUNTS** n[s,t] (not per-press booleans) — this collapses the model
+from ~490k booleans to ~30k vars and is what makes it solvable. Which physical press
+cures which SKU is a bipartite matching recovered/audited post-hoc (count relaxation).
+
+v1 scope: building GT (Stage-2 + Unistage) + curing counts + GT reservoir + mould
+count-cap + curing-CO cost + demand cap + historical inch-lock, objective = max cured.
+Deferred to v2 (TODO): Stage-1 carcass gating, campaigns/min-dwell, inch-lock
+RELAXATION budgets, shared-mould contention + lazy exact-bipartite cuts.
+
+Determinism: single worker, fixed seed, stop on max_deterministic_time (NOT wall).
+"""
+from __future__ import annotations
+
+import os
+
+from ortools.sat.python import cp_model
+
+import bc_config
+from optimizer.data import ModelInputs
+
+MAX_CO_PER_DAY = int(getattr(bc_config, "MAX_CHANGEOVERS_PER_DAY", 12))
+GT_CAP         = int(getattr(bc_config, "MAX_ENDOFDAY_GT_INVENTORY", 8000))
+GT_GROUPS      = ("S2", "UNI")
+
+# Objective shaping (env-tunable). CO_PENALTY = cured-units charged per curing CO
+# (keeps productive COs, cuts gratuitous churn; must be small — NOT a x1000-scale
+# coeff that would re-break CP-SAT search). TERM_GT_W = weight on end-of-window GT
+# inventory (value-to-go) to stop the rolling windows front-loading — 0 = off.
+CO_PENALTY = int(os.environ.get("OPT_CO_PEN", "40"))     # cured-units/CO: higher -> COs only "when needed"
+TERM_GT_W  = int(os.environ.get("OPT_TERM_GT", "0"))     # front-loading fix; enabled in step 2
+
+# ------------------------------------------------------------------------------
+# INCH-LOCK RELAXATION (v2, toggle-gated). Default OFF = v1 hard-lock bit-for-bit.
+# When ON, a building machine keeps its HISTORICAL inches (free/preferred) AND may
+# ADDITIONALLY reach the SCARCE high-demand inches (_RELAX_INCHES = 13"/15", where the
+# ceiling headroom lives) among its DB-allowable SKUs — NOT every inch (blanket relax
+# was intractable, -11%). A diff-INCH changeover is (a) COUNTED per machine, (b) CAPPED
+# by a per-window budget from a per-MONTH group budget, (c) charged a small penalty, so
+# the optimizer only spends spare/freed capacity on 13"/15" when it beats staying put.
+INCH_RELAX  = os.environ.get("INCH_RELAX", "0") == "1"
+_RELAX_INCHES = set(os.environ.get("RELAX_INCHES", "13,15").split(","))   # scarce targets
+INCH_PEN   = int(os.environ.get("OPT_INCH_PEN", "8"))    # cured-units charged per diff-inch CO
+# Per-MONTH diff-inch-CO budget per machine group (owner's rule):
+#   S1  = 2  (up to 2 diff-inch COs/machine/month, reverts allowed) ;
+#   UNI = 2  (VMI 6001-04/7001-04 + BJ 7101-06/7201 + UNI-narrow 7501-03 -> "very few") ;
+#   S2  = 12 ("no practical limit on diff-inch COs").
+_INCH_MONTHLY_BUDGET = {"S1": 2, "UNI": 2, "S2": 12}
+
+# ------------------------------------------------------------------------------
+# DEMAND-PRIORITY (FIX 3, toggle-gated). Default OFF = flat max-cured bit-for-bit.
+# The flat objective weights every cured unit equally, so it fills easy small SKUs
+# and leaves big CAPACITY-FEASIBLE SKUs (e.g. 1225170015012LSTL0) half-served even
+# with idle presses/machines. When ON we add a MILD completion gradient PLUS SOFT
+# pro-rata floors on the top-N big capacity-feasible SKUs:
+#   (a) WEIGHT cured[s,t] by w[s] = SCALE*(1 + alpha*demand[s]/max_demand), a gentle
+#       1.0..~1.2 gradient (SCALE keeps it integer). Small SKUs still get served by
+#       spare capacity — the gradient only breaks ties toward finishing big SKUs.
+#   (b) SOFT FLOOR: for the top-N highest-demand CAPACITY-FEASIBLE SKUs,
+#       sum_committed cured[s] + slack[s] >= floor_target[s], slack>=0 penalized
+#       (NEVER hard -> never infeasible). floor_target is a PRO-RATA per-window share
+#       (remaining_demand * commit_days / days_left) so big SKUs are PACED across
+#       windows, not all deferred. CAPACITY-FEASIBLE is checked per SKU (cure ceiling
+#       AND build ceiling over the committed horizon both >= floor); genuinely scarce
+#       SKUs are skipped (flooring them only displaces others).
+PRIORITY        = os.environ.get("PRIORITY", "0") == "1"
+PRIO_SCALE      = int(os.environ.get("PRIO_SCALE", "10"))     # integer base weight on cured
+PRIO_ALPHA      = float(os.environ.get("PRIO_ALPHA", "0.2"))  # gradient span: w in [1, 1+alpha]
+PRIO_TOPN       = int(os.environ.get("PRIO_TOPN", "15"))      # #big capacity-feasible SKUs floored
+PRIO_FLOOR_FRAC = float(os.environ.get("PRIO_FLOOR_FRAC", "1.0"))  # fraction of pro-rata share
+PRIO_SLACK_PEN  = int(os.environ.get("PRIO_SLACK_PEN", "2"))  # cured-units charged per unmet floor unit
+
+
+def build_and_solve(mi: ModelInputs, day_start: int, n_days: int,
+                    init_gt: dict | None = None,
+                    init_press_sku: dict | None = None,
+                    init_n: dict | None = None,
+                    init_carc: dict | None = None,
+                    det_time_s: float = 60.0, seed: int = 1, log: bool = False,
+                    probe_feasible: bool = False, workers: int = 1,
+                    hint: dict | None = None, commit_days: int | None = None,
+                    days_left: int | None = None) -> dict:
+    """Solve one window [day_start, day_start+n_days). Returns a solution dict."""
+    W = n_days * 3
+    T = range(W)
+    init_gt        = dict(init_gt if init_gt is not None else mi.opening_gt)
+    init_press_sku = dict(init_press_sku if init_press_sku is not None else mi.press_init_sku)
+    _init_carc     = dict(init_carc if init_carc is not None else mi.opening_carcass)
+    m = cp_model.CpModel()
+
+    # ================= BUILDING (per-machine, inch-locked) =================
+    bld_pairs = []
+    for mac in mi.machines:
+        if mi.machine_group[mac] not in GT_GROUPS:      # Stage-1 = carcass only (v2)
+            continue
+        inns = mi.machine_allowed_inches.get(mac, set())
+        for s in mi.machine_allowed_skus.get(mac, ()):
+            if mi.build_rate.get((mac, s), 0) <= 0:
+                continue
+            _inch = mi.sku_inch.get(s, "")
+            if inns and _inch not in inns and not (INCH_RELAX and _inch in _RELAX_INCHES):
+                continue     # keep historical inches always; +13"/15" only when INCH_RELAX
+            bld_pairs.append((mac, s))
+    bld_pairs.sort()
+    gt_machines = sorted({mac for mac, _ in bld_pairs})
+    skus_built  = {s for _, s in bld_pairs}
+
+    x, g = {}, {}
+    for (mac, s) in bld_pairs:
+        for t in T:
+            x[mac, s, t] = m.NewBoolVar(f"x_{mac}_{s}_{t}")
+            g[mac, s, t] = m.NewIntVar(0, mi.build_rate[(mac, s)], f"g_{mac}_{s}_{t}")
+            m.Add(g[mac, s, t] <= mi.build_rate[(mac, s)] * x[mac, s, t])
+    for mac in gt_machines:
+        macs_skus = [s for (mm, s) in bld_pairs if mm == mac]
+        for t in T:
+            m.Add(sum(x[mac, s, t] for s in macs_skus) <= 1)
+
+    # ---- Stage-1 CARCASS gating: Stage-2 GT needs Stage-1 carcass ----
+    s1_pairs = []
+    for mac in mi.machines:
+        if mi.machine_group[mac] != "S1":
+            continue
+        inns = mi.machine_allowed_inches.get(mac, set())
+        for s in mi.machine_allowed_skus.get(mac, ()):
+            if mi.build_rate.get((mac, s), 0) <= 0:
+                continue
+            _inch = mi.sku_inch.get(s, "")
+            if inns and _inch not in inns and not (INCH_RELAX and _inch in _RELAX_INCHES):
+                continue     # keep historical inches always; +13"/15" only when INCH_RELAX
+            s1_pairs.append((mac, s))
+    s1_pairs.sort()
+    s1_machines = sorted({mac for mac, _ in s1_pairs})
+    s2_skus = sorted({s for (mac, s) in bld_pairs if mi.machine_group[mac] == "S2"})
+
+    xc, gc = {}, {}
+    for (mac, s) in s1_pairs:
+        for t in T:
+            xc[mac, s, t] = m.NewBoolVar(f"xc_{mac}_{s}_{t}")
+            gc[mac, s, t] = m.NewIntVar(0, mi.build_rate[(mac, s)], f"gc_{mac}_{s}_{t}")
+            m.Add(gc[mac, s, t] <= mi.build_rate[(mac, s)] * xc[mac, s, t])
+    for mac in s1_machines:
+        macs = [s for (mm, s) in s1_pairs if mm == mac]
+        for t in T:
+            m.Add(sum(xc[mac, s, t] for s in macs) <= 1)
+
+    # ---- INCH-LOCK RELAXATION: diff-inch-CO tracking + per-window budget (v2) ----
+    # A machine builds one SKU/shift; its inch = that SKU's inch. Track a committed-inch
+    # STATE a[mac,i,t] (one-hot, persists through idle shifts, tied to production) and
+    # charge dci[mac,t]=1 whenever that committed inch CHANGES across shifts (a diff-size
+    # building CO; reverts count: 14->13->14 = 2 COs). Per-machine sum(dci) <= a per-window
+    # budget = ceil(monthly_budget[group] * commit_days / planning_days). Historical inch =
+    # free default: starting the window on a non-historical inch also costs one dci.
+    diff_co_vars = []
+    dci_by_mt = {}      # (machine, shift) -> dci var, for committed-day diff-CO accounting
+    if INCH_RELAX:
+        import math
+        _planning_days = int(getattr(mi, "planning_days", n_days)) or n_days
+        _cd = commit_days if commit_days is not None else n_days
+
+        def _track_inch(mac, pairs, xvars):
+            skus_m = sorted({s for (mm, s) in pairs if mm == mac})
+            inch_skus: dict = {}
+            for s in skus_m:
+                inch_skus.setdefault(mi.sku_inch.get(s, ""), []).append(s)
+            inches = sorted(inch_skus)
+            if len(inches) <= 1:                # only one inch reachable -> no diff-inch CO possible
+                return
+            hist = mi.machine_allowed_inches.get(mac, set())
+            grp  = mi.machine_group[mac]
+            cap  = math.ceil(_INCH_MONTHLY_BUDGET.get(grp, 2) * _cd / _planning_days)
+            a = {}
+            for i in inches:
+                for t in T:
+                    a[i, t] = m.NewBoolVar(f"ainch_{mac}_{i}_{t}")
+            for t in T:
+                m.Add(sum(a[i, t] for i in inches) == 1)           # exactly one committed inch/shift
+                for i in inches:                                   # producing inch i => committed to i
+                    m.Add(sum(xvars[mac, s, t] for s in inch_skus[i]) <= a[i, t])
+            mac_dci = []
+            for t in T:
+                dci = m.NewBoolVar(f"dci_{mac}_{t}")
+                if t == 0:
+                    for i in inches:
+                        if i not in hist:                          # start off the historical default = 1 CO
+                            m.Add(dci >= a[i, 0])
+                else:
+                    for i in inches:
+                        m.Add(dci >= a[i, t] - a[i, t - 1])        # committed inch changed = 1 CO
+                mac_dci.append(dci)
+                diff_co_vars.append(dci)
+                dci_by_mt[(mac, t)] = dci
+            m.Add(sum(mac_dci) <= cap)                             # per-window diff-inch-CO budget
+
+        for mac in gt_machines:
+            _track_inch(mac, bld_pairs, x)
+        for mac in s1_machines:
+            _track_inch(mac, s1_pairs, xc)
+
+    # carcass reservoir per S2 SKU: carc_inv >= 0 enforces "S2 GT <= carcass available".
+    carc_inv = {}
+    for s in s2_skus:
+        _rate = sum(mi.build_rate[(m1, ss)] for (m1, ss) in s1_pairs if ss == s)
+        c_ub = max(int(_init_carc.get(s, 0)), _rate * 4) + 1
+        for t in T:
+            carc_inv[s, t] = m.NewIntVar(0, c_ub, f"carc_{s}_{t}")
+            c_built = sum(gc[m1, s, t] for (m1, ss) in s1_pairs if ss == s)   # 0 if no S1 supply
+            c_used  = sum(g[m2, s, t] for (m2, ss) in bld_pairs
+                          if ss == s and mi.machine_group[m2] == "S2")
+            prev = carc_inv[s, t - 1] if t > 0 else int(_init_carc.get(s, 0))
+            m.Add(carc_inv[s, t] == prev + c_built - c_used)                  # carc_inv>=0 gates S2 GT
+
+    # ================= CURING (per-SKU press counts) =======================
+    n_press = len(mi.presses)
+    elig_cnt = {s: sum(1 for p in mi.presses if s in mi.press_allowed_skus.get(p, ()))
+                for s in mi.skus}
+    if init_n is None:                                     # driver may pass carry-over counts directly
+        init_n = {s: sum(1 for p in mi.presses if init_press_sku.get(p) == s) for s in mi.skus}
+    cure_skus = [s for s in mi.skus
+                 if mi.mould_pairs.get(s, 0) >= 1 and mi.cure_rate.get(s, 0) > 0 and elig_cnt[s] > 0]
+
+    n, co, prod = {}, {}, {}
+    for s in cure_skus:
+        cap_s = min(mi.mould_pairs[s], elig_cnt[s])
+        for t in T:
+            n[s, t]  = m.NewIntVar(0, cap_s, f"n_{s}_{t}")          # presses on s
+            co[s, t] = m.NewIntVar(0, cap_s, f"co_{s}_{t}")         # presses newly CO'd onto s (in CO this shift)
+            prod[s, t] = m.NewIntVar(0, cap_s, f"prod_{s}_{t}")     # presses actually producing
+            prev = n[s, t - 1] if t > 0 else min(init_n[s], cap_s)
+            m.Add(co[s, t] >= n[s, t] - prev)
+            m.Add(co[s, t] <= n[s, t])
+            m.Add(prod[s, t] == n[s, t] - co[s, t])                 # CO'd presses don't produce their CO shift
+    for t in T:                                                     # press-count cap
+        m.Add(sum(n[s, t] for s in cure_skus) <= n_press)
+    for d in range(n_days):                                         # daily curing-CO cap
+        day_ts = [d * 3 + k for k in range(3)]
+        m.Add(sum(co[s, t] for s in cure_skus for t in day_ts) <= MAX_CO_PER_DAY)
+
+    # shared-mould contention: SKUs sharing a mould pool compete for it. Union-find
+    # over sku_moulds -> components; per component per shift: sum n[s,t] <= |union moulds|//2.
+    # Tighter than the per-SKU pair cap when SKUs share moulds (the 15"/13" pattern).
+    _parent = {s: s for s in cure_skus}
+    def _find(a):
+        while _parent[a] != a:
+            _parent[a] = _parent[_parent[a]]; a = _parent[a]
+        return a
+    _owner = {}
+    for s in cure_skus:
+        for md in mi.sku_moulds.get(s, ()):
+            if md in _owner:
+                ra, rb = _find(s), _find(_owner[md])
+                if ra != rb:
+                    _parent[ra] = rb
+            else:
+                _owner[md] = s
+    _comps: dict = {}
+    for s in cure_skus:
+        _comps.setdefault(_find(s), []).append(s)
+    n_shared = 0
+    for comp_skus in _comps.values():
+        if len(comp_skus) <= 1:
+            continue                                                # disjoint -> per-SKU domain cap suffices
+        union_moulds = set()
+        for s in comp_skus:
+            union_moulds.update(mi.sku_moulds.get(s, ()))
+        cap = len(union_moulds) // 2
+        n_shared += 1
+        for t in T:
+            m.Add(sum(n[s, t] for s in comp_skus) <= cap)
+
+    # ================= GT RESERVOIR (building <-> curing) ==================
+    # Tight per-SKU per-shift upper bounds (huge domains cripple CP-SAT presolve).
+    built_ub = {s: sum(mi.build_rate[(mac, ss)] for (mac, ss) in bld_pairs if ss == s) for s in mi.skus}
+    cured_ub = {s: (mi.cure_rate.get(s, 0) * min(mi.mould_pairs.get(s, 0), elig_cnt.get(s, 0))
+                    if s in cure_skus else 0) for s in mi.skus}
+    cured, built, inv = {}, {}, {}
+    for s in mi.skus:
+        for t in T:
+            cured[s, t] = m.NewIntVar(0, max(0, cured_ub[s]), f"cured_{s}_{t}")
+            built[s, t] = m.NewIntVar(0, max(0, built_ub[s]), f"built_{s}_{t}")
+            inv[s, t]   = m.NewIntVar(0, GT_CAP, f"inv_{s}_{t}")
+            m.Add(cured[s, t] == mi.cure_rate.get(s, 0) * prod[s, t]) if (s in cure_skus) else m.Add(cured[s, t] == 0)
+            gp = [g[mac, s, t] for (mac, ss) in bld_pairs if ss == s]
+            m.Add(built[s, t] == sum(gp)) if gp else m.Add(built[s, t] == 0)
+            prev_inv = inv[s, t - 1] if t > 0 else int(init_gt.get(s, 0))
+            m.Add(inv[s, t] == prev_inv + built[s, t] - cured[s, t])
+        m.Add(sum(cured[s, t] for t in T) <= mi.demand[s])          # sacred demand cap
+    for d in range(n_days):                                         # end-of-day total GT cap
+        tc = d * 3 + 2
+        m.Add(sum(inv[s, tc] for s in mi.skus) <= GT_CAP)
+
+    # ================= OBJECTIVE: max cured =====
+    # Maximizing cured already discourages COs (a CO'd press produces nothing that
+    # shift), so no explicit CO penalty / large scaling is needed. probe_feasible
+    # drops the objective to test that a feasible solution exists at all.
+    total_cured = sum(cured[s, t] for s in mi.skus for t in T)
+    total_co    = sum(co[s, t] for s in cure_skus for t in T)
+    # Terminal value at the COMMIT boundary (the GT actually handed to the next window),
+    # not the discarded window tail: reward end-of-commit GT so windows stop front-loading.
+    _cd = commit_days if commit_days is not None else n_days
+    term_shift = min(W - 1, _cd * 3 - 1)
+    term_gt = sum(inv[s, term_shift] for s in mi.skus)
+    inch_pen = INCH_PEN * sum(diff_co_vars) if diff_co_vars else 0
+
+    # ---- DEMAND-PRIORITY (FIX 3): mild demand-weighted cured + soft pro-rata floors ----
+    # OFF (default): SCALE=1, w[s]=1, no slack -> objective is IDENTICAL to the flat path.
+    slack_vars = []
+    prio_floors = []                 # (sku, floor_target) for the report
+    if PRIORITY:
+        SCALE = PRIO_SCALE
+        _dvals = [mi.demand.get(s, 0) for s in mi.skus if mi.demand.get(s, 0) > 0]
+        _max_dem = max(_dvals) if _dvals else 1
+        # gentle completion gradient: w in [SCALE, SCALE*(1+alpha)]
+        w_int = {s: SCALE + int(round(PRIO_ALPHA * SCALE * mi.demand.get(s, 0) / _max_dem))
+                 for s in mi.skus}
+        # pro-rata soft floors on the top-N big CAPACITY-FEASIBLE SKUs
+        _days_left  = int(days_left) if days_left else n_days
+        _cshifts    = _cd * 3                          # committed shifts this window
+        _committed  = range(_cshifts)
+        feas = []
+        for s in cure_skus:
+            rem = mi.demand.get(s, 0)
+            if rem <= 0 or built_ub.get(s, 0) <= 0:    # in demand AND buildable
+                continue
+            floor_t = int(PRIO_FLOOR_FRAC * rem * _cd / max(1, _days_left))
+            floor_t = min(floor_t, rem)                # sits BELOW the sacred demand cap
+            if floor_t <= 0:
+                continue
+            cap_presses      = min(mi.mould_pairs.get(s, 0), elig_cnt.get(s, 0))
+            cure_cap_commit  = cap_presses * mi.cure_rate.get(s, 0) * _cshifts
+            build_cap_commit = built_ub.get(s, 0) * _cshifts
+            # CAPACITY-FEASIBLE: reachable within the committed horizon on BOTH sides
+            if cure_cap_commit >= floor_t and build_cap_commit >= floor_t:
+                feas.append((rem, s, floor_t))
+        feas.sort(key=lambda r: (-r[0], r[1]))         # biggest remaining demand first, deterministic
+        for rem, s, floor_t in feas[:PRIO_TOPN]:
+            sl = m.NewIntVar(0, floor_t, f"prioslack_{s}")
+            m.Add(sum(cured[s, t] for t in _committed) + sl >= floor_t)
+            slack_vars.append(sl)
+            prio_floors.append((s, floor_t))
+        weighted_cured = sum(w_int[s] * cured[s, t] for s in mi.skus for t in T)
+        slack_pen = PRIO_SLACK_PEN * SCALE * sum(slack_vars) if slack_vars else 0
+        priority_obj = (weighted_cured
+                        - CO_PENALTY * SCALE * total_co
+                        + TERM_GT_W * SCALE * term_gt
+                        - (INCH_PEN * SCALE * sum(diff_co_vars) if diff_co_vars else 0)
+                        - slack_pen)
+
+    if not probe_feasible:
+        if PRIORITY:
+            m.Maximize(priority_obj)
+        else:
+            m.Maximize(total_cured - CO_PENALTY * total_co + TERM_GT_W * term_gt - inch_pen)
+
+    # Warm-start HINT so CP-SAT starts from an incumbent (best != -inf) and spends its
+    # budget IMPROVING, not hunting for a first solution. hint=None -> guaranteed-feasible
+    # all-zero (bit-for-bit prior behaviour); hint={'n','g'} from optimizer.warmstart.greedy_hint
+    # -> a strong ~greedy incumbent (pins the objective-driving n/g + derived x; CP-SAT
+    # completes co/prod/cured/built/inv + Stage-1 gc/xc/carc).
+    if hint is None:
+        for (mac, s) in bld_pairs:
+            for t in T:
+                m.AddHint(x[mac, s, t], 0)
+        for s in cure_skus:
+            for t in T:
+                m.AddHint(n[s, t], 0)
+    else:
+        hn, hg = hint.get("n", {}), hint.get("g", {})
+        for (mac, s) in bld_pairs:
+            for t in T:
+                gv = int(hg.get((mac, s, t), 0))
+                m.AddHint(g[mac, s, t], gv)
+                m.AddHint(x[mac, s, t], 1 if gv > 0 else 0)
+        for s in cure_skus:
+            for t in T:
+                m.AddHint(n[s, t], int(hn.get((s, t), 0)))
+
+    # ================= SOLVE (deterministic) ==============================
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = workers
+    solver.parameters.random_seed = seed
+    if workers <= 1:
+        solver.parameters.max_deterministic_time = det_time_s     # deterministic (cloud)
+    else:
+        solver.parameters.max_time_in_seconds = det_time_s        # wall-clock (local multi-worker)
+    solver.parameters.log_search_progress = log
+    if probe_feasible:
+        solver.parameters.stop_after_first_solution = True
+    status = solver.Solve(m)
+    ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    sol = {
+        "status": solver.StatusName(status),
+        "cured": int(solver.Value(total_cured)) if ok else 0,
+        "n_co":  int(solver.Value(total_co)) if ok else None,
+        "objective": solver.ObjectiveValue() if ok else None,
+        "best_bound": solver.BestObjectiveBound() if ok else None,
+        "wall_s": round(solver.WallTime(), 1),
+        "det_time": round(solver.deterministic_time() if callable(getattr(solver, "deterministic_time", None))
+                          else getattr(solver, "deterministic_time", 0.0), 1),
+        "n_bld_pairs": len(bld_pairs), "n_cure_skus": len(cure_skus), "n_skus_built": len(skus_built),
+    }
+    if ok and diff_co_vars:
+        sol["n_diff_co"] = int(sum(solver.Value(v) for v in diff_co_vars))
+    if ok and PRIORITY:
+        sol["n_prio_floors"] = len(prio_floors)
+        sol["prio_slack"] = int(sum(solver.Value(v) for v in slack_vars)) if slack_vars else 0
+    if ok and sol["best_bound"] and sol["best_bound"] > 0:
+        sol["gap"] = round(max(0.0, (sol["best_bound"] - sol["cured"]) / sol["best_bound"]), 4)
+    if ok:
+        V = solver.Value
+        # Full solution values (consumed by driver = carry-over state, writer = output schedule).
+        sol["plan"] = {
+            "n":     {k: V(v) for k, v in n.items()},        # (sku,t) -> #presses on sku
+            "prod":  {k: V(v) for k, v in prod.items()},     # (sku,t) -> #presses producing
+            "co":    {k: V(v) for k, v in co.items()},       # (sku,t) -> #presses newly CO'd on
+            "cured": {k: V(v) for k, v in cured.items()},    # (sku,t) -> units cured
+            "built": {k: V(v) for k, v in built.items()},    # (sku,t) -> GT units built
+            "inv":   {k: V(v) for k, v in inv.items()},      # (sku,t) -> GT inventory EOS
+            "g":     {k: V(v) for k, v in g.items()},        # (machine,sku,t) -> GT built (S2+UNI)
+            "gc":    {k: V(v) for k, v in gc.items()},       # (machine,sku,t) -> carcass built (S1)
+            "carc":  {k: V(v) for k, v in carc_inv.items()}, # (sku,t) -> carcass inventory EOS
+        }
+        if dci_by_mt:
+            sol["plan"]["dci"] = {k: V(v) for k, v in dci_by_mt.items()}  # (machine,t) -> 1 if diff-inch CO
+        sol["meta"] = {"n_days": n_days, "W": W, "day_start": day_start,
+                       "cure_rate": {s: mi.cure_rate.get(s, 0) for s in mi.skus}}
+    return sol
+
+
+if __name__ == "__main__":
+    from optimizer.data import load_model_inputs
+    mi = load_model_inputs()
+    print("Inputs:", mi.summary())
+    print("Solving a 10-day window (det_time=60s)...")
+    sol = build_and_solve(mi, day_start=1, n_days=10, det_time_s=60.0, seed=1)
+    for k, v in sol.items():
+        print(f"  {k}: {v}")

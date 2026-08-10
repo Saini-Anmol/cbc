@@ -239,14 +239,16 @@ class ConsumptionETL:
         Returns {"sku_moulds": {SKUCode: set(mould_id)},
                  "mould_skus": {mould_id: set(SKUCode)}}.
         A press needs 2 eligible moulds to run an SKU; a mould can serve several
-        SKUs (sharing). NOTE the real column is `Mould` (not `MouldNo`) and the
-        active flag is 1 (not "X") — the old curing_b2c._load_mould_tracker used
-        both wrong names and silently returned nothing.
+        SKUs (sharing).
+
+        Table schema (2026-08 replacement): columns are `Mold_Name` (mould id),
+        `Item_Code` (SKU), `Plant_Code`, `Full_Load`. There is NO active flag —
+        ALL rows count (user-confirmed). Duplicate (mould,sku) rows are deduped by
+        the sets below. Old schema was `Mould`/`Matl.Code`/`Active Flag`=1.
         """
         df = self._sql(
-            f"SELECT `Mould` AS mould, `Matl.Code` AS sku "
-            f"FROM {self.db}.Master_Mapping_Mould_SKU "
-            f"WHERE `Active Flag` = 1"
+            f"SELECT `Mold_Name` AS mould, `Item_Code` AS sku "
+            f"FROM {self.db}.Master_Mapping_Mould_SKU"
         )
         df["mould"] = df["mould"].astype(str).str.strip()
         df["sku"]   = df["sku"].astype(str).str.strip()

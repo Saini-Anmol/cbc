@@ -179,6 +179,27 @@ _SIZE_BAL_MIGRATE = os.environ.get("SIZE_BAL_MIGRATE", "0") != "0"
 _SAME_INCH_FIRST = os.environ.get("SAME_INCH_FIRST", "0") != "0"
 _SAME_INCH_RANK  = os.environ.get("SAME_INCH_RANK", "safe")   # "safe" | "top"
 
+# Per-SKU shared-capacity feed filter (env PERSKU_FEED, default OFF). The 5b guard blocks
+# CO'ing another press onto a target only when (n+1)·draw > buildable_rate[target]. Today
+# buildable_rate is the FULL un-apportioned sum of the target's eligible in-inch machines'
+# GT/day — but those machines are SHARED and build one SKU at a time, so within an
+# oversubscribed inch a press can still be parked on a specific SKU whose machines are busy
+# building OTHER same-inch SKUs. When ON, the guard replaces the static sum with a DRAW-WEIGHTED
+# per-machine share: each of target's machines is split across the same-inch SKUs currently
+# drawing it, weighted by draw, so target's feed = its realistic slice. FLOORED at one full
+# machine's GT/day (building can always dedicate a machine to a target). Needs the co-plan
+# feed_ctx (sku_machines + machine_gtday, lock-aware); inert without it. OFF → the static
+# buildable_rate, bit-for-bit.
+# REJECTED (measured, default OFF, code retained for the record). Draw-weighted sharing assumes
+# building splits a machine PROPORTIONALLY to current draw among same-inch SKUs — but building
+# serves DEFICIT-FIRST and can dedicate a machine to a starving SKU (giving it MORE than its draw
+# share), so the estimate is too pessimistic and OVER-BLOCKS valid COs. The one-machine floor kept
+# it from the 44x catastrophe but not from a net loss: June -9,992 / July -9,433 / Aug -1,680
+# (= -21,105) with starvation UP all 3 months (2-seed deterministic, OFF-parity 664,345 bit-for-bit).
+# Confirms the July gap is building/mould CAPACITY, not CO mis-prioritization (only ~4.5k July was
+# ever curing-side recoverable). Env PERSKU_FEED=1 to re-enable for experiments.
+_PERSKU_FEED = os.environ.get("PERSKU_FEED", "0") != "0"
+
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
 _BLUE  = "D6E4F0"
@@ -280,6 +301,7 @@ class COScheduler:
         buildable_rate: dict | None = None,
         sku_inch: dict | None = None,
         building_inch_capacity: dict | None = None,
+        feed_ctx: dict | None = None,            # PERSKU_FEED: {sku_machines, machine_skus, machine_gtday}
         sku_moulds: dict | None = None,          # #4: {sku: set(eligible mould IDs)} or None
         priority_deadline_map: dict | None = None,  # DELIVERY_PRIORITY: {sku: deadline_day} or None
     ) -> list[dict]:
@@ -434,6 +456,41 @@ class COScheduler:
         def _over_cap(target: str, cons: dict) -> bool:
             _i = _sku_inch.get(str(target), "")
             return (_bic.get(_i, 0.0) - cons.get(_i, 0.0)) <= 0
+
+        # PERSKU_FEED: refine the 5b guard's per-SKU buildable rate. The static buildable_rate is
+        # the FULL sum of a SKU's in-inch machines' GT/day — but those machines are shared. This
+        # returns target's DRAW-WEIGHTED slice: each machine split across the same-inch SKUs
+        # currently drawing it, weighted by draw. Floored at one full machine's GT/day (building
+        # can dedicate a machine to a target) so it can only ever TIGHTEN below the static sum for
+        # a genuinely contended SKU, never over-block. OFF / no ctx → the static rate (bit-for-bit).
+        _perSKU_feed_on = _PERSKU_FEED and bool(feed_ctx) and bool(_sku_inch)
+        _feed_sm = (feed_ctx or {}).get("sku_machines", {})
+        _feed_ms = (feed_ctx or {}).get("machine_skus", {})
+        _feed_gt = (feed_ctx or {}).get("machine_gtday", {})
+
+        def _perSKU_feed(target, n_t, rate_t):
+            _static = buildable_rate.get(target) if buildable_rate is not None else None
+            if not _perSKU_feed_on:
+                return _static
+            _ms = _feed_sm.get(str(target))
+            if not _ms:
+                return _static
+            _newdraw = (n_t + 1) * rate_t                    # target's draw WITH the added press
+            _dctm = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+            feasible = 0.0
+            for _m in _ms:
+                _tot = 0.0                                   # total same-inch draw contending for _m
+                for _s in _feed_ms.get(_m, ()):
+                    if _s == str(target):
+                        _tot += _newdraw
+                    else:
+                        _ns = press_count.get(_s, 0)
+                        if _ns > 0:
+                            _tot += _ns * _qty_per_press_per_day(ct_map.get(_s, _dctm))
+                _mg = _feed_gt.get(_m, 0.0)
+                feasible += _mg if _tot <= 0 else _mg * (_newdraw / _tot)   # target's slice of _m
+            _floor = max((_feed_gt.get(_m, 0.0) for _m in _ms), default=0.0)
+            return max(feasible, _floor)
 
         ro_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-Out",     "SKUCode"])
         ri_skus  = set(df_day0.loc[df_day0["Category"] == "Runner-In",      "SKUCode"])
@@ -700,9 +757,9 @@ class COScheduler:
                                     continue   # RI already on track
                             else:
                                 continue
-                            # 5b building-supply hard filter
+                            # 5b building-supply hard filter (PERSKU_FEED refines per-SKU)
                             if buildable_rate is not None:
-                                _br = buildable_rate.get(target)
+                                _br = _perSKU_feed(target, n_t, rate_t)
                                 if _br is not None and (n_t + 1) * rate_t > _br:
                                     continue
                             # #4 mould-availability hard filter: skip a target the press
@@ -893,10 +950,10 @@ class COScheduler:
                 # the reassigned press just starves (RUNNING, no GT). buildable_rate
                 # is the per-SKU sustainable GT/day building can produce.
                 if p in surplus_free and buildable_rate is not None:
-                    _br = buildable_rate.get(new_sku)
+                    _nr = _qty_per_press_per_day(
+                        ct_map.get(new_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                    _br = _perSKU_feed(new_sku, cur_n, _nr)     # PERSKU_FEED refines per-SKU
                     if _br is not None:
-                        _nr = _qty_per_press_per_day(
-                            ct_map.get(new_sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
                         if (cur_n + 1) * _nr > _br:
                             continue  # building can't supply the extra press → skip
 
@@ -1738,6 +1795,7 @@ def run_dynamic_consumption(
     buildable_rate: dict | None = None,
     sku_inch: dict | None = None,
     building_inch_capacity: dict | None = None,
+    feed_ctx: dict | None = None,                # PERSKU_FEED: {sku_machines, machine_skus, machine_gtday}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
 ) -> dict:
     """
@@ -1904,6 +1962,7 @@ def run_dynamic_consumption(
         buildable_rate=buildable_rate,
         sku_inch=sku_inch,
         building_inch_capacity=building_inch_capacity,
+        feed_ctx=feed_ctx,
         sku_moulds=_p0_sku_moulds,
         priority_deadline_map=priority_deadline_map,
     )

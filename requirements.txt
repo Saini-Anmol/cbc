@@ -8,3 +8,4 @@ pandas==3.0.3
 numpy==2.4.6
 scipy==1.17.1
 openpyxl==3.1.5
+ortools==9.15.6755    # CP-SAT global optimizer (GLOBAL_OPT); pinned for deterministic search order
