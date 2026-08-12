@@ -63,7 +63,7 @@ class ConsumptionConfig:
     # ── press physics ─────────────────────────────────────────────────────────
     CAVITIES_PER_MOULD    = 2
     MOULDS_PER_PRESS      = 2
-    LOAD_UNLOAD_BUFFER_MIN = 2.3
+    LOAD_UNLOAD_BUFFER_MIN = 0
     PRESS_EFFICIENCY       = 0.94
     # Default EFFECTIVE cycle time for SKUs missing from the CT master.
     # Already includes buffer + efficiency — do NOT re-apply the formula.

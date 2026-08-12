@@ -129,9 +129,11 @@ for _m in ("7501","7502","7503"):
     _MACHINE_GROUP[_m] = "UNISTAGE"
 for _m in ("8201","8301","8302","8501","8502","7301"):
     _MACHINE_GROUP[_m] = "STAGE2"
-for _m in ("6802","6803","6909","6911","7601","7701",
-           "7801","7802","7803","7804","8001","8002","8003","8101"):  # 6801 removed (plant retired it) → 14 Stage-1
+for _m in ("6801","6802","6803","6909","6911","7601","7701",
+           "7801","7802","7803","7804","8001","8002","8003","8101"):  # Stage-1 (15; 6801 is Stage-1 carcass, not GT)
     _MACHINE_GROUP[_m] = "STAGE1"
+for _m in ("ps3","ps4"):   # NEW 2026-08 GT machines (independent GT, like Unistage; CO 30/60 via "PS" key)
+    _MACHINE_GROUP[_m] = "PS"
 
 # Plant-facing display labels — used ONLY for the Machine_Group column in the
 # building Shift Schedule output sheet. Never used in scheduling logic, so these
@@ -559,6 +561,7 @@ _BLD_CT_SEC: dict[str, float] = {
     "7701":163,   "7801":135,   "7802":135,
     "7803":135,   "7804":135,   "8001":113,
     "8002":113,   "8003":113,   "8101":230,
+    "ps3":48.0,   "ps4":48.0,   # NEW plant building machines (2026-08): ps3 dom 15", ps4 dom 16"; CT 48 sec/unit
 }
 
 # ── Per-(SKU × machine) building CT (sec/unit) — LIVE, toggle-gated ───────────
@@ -4441,6 +4444,7 @@ def _write_rolling_building_excel(
         if m in {"6001","6002","6003","6004","7001","7002","7003","7004"}: return "VMI"
         if m in {"7101","7102","7103","7104","7105","7106","7201"}:        return "BJ"
         if m in {"7501","7502","7503"}:                                    return "UNI_NARROW"
+        if m in {"ps3","ps4"}:                                             return "PS"
         if m in {"8201","8301","8302","8501","8502","7301"}:               return "Stage-2"
         return "Stage-1"
 
@@ -4476,17 +4480,18 @@ def _write_rolling_building_excel(
     # are always included regardless of whether they appear in production or CO dicts.
     # (6801/bj1stage1 removed — plant retired it → 14 Stage-1.)
     _ALL_BUILDING_MACHINES = frozenset({
-        "6802","6803","6909","6911","7601","7701",
-        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (14)
+        "6801","6802","6803","6909","6911","7601","7701",
+        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (15, incl 6801)
         "8201","8301","8302","8501","8502","7301",                # Stage-2 (6)
         "7001","7002","7003","7004","6001","6002","6003","6004",  # VMI (8)
         "7101","7102","7103","7104","7105","7106","7201",         # BJ (7)
         "7501","7502","7503",                                     # UNI_NARROW (3)
+        "ps3","ps4",                                              # NEW 2026-08 GT machines (2)
     })
     all_machines = sorted(
         _ALL_BUILDING_MACHINES,
         key=lambda m: (
-            {"VMI":0,"BJ":1,"UNI_NARROW":2,"Stage-2":3,"Stage-1":4}.get(_mgroup(m), 5),
+            {"VMI":0,"BJ":1,"UNI_NARROW":2,"PS":3,"Stage-2":4,"Stage-1":5}.get(_mgroup(m), 6),
             m
         )
     )
@@ -6840,6 +6845,14 @@ def run_rolling_pipeline(
         for _mm in _S1_MACHINES:
             _s1_visited[str(_mm)].add(s1_locked_inch.get(str(_mm), ""))
 
+    # ps3/ps4 hard monthly build cap (bc_config.PS_MAX_BUILD). Track cumulative build; once a
+    # capped machine hits its cap it is dropped from that shift's eligibility so it stops building.
+    try:
+        _PS_MAX_BUILD = dict(getattr(_bc_cfg, "PS_MAX_BUILD", {}) or {})
+    except Exception:
+        _PS_MAX_BUILD = {}
+    _ps_built_sofar: dict = defaultdict(float)
+
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
@@ -6943,6 +6956,33 @@ def run_rolling_pipeline(
                 today_cos = list(today_cos) + _cold
                 print(f"  [Rolling] Day 1: cold-started {len(_cold)} idle press(es) "
                       f"{[(c[0], c[2]) for c in _cold]}")
+
+        # ── Runner-Out Day-1 CO (Day 1 only) ──────────────────────────────────────
+        # Plant rule: a press running a NO-DEMAND SKU at Day-0 (Runner-Out) must change over
+        # on Day-1 Shift A to its preferred demand SKU and produce from Shift B — it must NOT
+        # sit idle on the dead SKU. Force a Day-1 CO for any RO press not already scheduled one
+        # today. Same contention-safe mount as the cold-start; exempt from the daily CO cap.
+        # Toggle: bc_config.RUNNER_OUT_DAY1_CO_ENABLED (env RUNNER_OUT_DAY1_CO=0 disables).
+        if day == 1 and getattr(_bc_cfg, "RUNNER_OUT_DAY1_CO_ENABLED", True):
+            _co_presses = {str(_p) for _p, _os, _ns in today_cos}
+            _roco = []
+            for _p, _st in list(press_state.items()):
+                if str(_p) in _co_presses:
+                    continue
+                _psku = _st.get("sku", "")
+                if demand_remaining.get(_psku, 0.0) > 0:      # running a demand SKU -> Runner-In, keep
+                    continue
+                _tgt = _pick_retarget(_p)                      # neediest allowable demand SKU w/ 2 free moulds
+                if _tgt is None or _tgt == _psku:
+                    continue
+                if not _try_mount(_p, _tgt, defer_free=False):
+                    continue
+                press_state[_p] = {"sku": _tgt, "status": "RUNNING"}
+                _roco.append((_p, _psku, _tgt))
+            if _roco:
+                today_cos = list(today_cos) + _roco
+                print(f"  [Rolling] Day 1: forced Runner-Out CO on {len(_roco)} press(es) "
+                      f"{[(c[0], c[2]) for c in _roco]}")
 
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
         # SKUs that curing presses are switching TO today — building must pre-build for these
@@ -7055,9 +7095,12 @@ def run_rolling_pipeline(
                 shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
 
             # ── 2. Building assignment for this shift ──────────────────────
+            _ms_capped = ({k: v for k, v in machine_skus.items()
+                           if not (k in _PS_MAX_BUILD and _ps_built_sofar[k] >= _PS_MAX_BUILD[k])}
+                          if _PS_MAX_BUILD else machine_skus)   # drop ps3/ps4 once at monthly cap
             shift_plan = _assign_building_shift(
                 shift_cure_demand=dict(shift_cure_demand),
-                machine_skus=machine_skus,
+                machine_skus=_ms_capped,
                 machine_current_sku=machine_current_sku,
                 sku_inch=sku_inch,
                 demand_remaining=demand_remaining,
@@ -7086,6 +7129,23 @@ def run_rolling_pipeline(
                 lookahead_draw=_lookahead_draw,             # LOOKAHEAD_BUF: anticipated peak draw
                 priority_deadline_map=(priority_deadline_map if _prio_active else None),
             )
+
+            # ps3/ps4 hard monthly cap: clamp this shift's ps build to the remaining room so the
+            # month total never exceeds PS_MAX_BUILD, then accumulate.
+            for _pm in _PS_MAX_BUILD:
+                _room = _PS_MAX_BUILD[_pm] - _ps_built_sofar[_pm]
+                _plan = shift_plan.get(_pm)
+                if _plan:
+                    if sum(_q for (_s, _q, _c) in _plan) > _room:
+                        _new = []; _acc = 0.0
+                        for (_s, _q, _c) in _plan:
+                            if _acc >= _room:
+                                break
+                            _take = min(_q, _room - _acc)
+                            if _take > 0:
+                                _new.append((_s, _take, _c)); _acc += _take
+                        shift_plan[_pm] = _new
+                    _ps_built_sofar[_pm] += sum(_q for (_s, _q, _c) in shift_plan.get(_pm, []))
 
             _shift_start = _shift_start_dt(date_str, shift)
 

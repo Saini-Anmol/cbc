@@ -38,12 +38,21 @@ DELIVERY_PRIORITY_ENABLED             = False
 DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = False
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ★ FEATURE TOGGLE — RUNNER-OUT DAY-1 CHANGEOVER ★
+#   A curing press running a NO-DEMAND SKU at Day-0 (Runner-Out) is forced to change
+#   over on Day-1 Shift A to its neediest allowable demand SKU (2 free moulds) and produce
+#   from Shift B — instead of sitting idle on the dead SKU. Measured July +3,196
+#   (666,496 → 669,692). Env RUNNER_OUT_DAY1_CO=0 also forces it off.
+# ══════════════════════════════════════════════════════════════════════════════
+RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1. PLAN HORIZON
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 31                                # number of days in plan horizon
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 32                                # number of days in plan horizon (July = 31)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. INPUT FILES
@@ -52,7 +61,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_plant_say_30_days.xlsx")
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
@@ -331,6 +340,7 @@ BUILDING_CO_SAME_SIZE = {
     "STAGE1":   60,   # 6802–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 (6801 retired)
     "MID":      60,   # same as Stage-1 (shared group in CO master)
     "UNISTAGE": 110,  # 7501–7503
+    "PS":       30,   # ps3, ps4 (NEW 2026-08 GT machines) — plant same_size_CO = 30 min
 }
 
 BUILDING_CO_DIFF_SIZE = {
@@ -341,6 +351,29 @@ BUILDING_CO_DIFF_SIZE = {
     "STAGE1":   180,  # 37.5% of one shift — avoid unless critical demand
     "MID":      180,
     "UNISTAGE": 180,  # 7501–7503 — same as Stage-1
+    "PS":       60,   # ps3, ps4 (NEW 2026-08 GT machines) — plant diff_size_CO = 60 min
+}
+
+# ── ps3 / ps4 NEW machines — MASTER ON/OFF toggle ────────────────────────────────────
+# OFF (default) = the plant's ORIGINAL line WITHOUT ps3/ps4 (they are stripped from the
+# building allowable entirely, as if not installed) → measures max production without the
+# new machines. ON = ps3/ps4 active (their DB-allowable SKUs, CT 48, inch ps3=15"/ps4=16",
+# CO 30/60). Env PS_MACHINES=1 forces ON, PS_MACHINES=0 forces OFF.
+PS_MACHINES_ENABLED = False   # default OFF
+# When ON, each ps machine may build at most this many units for the whole month (hard cap,
+# applies in shared or dedicated mode). Plant's real monthly capacity for the new machines.
+PS_MAX_BUILD = {"ps3": 10000, "ps4": 7000}
+
+# ── ps3 / ps4 NEW-machine dedication (DYNAMIC per-month) ──────────────────────────────
+# Each new GT machine is dedicated to a set of SKUs chosen FRESH from every month's demand:
+# among its dominant-inch SKUs it is DB-allowable for, take the highest-demand ones cumulatively
+# up to `max_build` (the machine's monthly capacity ceiling; "keep it low" = never exceed). Those
+# SKUs become EXCLUSIVE to the ps machines (removed from the shared VMI pool). Selection is computed
+# in building.load_machine_allowable(); env PS_EXCL_SKUS overrides with a fixed list, PS_EXCLUSIVE=0
+# disables. Edit inch / cap here.
+PS_DEDICATION = {
+    "ps3": {"inch": "15", "max_build": 10000},   # us3 — 15", max 10k (aligned to PS_MAX_BUILD)
+    "ps4": {"inch": "16", "max_build": 7000},    # us4 — 16", max 7k  (aligned to PS_MAX_BUILD)
 }
 
 STAGE2_CO_TIME_MULTIPLIER = 2.0

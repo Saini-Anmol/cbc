@@ -198,7 +198,7 @@ def _load_cycle_times(engine) -> dict:
             f"SELECT Sapcode AS sku, `Cure Time` AS raw_ct "
             f"FROM {DB}.Master_Curing_Design_CycleTime")
         df["sku"] = df["sku"].astype(str).str.strip()
-        df["ct"]  = (pd.to_numeric(df["raw_ct"], errors="coerce") + 2.3) / 0.94
+        df["ct"]  = (pd.to_numeric(df["raw_ct"], errors="coerce") + 0) / 0.94
         return {r["sku"]: float(r["ct"]) for _, r in df.iterrows() if pd.notna(r["ct"])}
     except Exception as e:
         print(f"  ⚠  Cycle times: {e}")

@@ -52,6 +52,9 @@ def main():
     paths = write_full_schedules(res, mi, ct_map=ct_map, out_dir=_out_dir, demand_path=_DEMAND)
     print(f"Building (full): {paths['building']}")
     print(f"Curing   (full): {paths['curing']}")
+    # NOTE: the greedy sheets (greedy_building_{date}.xlsx / greedy_curing_{date}.xlsx) are saved
+    # EARLIER, inside greedy_warmstart._greedy_sheets — right after the greedy runs, before the
+    # optimizer windows — so they persist even if the optimizer is interrupted.
 
 
 if __name__ == "__main__":

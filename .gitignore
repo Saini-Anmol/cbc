@@ -1,5 +1,6 @@
 # Data directories (large files)
 data/
+optimizer/
 
 # Secrets
 .env

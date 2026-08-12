@@ -211,6 +211,48 @@ def is_urgent(sku, urgency_map, plan_start):
             < Config.URGENT_THRESHOLD_HOURS)
 
 
+def _ps_dedicated_skus(allow_df) -> set:
+    """DYNAMIC ps3/ps4 dedication — re-derived every run from the CURRENT month's demand.
+
+    For each ps machine in bc_config.PS_DEDICATION, take its highest-demand SKUs of its
+    dominant inch (that it is DB-allowable for) cumulatively up to its `max_build` cap, then
+    stop (never exceed the cap; "keep it low" if the top SKU already fills it). Those SKUs
+    become exclusive to the ps machines. A new month's demand file auto-selects a fresh set —
+    no hardcoded SKU codes. Env {PS3,PS4}_MAX_BUILD override the caps. Empty/unreadable demand
+    -> empty set (no dedication). Returns the selected SKU codes.
+    """
+    try:
+        import bc_config as _bc
+        cfg = dict(getattr(_bc, "PS_DEDICATION", {}) or {})
+        if not cfg:
+            return set()
+        dem = pd.read_excel(_bc.DEMAND_FILE)
+        skucol = next(c for c in dem.columns if str(c).lower().startswith("sku"))
+        qcol = next(c for c in dem.columns
+                    if any(k in str(c).lower() for k in ("require", "demand", "qty", "quantity")))
+        dmap = {str(r[skucol]).strip(): float(r[qcol])
+                for _, r in dem.iterrows() if pd.notna(r[qcol])}
+    except Exception as e:
+        print(f"  [PS_DEDICATE] skipped (demand read failed: {e})")
+        return set()
+    sel = set()
+    for m, mc in cfg.items():
+        inch = str(mc.get("inch", ""))
+        cap = int(os.environ.get(f"{m.upper()}_MAX_BUILD", mc.get("max_build", 0)))
+        cands = [(str(sku).strip(), dmap[str(sku).strip()])
+                 for sku, ms in zip(allow_df["SKUCode"], allow_df["Machines"])
+                 if m in ms and str(sku).strip()[8:10] == inch and str(sku).strip() in dmap]
+        cands.sort(key=lambda z: -z[1])       # highest-demand first (frees the most VMI)
+        cum = 0.0; picked = []
+        for sku, d in cands:                  # greedy cap-fill: take each SKU that still fits,
+            if cum + d <= cap:                # keep filling headroom with the next-largest that fits
+                picked.append(sku); cum += d
+        sel.update(picked)
+        print(f"  [PS_DEDICATE] {m} (inch {inch}\", cap {cap:,}): {len(picked)} SKU(s), "
+              f"demand {cum:,.0f} -> {picked}")
+    return sel
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ETL
 # ══════════════════════════════════════════════════════════════════════
@@ -325,9 +367,49 @@ class ETL:
         )
         def _parse(s):
             if pd.isna(s) or not str(s).strip(): return []
-            return [str(int(p.strip())) for p in str(s).split(',') if p.strip().isdigit()]
+            # keep numeric IDs (normalised) AND alphanumeric machine codes like ps3/ps4
+            out = []
+            for p in str(s).split(','):
+                p = p.strip()
+                if not p:
+                    continue
+                out.append(str(int(p)) if p.isdigit() else p)
+            return out
         df = df.rename(columns={"Machines": "_machines_raw"})
         df["Machines"] = df["_machines_raw"].apply(_parse)
+        # ── ps3/ps4 MASTER ON/OFF (bc_config.PS_MACHINES_ENABLED, default OFF) ──────────────
+        # OFF strips ps3/ps4 from every allowable list -> the plant's ORIGINAL line without the
+        # new machines (measures max production without them). Env PS_MACHINES=1 forces ON.
+        try:
+            from bc_config import PS_MACHINES_ENABLED as _PS_ON
+        except Exception:
+            _PS_ON = False
+        if os.environ.get("PS_MACHINES") is not None:
+            _PS_ON = (os.environ.get("PS_MACHINES") != "0")
+        if not _PS_ON:
+            df["Machines"] = df["Machines"].apply(lambda ms: [m for m in ms if m not in ("ps3", "ps4")])
+        # ps3/ps4 SKU-EXCLUSIVITY (env PS_EXCLUSIVE, default ON): any SKU allowable on a NEW
+        # ps machine is built ONLY on the ps machine(s) — the plant dedicated ps3/ps4 to these
+        # SKUs, which also frees the shared VMI pool for other inches. Removes all non-ps
+        # machines from those SKUs' allowable list.
+        import os as _os
+        # Default OFF: measured -33k (dedicating ps3/ps4's VMI-type SKUs relieves VMI, not the
+        # BJ bottleneck). ps3/ps4 add the most value SHARED in the pool. Set PS_EXCLUSIVE=1 to
+        # re-enable dedication (dynamic set via bc_config.PS_DEDICATION / _ps_dedicated_skus).
+        if _os.environ.get("PS_EXCLUSIVE", "0") == "1":
+            _PS = {"ps3", "ps4"}
+            _env = _os.environ.get("PS_EXCL_SKUS", "").strip()
+            if _env:                                     # fixed override (A/B / pinning a set)
+                _sel = {s.strip() for s in _env.split(",") if s.strip()}
+            else:                                        # DYNAMIC: choose from THIS month's demand
+                _sel = _ps_dedicated_skus(df)
+            def _ps_excl(sku, ms):
+                has_ps = [m for m in ms if m in _PS]
+                if not has_ps:
+                    return ms
+                return has_ps if sku in _sel else [m for m in ms if m not in _PS]
+            df["Machines"] = [_ps_excl(str(s).strip(), ms)
+                              for s, ms in zip(df["SKUCode"], df["Machines"])]
         return df[["SKUCode", "Machines"]]
 
     def load_changeover_map(self):

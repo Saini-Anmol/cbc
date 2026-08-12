@@ -28,8 +28,8 @@ def _cfg(env_key, value):
 # for opening GT (gt_inventory_manual), opening carcass, and the Daily_Running_Moulds snapshot.
 MONTH_YEAR    = _cfg("MONTH_YEAR", 2026)
 MONTH_NUM     = _cfg("MONTH_NUM",  8)                 # 6 | 7 | 8 ...
-PLANNING_DAYS = _cfg("MONTH_DAYS", 29)               # 29 (Aug) | 31 (Jul) | 30 (Jun)
-DEMAND_FILE   = _cfg("MONTH_DEMAND", "august_demand_tomerji.xlsx")   # file under data/input/
+PLANNING_DAYS = _cfg("MONTH_DAYS", 32)               # 29 (Aug) | 31 (Jul) | 30 (Jun)
+DEMAND_FILE   = _cfg("MONTH_DEMAND", "correct_july.xlsx")   # file under data/input/
 
 PLAN_MONTH = f"{int(MONTH_YEAR):04d}-{int(MONTH_NUM):02d}"
 os.environ.setdefault("RUNNING_MOULDS_MONTH", PLAN_MONTH)   # opening GT + carcass + running moulds

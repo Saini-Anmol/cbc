@@ -103,20 +103,33 @@ def _greedy_sheets(mi):
 
     if os.environ.get("GX_REUSE") and os.path.exists(bout) and os.path.exists(cout):
         print(f"  [greedy_warmstart] reuse greedy sheets in {wd}")
-        return bout, cout
+    else:
+        from b2c_pipeline import run_rolling_pipeline
+        print(f"  [greedy_warmstart] running REAL greedy for {int(mi.planning_days)} days "
+              f"(plan_start={mi.plan_start}) ...")
+        res = run_rolling_pipeline(
+            demand_path=bc.DEMAND_FILE, plan_start=mi.plan_start, planning_days=int(mi.planning_days),
+            build_output=bout, curing_output=cout,
+        )
+        print(f"  [greedy_warmstart] greedy month: built={res['total_built']:,.0f} "
+              f"cured={res['total_cured']:,.0f} coverage={res['demand_coverage']:.2f}% n_co={res['n_co']}")
+        with open(os.path.join(wd, "gx_meta.pkl"), "wb") as fh:
+            pickle.dump({"built": res["total_built"], "cured": res["total_cured"],
+                         "coverage": res["demand_coverage"], "n_co": res["n_co"]}, fh)
 
-    from b2c_pipeline import run_rolling_pipeline
-    print(f"  [greedy_warmstart] running REAL greedy for {int(mi.planning_days)} days "
-          f"(plan_start={mi.plan_start}) ...")
-    res = run_rolling_pipeline(
-        demand_path=bc.DEMAND_FILE, plan_start=mi.plan_start, planning_days=int(mi.planning_days),
-        build_output=bout, curing_output=cout,
-    )
-    print(f"  [greedy_warmstart] greedy month: built={res['total_built']:,.0f} "
-          f"cured={res['total_cured']:,.0f} coverage={res['demand_coverage']:.2f}% n_co={res['n_co']}")
-    with open(os.path.join(wd, "gx_meta.pkl"), "wb") as fh:
-        pickle.dump({"built": res["total_built"], "cured": res["total_cured"],
-                     "coverage": res["demand_coverage"], "n_co": res["n_co"]}, fh)
+    # Persist date-stamped copies of the greedy sheets into the output folder NOW — right after the
+    # greedy runs, BEFORE the optimizer windows — so the greedy plan is saved even if the optimizer
+    # is long or interrupted. (greedy_building_{date}.xlsx / greedy_curing_{date}.xlsx)
+    try:
+        import shutil
+        _out = os.environ.get("OPT_OUT_DIR", "main_output"); os.makedirs(_out, exist_ok=True)
+        _dt = mi.plan_start.strftime("%Y-%m-%d")
+        for _src, _nm in ((bout, f"greedy_building_{_dt}.xlsx"), (cout, f"greedy_curing_{_dt}.xlsx")):
+            if os.path.exists(_src):
+                shutil.copy(_src, os.path.join(_out, _nm))
+                print(f"  [greedy_warmstart] saved {_nm} -> {_out}/")
+    except Exception as _e:
+        print(f"  [greedy_warmstart] greedy-copy skipped: {_e}")
     return bout, cout
 
 

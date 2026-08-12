@@ -57,12 +57,13 @@ from b2c_pipeline import (
 )
 
 # Building machine groups (authoritative, per CLAUDE.md / bc.md).
-STAGE1 = {"6802", "6803", "6909", "6911", "7601", "7701",
+STAGE1 = {"6801", "6802", "6803", "6909", "6911", "7601", "7701",
           "7801", "7802", "7803", "7804", "8001", "8002", "8003", "8101"}
 STAGE2 = {"8201", "8301", "8302", "8501", "8502", "7301"}
 UNISTAGE = {"6001", "6002", "6003", "6004", "7001", "7002", "7003", "7004",
             "7101", "7102", "7103", "7104", "7105", "7106", "7201",
-            "7501", "7502", "7503"}
+            "7501", "7502", "7503",
+            "ps3", "ps4"}                 # NEW 2026-08 GT machines (independent GT; ps3 dom 15", ps4 dom 16")
 _GT_MACHINES = STAGE2 | UNISTAGE          # machines that produce GT (Stage-1 = carcass only)
 
 # --- Building-CO time sub-groups (for building-changeover pricing, OPT_BLD_CO) ---
@@ -73,10 +74,13 @@ _GT_MACHINES = STAGE2 | UNISTAGE          # machines that produce GT (Stage-1 = 
 _VMI_MACHINES = {"6001", "6002", "6003", "6004", "7001", "7002", "7003", "7004"}
 _BJ_MACHINES  = {"7101", "7102", "7103", "7104", "7105", "7106", "7201"}
 _UNI_NARROW   = {"7501", "7502", "7503"}
+_PS_MACHINES  = {"ps3", "ps4"}          # NEW 2026-08 GT machines — CO 30/60 via bc_config "PS" key
 
 
 def _co_time_key(m: str) -> str:
-    """Machine id -> bc_config CO-time table key (VMI/BJ/UNISTAGE/STAGE2/STAGE1)."""
+    """Machine id -> bc_config CO-time table key (VMI/BJ/UNISTAGE/STAGE2/STAGE1/PS)."""
+    if m in _PS_MACHINES:
+        return "PS"
     if m in _VMI_MACHINES:
         return "VMI"
     if m in _BJ_MACHINES:
@@ -96,6 +100,8 @@ def _pen_group(m: str) -> str:
     penalty gradient needs them split (VMI light, BJ/UNI-narrow heavy)."""
     if m in STAGE2:
         return "S2"
+    if m in _PS_MACHINES:
+        return "VMI"            # NEW GT machines: light diff-CO penalty (moot — single allowed inch)
     if m in _VMI_MACHINES:
         return "VMI"
     if m in _BJ_MACHINES:
