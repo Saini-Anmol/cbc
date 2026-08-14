@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """Holiday scenario-matrix driver. One scenario per process, fully isolated output dir.
 Usage: python scratch_holiday_matrix.py <tag> <planning_days> <comma-holidays-or-NONE> <out_root>
 Prints one parseable RESULT| line.

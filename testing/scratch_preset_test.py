@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """scratch_preset_test.py — verify the impPriorityFlag preset-gate on the CLOUD path.
 
 Seeds 4 plans (July/August × {BTP Preset Main = impPriorityFlag 1, BTP Preset = impPriorityFlag 0}),

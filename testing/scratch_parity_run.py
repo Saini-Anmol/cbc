@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """scratch_parity_run.py <local|cloud> <may|june|july>
 Run ONE path for ONE month in an isolated process; print a PARITY_KPI json line.
 Temporary parity-test harness (not part of the deployment)."""

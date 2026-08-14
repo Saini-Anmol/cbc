@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 #!/usr/bin/env python3
 """
 smoke_test_db.py — fast DB connectivity smoke test for the CBC/B2C pipeline.

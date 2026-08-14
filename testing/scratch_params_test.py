@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """scratch_params_test.py — prove the cloud backend reads EVERYTHING from jkt_plan_params only
 (never the preset). Each plan's optimisationPreset is deliberately set to the OPPOSITE preset,
 so if the output follows the params values the backend is genuinely params-only.

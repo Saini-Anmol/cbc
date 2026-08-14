@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """scratch_inch_audit.py <building_schedule.xlsx>
 Audit the client inch rules against a produced building schedule.
 

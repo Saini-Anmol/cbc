@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """scratch_fulltest.py — seed June/July/August into the DB (jkt_demand + jkt_plan_params)
 and run them through the CLOUD path (main.run_plan), auditing that all 5 output tables are
 filled. Seeds the SAME PARITY_<month> plan_ids the parity harness (scratch_parity_run.py cloud)

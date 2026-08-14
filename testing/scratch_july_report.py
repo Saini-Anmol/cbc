@@ -1,3 +1,4 @@
+import os as _o, sys as _s; _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))  # allow imports from repo root
 """Regenerate the tail of plant_may_production_insights.pdf:
    page 5 = OUR JULY PLAN (margin=150/budget=2, 690,835 / 127 diff-COs)
    page 6 = OUR JULY PLAN (margin=200/budget=2, 683,536 / 83 diff-COs)
