@@ -88,6 +88,32 @@ from bc_config import (
     CO_CLASS_B_THRESHOLD,
     DYNAMIC_CC_OUTPUT,
 )
+import bc_config as _bc
+
+
+# ── Plant-holiday support: working-days-left urgency horizon ──────────────────
+# PLANT_HOLIDAYS (bc_config) is a list of "YYYY-MM-DD" strings (empty by default).
+# Urgency (Class A/B CO gating) must count WORKING days remaining, not calendar days,
+# so a holiday-shortened horizon fires COs on time. Empty holidays ⇒ working==calendar
+# ⇒ byte-for-byte identical to today (the parity guarantee).
+def _holiday_day_index_set(plan_start=PLAN_START):
+    """1-based day indices (relative to plan_start) that are plant holidays."""
+    out = set()
+    base = plan_start.date() if hasattr(plan_start, "date") else plan_start
+    for _h in (getattr(_bc, "PLANT_HOLIDAYS", []) or []):
+        try:
+            _idx = (datetime.strptime(str(_h).strip(), "%Y-%m-%d").date() - base).days + 1
+            out.add(_idx)
+        except Exception:
+            pass
+    return out
+
+
+def _working_days_left(day, planning_days, holiday_set):
+    """Count working (non-holiday) days in [day, planning_days] inclusive."""
+    if not holiday_set:
+        return planning_days - day + 1
+    return sum(1 for d in range(day, planning_days + 1) if d not in holiday_set)
 
 # Curing-side ratio alignment: replaces Priority_Score in _urgency_sort_key with
 # static demand[target]/press_total_demand[press] (never decremented), mirroring
@@ -577,14 +603,17 @@ class COScheduler:
 
         co_events: list[dict] = []
         daily_co_used: dict[int, int] = {}
+        _hol = _holiday_day_index_set()   # plant holidays → working-day urgency horizon
 
         # ── Day-by-day simulation ─────────────────────────────────────────────
         for day in range(1, planning_days + 1):
-            horizon_left = planning_days - day + 1
+            horizon_left = _working_days_left(day, planning_days, _hol)
             co_used = daily_co_used.get(day, 0)
 
-            # Drain demand by previous day's production
-            if day > 1:
+            # Drain demand by previous day's production. If the previous day was a plant
+            # holiday, nothing was produced → no drain (keeps the CO-planner's demand
+            # projection consistent with the holiday-idle plant).
+            if day > 1 and (day - 1) not in _hol:
                 for sku in all_demand_skus:
                     n = press_count.get(sku, 0)
                     if n <= 0:
@@ -1036,9 +1065,11 @@ class COScheduler:
                     if _co_day is None:
                         continue  # no CO budget anywhere in horizon
 
-                    # Capacity: n_ri presses run days 1.._co_day, then n_ri−1 for rest
-                    cap_before = n_ri * ri_rate * _co_day
-                    cap_after  = max(0, n_ri - 1) * ri_rate * (planning_days - _co_day)
+                    # Capacity: n_ri presses run days 1.._co_day, then n_ri−1 for rest.
+                    # Count WORKING days only (holidays produce nothing). Empty holidays
+                    # ⇒ identical to the plain day counts (parity).
+                    cap_before = n_ri * ri_rate * _working_days_left(1, _co_day, _hol)
+                    cap_after  = max(0, n_ri - 1) * ri_rate * _working_days_left(_co_day + 1, planning_days, _hol)
                     if (cap_before + cap_after) < ri_full_demand:
                         continue  # CO would leave RI SKU demand unmet
 
@@ -1151,11 +1182,16 @@ class DaySimulator:
         }
 
         daily_sheets: list[pd.DataFrame] = []
+        _hol = _holiday_day_index_set()   # plant holidays → working-day urgency horizon
 
         for day in range(1, planning_days + 1):
-            horizon_left = planning_days - day + 1
+            horizon_left = _working_days_left(day, planning_days, _hol)
+            _is_hol = day in _hol    # plant holiday: no curing, no demand drain this day
 
-            # Apply COs for this day (press count update effective from Shift C same day)
+            # Apply COs for this day (press count update effective from Shift C same day).
+            # Planned COs still execute on a holiday (setup crew works) so the press is
+            # ready to run the new SKU on the first working day — consistent with the
+            # rolling pipeline's holiday CO handling.
             for ev in co_by_day.get(day, []):
                 old = ev["old_sku"]
                 new = ev["new_sku"]
@@ -1164,15 +1200,20 @@ class DaySimulator:
                 if category_map.get(new) == "Non-Runner-In":
                     category_map[new] = "Runner-In"
 
-            # Snapshot today's GT output BEFORE draining (used in the sheet)
+            # Snapshot today's GT output BEFORE draining (used in the sheet). On a plant
+            # holiday NOTHING cures → gt_today stays empty → every day-sheet's "GT / Shift"
+            # column is 0 AND the drain loop below (which iterates gt_today) makes no change,
+            # so remaining demand carries across the holiday unchanged. This keeps the curing
+            # consumption output consistent with the building/curing schedules (holiday idle).
             gt_today: dict[str, int] = {}
-            for sku in all_skus:
-                n = press_count.get(sku, 0)
-                if n <= 0:
-                    continue
-                ct  = ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
-                qps = _qty_per_press_per_shift(ct)
-                gt_today[sku] = n * qps   # per-shift; × SHIFTS_PER_DAY = day total
+            if not _is_hol:
+                for sku in all_skus:
+                    n = press_count.get(sku, 0)
+                    if n <= 0:
+                        continue
+                    ct  = ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
+                    qps = _qty_per_press_per_shift(ct)
+                    gt_today[sku] = n * qps   # per-shift; × SHIFTS_PER_DAY = day total
 
             # Drain demand by today's full production FIRST so the day sheet
             # shows "Updated_Demand_Qty" = remaining demand AFTER today runs.

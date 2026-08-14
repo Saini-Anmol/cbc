@@ -54,6 +54,16 @@ RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
 PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 32                                # number of days in plan horizon (July = 31)
 
+# ── Plant holidays — NON-working days (no building, no curing) ─────────────────
+# List of holiday dates as "YYYY-MM-DD" strings inside the plan horizon. Empty =
+# feature INERT (output bit-for-bit identical to a no-holiday run). Holidays are IDLE
+# days inside the FIXED calendar span (same demand, fewer working days → lower coverage).
+# Aging stays CALENDAR-based (GT 3-day / carcass 1-day still age across a holiday);
+# in-flight changeovers/cleans complete during the idle day (setup crew). Env
+# PLANT_HOLIDAYS="2026-07-15,2026-07-16" overrides; cloud reads jkt_plan_params.
+PLANT_HOLIDAYS = ["2026-07-15"]
+#   e.g. PLANT_HOLIDAYS = ["2026-07-15", "2026-07-16"]   (edit here or set the env var)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. INPUT FILES
 #    Drop the demand workbook in data/input/ and update DEMAND_FILE.
@@ -61,7 +71,7 @@ PLANNING_DAYS = 32                                # number of days in plan horiz
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_plant_say_30_days.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_correct_plan.xlsx")
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)

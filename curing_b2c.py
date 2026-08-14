@@ -268,11 +268,20 @@ def _load_press_state(engine) -> pd.DataFrame:
 def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
         rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
-        mms = _sql(engine,
-            f"SELECT `Mold_Name` AS MouldNo, `Item_Code` AS sku "
-            f"FROM {DB}.Master_Mapping_Mould_SKU")
+        # Schema-adaptive (the mapping table has flipped naming across cycles):
+        # current/original `Mould`/`Matl.Code`/`Active Flag`=1, or prior `Mold_Name`/`Item_Code`.
+        _mcols = set(_sql(engine, f"SHOW COLUMNS FROM {DB}.Master_Mapping_Mould_SKU")["Field"].astype(str))
+        if {"Mould", "Matl.Code"} <= _mcols:
+            _mwhere = " WHERE `Active Flag` = 1" if "Active Flag" in _mcols else ""
+            mms = _sql(engine,
+                f"SELECT `Mould` AS MouldNo, `Matl.Code` AS sku "
+                f"FROM {DB}.Master_Mapping_Mould_SKU{_mwhere}")
+        else:
+            mms = _sql(engine,
+                f"SELECT `Mold_Name` AS MouldNo, `Item_Code` AS sku "
+                f"FROM {DB}.Master_Mapping_Mould_SKU")
 
-        active = mms   # 2026-08 schema has NO active flag — all rows count
+        active = mms   # active-flag already applied above when present
         compat = (active.groupby("MouldNo")["sku"]
                         .apply(lambda x: ", ".join(x.astype(str).str.strip()))
                         .reset_index()

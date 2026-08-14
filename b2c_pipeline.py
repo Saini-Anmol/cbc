@@ -1818,6 +1818,25 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
     S1 = sorted(_S1_MACHINES)
     CAP = {m: int(round(_bld_qty_per_shift(m))) for m in S1}      # carcass units/shift
 
+    # ABSOLUTE calendar-shift index per produced shift. `shifts` excludes holidays (no Stage-2
+    # is built on a holiday), so consecutive entries can straddle a holiday gap. Using the
+    # calendar distance for the feed window means carcass built just before a holiday CANNOT
+    # feed Stage-2 after it (it would exceed the 1-day shelf) — physical holiday-gap handling.
+    # No holidays ⇒ cal[i+1]-cal[i] == 1 ⇒ window identical to the contiguous one (parity).
+    from datetime import datetime as _dtc
+    def _cal_date(_s):
+        for _f in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return _dtc.strptime(str(_s)[:10], _f)
+            except Exception:
+                pass
+        return None
+    _c0 = _cal_date(shifts[0][0])
+    cal = []
+    for _k in shifts:
+        _cd = _cal_date(_k[0])
+        cal.append(((_cd - _c0).days * 3 + _SORD.get(_k[1], 0)) if (_cd and _c0) else 0)
+
     demlist = [(tidx[k], sku) for k in shifts for sku in s2[k]]
     NMS = len(S1) * T
     def _ms(mi, t): return 1 + mi * T + t
@@ -2201,7 +2220,8 @@ def _build_machine_pools(
             ]
 
         same_inch.sort(
-            key=lambda s: (-_urgency_score(s, demand_dict, press_count, cure_ct_map, planning_days), s)
+            key=lambda s: (-_urgency_score(s, demand_dict, press_count, cure_ct_map,
+                                           _bc_working_days_left(1, planning_days)), s)  # working-day horizon
         )
         pools[machine] = same_inch[:pool_size]
 
@@ -2516,7 +2536,7 @@ def _plan_day_cos(
     (b2c_pipeline.py _select_dynamic_co_target), extended from "one press
     reactively" to "the whole eligible press fleet, once a day."
     """
-    horizon_left = planning_days - day + 1
+    horizon_left = _bc_working_days_left(day, planning_days)   # holiday-aware urgency horizon
     slots_left = MAX_CHANGEOVERS_PER_DAY - daily_co_count.get(day, 0)
     if slots_left <= 0:
         return []
@@ -2697,7 +2717,7 @@ def _rolling_horizon_co_call(
     any-class bypass it already has). Only a non-demand SKU occupying a press
     is "Runner-Out".
     """
-    horizon_left = planning_days - day + 1
+    horizon_left = _bc_working_days_left(day, planning_days)   # holiday-aware urgency horizon
     demand_skus = set(demand_remaining.keys())
 
     running_rows = [
@@ -4170,6 +4190,45 @@ def _xl_fill(ws, row_num: int, n_cols: int, hex_color: str):
         ws.cell(row=row_num, column=ci).fill = fill
 
 
+def _working_days_count(plan_start, planning_days) -> int:
+    """planning_days minus the bc_config.PLANT_HOLIDAYS dates that fall in [1..planning_days].
+    No holidays ⇒ returns planning_days (parity). Used for utilization/availability denominators."""
+    try:
+        base = plan_start.date() if hasattr(plan_start, "date") else plan_start
+        n = 0
+        for _h in (getattr(_bc_cfg, "PLANT_HOLIDAYS", []) or []):
+            _idx = (datetime.strptime(str(_h).strip(), "%Y-%m-%d").date() - base).days + 1
+            if 1 <= _idx <= planning_days:
+                n += 1
+        return planning_days - n
+    except Exception:
+        return planning_days
+
+
+def _bc_holiday_day_set(planning_days) -> set:
+    """1-based day indices in [1..planning_days] that are plant holidays (bc_config.PLANT_HOLIDAYS)."""
+    out: set = set()
+    try:
+        ps = getattr(_bc_cfg, "PLAN_START", None)
+        base = ps.date() if hasattr(ps, "date") else ps
+        for _h in (getattr(_bc_cfg, "PLANT_HOLIDAYS", []) or []):
+            _idx = (datetime.strptime(str(_h).strip(), "%Y-%m-%d").date() - base).days + 1
+            if 1 <= _idx <= planning_days:
+                out.add(_idx)
+    except Exception:
+        pass
+    return out
+
+
+def _bc_working_days_left(day, planning_days) -> int:
+    """Working (non-holiday) days in [day..planning_days] inclusive. Urgency/CO-timing horizon.
+    No holidays ⇒ planning_days - day + 1 (byte-for-byte parity)."""
+    hol = _bc_holiday_day_set(planning_days)
+    if not hol:
+        return planning_days - day + 1
+    return sum(1 for _d in range(day, planning_days + 1) if _d not in hol)
+
+
 def _write_rolling_building_excel(
     output_path: str,
     bld_shift_rows: list,          # per-shift rows (includes CO sentinels)
@@ -4179,6 +4238,7 @@ def _write_rolling_building_excel(
     opening_gt: dict,              # opening GT inventory
     demand_dict: dict,             # {sku: demand_qty} from demand file
     planning_days: int,
+    working_days: int = None,      # planning_days − holidays; None → planning_days (parity)
     n_curing_cos: int = 0,         # curing press CO count (from co_events)
     endday_gt_by_date: "dict | None" = None,  # {date_str: end-of-day total GT inventory}
     cure_ct_map: "dict | None" = None,        # {sku: ct} — for Skip_Reason data checks
@@ -4448,7 +4508,8 @@ def _write_rolling_building_excel(
         if m in {"8201","8301","8302","8501","8502","7301"}:               return "Stage-2"
         return "Stage-1"
 
-    avail_per_mach = planning_days * 3 * SHIFT_MINS  # 44,640 min
+    _wd = working_days if working_days is not None else planning_days   # holidays excluded
+    avail_per_mach = _wd * 3 * SHIFT_MINS  # working-day availability (holiday shifts dropped)
 
     # Production time per machine
     mach_prod_mins: dict[str, float] = defaultdict(float)
@@ -4640,7 +4701,7 @@ def _write_rolling_curing_excel(
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    avail_mins = planning_days * 3 * SHIFT_MINS
+    avail_mins = _working_days_count(plan_start, planning_days) * 3 * SHIFT_MINS  # holiday shifts dropped
 
     # ── Sheet 1: Demand Fulfillment ───────────────────────────────────────────
     ws = wb.create_sheet("Demand Fulfillment")
@@ -4658,7 +4719,7 @@ def _write_rolling_curing_excel(
         gap     = max(0, dem - planned)
         pct     = planned / dem if dem > 0 else 0.0
         ct      = cure_ct_map.get(sku, DEFAULT_CURING_CT)
-        cap_day = _cure_qty_per_shift(ct) * 3 * planning_days
+        cap_day = _cure_qty_per_shift(ct) * 3 * _working_days_count(plan_start, planning_days)
         p_needed= max(1, round(dem / cap_day)) if cap_day > 0 else "-"
         status  = ("FULLY MET" if planned >= dem * 0.999
                    else "PARTIAL" if planned > 0
@@ -6455,7 +6516,7 @@ def run_rolling_pipeline(
         """
         if not (_MOULD_GLOBAL_OPT_ENABLED and _mould_gate):
             return today_cos
-        hleft = planning_days - day
+        hleft = _working_days_left(day) - 1   # working days after today (holiday-aware); OFF by default
         slots = MAX_CHANGEOVERS_PER_DAY - daily_co_count.get(day, 0)
         if slots <= 0:
             return today_cos
@@ -6657,7 +6718,7 @@ def run_rolling_pipeline(
         pruning any pulled-forward COs out of tomorrow's co_by_day. Two modes:
         ADDITIVE (keep planned COs, add pull-forward + idle-fill) and FULL_REOPT
         (global utility scoring; planned COs may be cancelled/replaced)."""
-        horizon_left     = planning_days - day + 1
+        horizon_left     = _working_days_left(day)   # holiday-aware urgency horizon
         bld_free         = _bld_free_min_shift()
         tomorrow_planned = list(co_by_day.get(day + 1, []))
         planned_tom      = {p: ns for (p, _o, ns) in tomorrow_planned}
@@ -6853,8 +6914,41 @@ def run_rolling_pipeline(
         _PS_MAX_BUILD = {}
     _ps_built_sofar: dict = defaultdict(float)
 
+    # ── Plant holidays (bc_config.PLANT_HOLIDAYS) — non-working days inside the FIXED
+    #    calendar span. Map each holiday DATE → 1-based day-index. Empty ⇒ feature INERT
+    #    (no holiday day ⇒ output bit-for-bit identical). TWO CLOCKS: the loop still
+    #    iterates ALL calendar days so aging stays CALENDAR-based; a holiday day produces
+    #    nothing (0 build / 0 cure) and is excluded from working-day counts + util denoms,
+    #    while in-flight CO/clean carries still complete (setup crew works the idle day). ──
+    _holiday_days: set = set()
+    try:
+        for _h in (getattr(_bc_cfg, "PLANT_HOLIDAYS", []) or []):
+            _hd = datetime.strptime(str(_h).strip(), "%Y-%m-%d").date()
+            _idx = (_hd - plan_start.date()).days + 1
+            if 1 <= _idx <= planning_days:
+                _holiday_days.add(_idx)
+    except Exception as _e:
+        print(f"  [Rolling] PLANT_HOLIDAYS parse failed ({_e}); no holidays applied")
+        _holiday_days = set()
+
+    def _is_holiday(_d: int) -> bool:
+        return _d in _holiday_days
+
+    working_days = planning_days - len([_d for _d in _holiday_days if 1 <= _d <= planning_days])
+
+    def _working_days_left(_d: int) -> int:      # working days in [_d .. planning_days] inclusive
+        return sum(1 for _x in range(_d, planning_days + 1) if _x not in _holiday_days)
+
+    # First working day (for Day-1-only cold-start COs when day 1 is itself a holiday).
+    _first_working_day = next((_d for _d in range(1, planning_days + 1) if _d not in _holiday_days), 1)
+    if _holiday_days:
+        print(f"  [Rolling] PLANT HOLIDAYS: day-index {sorted(_holiday_days)} → "
+              f"{len(_holiday_days)} idle day(s); {working_days} working days; "
+              f"first working day = {_first_working_day}")
+
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
+        _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
         machine_day_skus = {str(_m): ({str(_s)} if _s else set())
                             for _m, _s in machine_current_sku.items()}
@@ -7095,9 +7189,13 @@ def run_rolling_pipeline(
                 shift_cure_demand[new_sku] += _cure_qty_per_shift(new_ct) * n_co
 
             # ── 2. Building assignment for this shift ──────────────────────
-            _ms_capped = ({k: v for k, v in machine_skus.items()
-                           if not (k in _PS_MAX_BUILD and _ps_built_sofar[k] >= _PS_MAX_BUILD[k])}
-                          if _PS_MAX_BUILD else machine_skus)   # drop ps3/ps4 once at monthly cap
+            # HOLIDAY: no machine builds (empty eligibility → empty shift_plan). State
+            # (machine_current_sku etc.) is untouched → machines resume the same SKU with
+            # no CO on the next working shift.
+            _ms_capped = ({} if _holiday else
+                          ({k: v for k, v in machine_skus.items()
+                            if not (k in _PS_MAX_BUILD and _ps_built_sofar[k] >= _PS_MAX_BUILD[k])}
+                           if _PS_MAX_BUILD else machine_skus))   # drop ps3/ps4 once at monthly cap
             shift_plan = _assign_building_shift(
                 shift_cure_demand=dict(shift_cure_demand),
                 machine_skus=_ms_capped,
@@ -7110,7 +7208,7 @@ def run_rolling_pipeline(
                 cure_ct_map=cure_ct_map,
                 press_count=press_count,
                 co_target_skus=co_target_skus_today,
-                days_left=planning_days - day + 1,
+                days_left=_working_days_left(day),   # holiday-aware urgency horizon
                 demand_dict=demand_dict,
                 machine_total_demand=machine_total_demand,
                 machine_anchor_inch=machine_anchor_inch,
@@ -7276,7 +7374,7 @@ def run_rolling_pipeline(
                 # are surplus-only, toward-scarcer-only, and never-revisit, each machine takes
                 # ≤ (#eligible inches) diff-COs all month → Stage-1 CO stays bounded.
                 if _S1_INCH_FLEX:
-                    _dl = max(1, planning_days - day + 1)          # shifts left ≈ days_left×3
+                    _dl = max(1, _working_days_left(day))          # working shifts left ≈ days_left×3 (holiday-aware)
                     _inch_rem: dict = defaultdict(float)
                     for _s2s in s1_sku_to_machines:
                         _ii = sku_inch.get(str(_s2s), "")
@@ -7664,7 +7762,28 @@ def run_rolling_pipeline(
                     })
 
             # ── 4. Curing simulation ───────────────────────────────────────
-            for press in sorted(press_state):
+            # HOLIDAY: no press cures (iterate no presses). press_state + CO/clean carries
+            # are left intact → a press mid-campaign resumes the same SKU on the next
+            # working shift. (Phase 3 upgrades in-flight COs to COMPLETE during the idle day.)
+            # Decision #3: an in-flight changeover/mould-clean COMPLETES during a plant
+            # holiday (the setup crew works even though production is idle), so the press
+            # is ready to run on the FIRST working shift. Drain co_carry/clean_carry by a
+            # full shift each holiday shift — but book NO press_stats minutes (the holiday
+            # shift is dropped from the utilization denominator, decision #4) and produce
+            # no GT. Parity: only runs when _holiday, so empty-holidays is bit-identical.
+            if _holiday:
+                for _hp in sorted(press_state):
+                    _rem = float(SHIFT_MINS)
+                    if co_carry.get(_hp, 0.0) > 0:
+                        _dd = min(co_carry[_hp], _rem)
+                        co_carry[_hp] -= _dd
+                        _rem -= _dd
+                    if _MOULD_CLEAN_ENABLED and _rem > 0 and clean_carry.get(_hp, 0.0) > 0:
+                        _dd = min(clean_carry[_hp], _rem)
+                        clean_carry[_hp] -= _dd
+                        _rem -= _dd
+
+            for press in (sorted(press_state) if not _holiday else []):
                 st  = press_state[press]
                 sku = st["sku"]
 
@@ -7836,7 +7955,7 @@ def run_rolling_pipeline(
                         if _n_cur > 1:
                             _rate_cur = _cure_qty_per_shift(ct) * 3
                             _rem_cur  = demand_remaining.get(sku, 0.0)
-                            _hz_cur   = planning_days - day + 1
+                            _hz_cur   = _working_days_left(day)   # holiday-aware horizon
                             if (_rate_cur > 0
                                     and _rem_cur / ((_n_cur - 1) * _rate_cur) <= _hz_cur):
                                 _early_co = True
@@ -7876,7 +7995,7 @@ def run_rolling_pipeline(
                         if (press not in _next_day_cos) or (_pf_target is not None):
                             _slots_left = MAX_CHANGEOVERS_PER_DAY - daily_co_count[day]
                             if _slots_left > 0:
-                                _horizon_left = planning_days - day + 1
+                                _horizon_left = _working_days_left(day)   # holiday-aware horizon
                                 _pf_fired = False
                                 if _CO_SCORER_ENABLED and _mould_gate:
                                     # Pull-forward if tomorrow's planned CO is feasible now;
@@ -8070,7 +8189,7 @@ def run_rolling_pipeline(
         # ── 5. Pool replacement: swap out any finished SKUs ─────────────────
         # If a pool SKU's demand_remaining hit 0 this day, remove it and add
         # the next best same-inch eligible SKU (highest urgency, not yet in pool).
-        days_left_now = planning_days - day
+        days_left_now = _working_days_left(day + 1) if day < planning_days else 0  # working days after today (holiday-aware)
         for machine in list(machine_pool.keys()):
             pool = machine_pool[machine]
             finished = [s for s in pool if demand_remaining.get(s, 0.0) <= 0]
@@ -8163,7 +8282,7 @@ def run_rolling_pipeline(
                   f"presses {n_active} | COs {len(today_cos)} | "
                   f"writeoff {day_writeoff:,.0f} | coverage {cov:.1f}%")
         daily_summary.append({
-            "Day": day, "Date": date_str,
+            "Day": day, "Date": date_str, "Holiday": bool(_holiday),
             "GT_Built": int(round(d_gt_built)), "GT_Cured": int(round(d_cured)),
             "GT_Writeoff": int(round(day_writeoff)),
             "EndDay_GT_Inventory": int(round(endday_gt_inv)),
@@ -8412,6 +8531,7 @@ def run_rolling_pipeline(
         opening_gt     = opening_gt,
         demand_dict    = demand_dict,
         planning_days  = planning_days,
+        working_days   = _working_days_count(plan_start, planning_days),  # holiday-adjusted util denom
         n_curing_cos   = len(co_events),
         endday_gt_by_date = {r["Date"]: r["EndDay_GT_Inventory"] for r in daily_summary},
         cure_ct_map    = cure_ct_map,

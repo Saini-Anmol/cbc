@@ -241,15 +241,26 @@ class ConsumptionETL:
         A press needs 2 eligible moulds to run an SKU; a mould can serve several
         SKUs (sharing).
 
-        Table schema (2026-08 replacement): columns are `Mold_Name` (mould id),
-        `Item_Code` (SKU), `Plant_Code`, `Full_Load`. There is NO active flag —
-        ALL rows count (user-confirmed). Duplicate (mould,sku) rows are deduped by
-        the sets below. Old schema was `Mould`/`Matl.Code`/`Active Flag`=1.
+        Table schema is SCHEMA-ADAPTIVE (the table has flipped naming across cycles):
+          • Current/original DB: `Mould` (mould id) / `Matl.Code` (SKU) / `Active Flag`=1.
+          • A prior cycle used `Mold_Name` / `Item_Code` (no active flag, all rows count).
+        We introspect the live columns and build the right query, so a silent
+        mould-blind run (gate OFF) can never happen again on a schema flip.
         """
-        df = self._sql(
-            f"SELECT `Mold_Name` AS mould, `Item_Code` AS sku "
-            f"FROM {self.db}.Master_Mapping_Mould_SKU"
-        )
+        _cols = set(self._sql(
+            f"SHOW COLUMNS FROM {self.db}.Master_Mapping_Mould_SKU")["Field"].astype(str))
+        if {"Mould", "Matl.Code"} <= _cols:
+            _where = " WHERE `Active Flag` = 1" if "Active Flag" in _cols else ""
+            df = self._sql(
+                f"SELECT `Mould` AS mould, `Matl.Code` AS sku "
+                f"FROM {self.db}.Master_Mapping_Mould_SKU{_where}")
+        elif {"Mold_Name", "Item_Code"} <= _cols:
+            df = self._sql(
+                f"SELECT `Mold_Name` AS mould, `Item_Code` AS sku "
+                f"FROM {self.db}.Master_Mapping_Mould_SKU")
+        else:
+            raise RuntimeError(
+                f"Master_Mapping_Mould_SKU: unrecognized columns {sorted(_cols)}")
         df["mould"] = df["mould"].astype(str).str.strip()
         df["sku"]   = df["sku"].astype(str).str.strip()
         sku_moulds: dict[str, set] = {}
