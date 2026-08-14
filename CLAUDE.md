@@ -156,7 +156,7 @@ GT built for SKU A cannot be cured as SKU B even if both are 16".
 5. **Mould availability is physical (LIVE).** A curing press can only run / CO to an SKU
    if it holds **2 eligible moulds** (`Master_Mapping_Mould_SKU`); a mould serves one press
    at a time (contention). Every plan must pass the exact bipartite mould-feasibility audit
-   (`scratch_mould_audit.py`). See "Mould→SKU availability constraint".
+   (`feasibility_test.py` rule R17). See "Mould→SKU availability constraint".
 6. **Building inch rules (LIVE — historical inch-lock).** Each machine is bound to its
    **allowed-inch SET from the 4-month plant report** (27 FIXED to one inch, 12 FLEXIBLE to
    their ranked historical inches); the **anchor ±2 band is DISCONTINUED**. Max **4 distinct
@@ -193,7 +193,7 @@ OFF paths reproduce the prior baseline bit-for-bit.
   both clean together) — already computed by `load_running_moulds().MouldLife_remaining`.
   Countdown / 8h-clean-at-0 / CO-reset-to-3000 unchanged (per-press). Mean opening ≈2,000;
   KPI: May +564, June −99, July −12,113.
-- Every plan passes the exact bipartite mould-feasibility audit (`scratch_mould_audit.py`).
+- Every plan passes the exact bipartite mould-feasibility audit (`feasibility_test.py` rule R17; the standalone `scratch_mould_audit.py` was removed as R17 supersedes it).
 
 ### 2. Building inch rules — LIVE (`INCH_RULES`, hardcoded ON)
 Replaces the old permanent one-way / no-revisit rule with a **5-day minimum inch dwell**:

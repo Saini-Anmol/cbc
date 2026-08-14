@@ -2813,6 +2813,7 @@ def _assign_building_shift(
     machine_db_skus: dict | None = None,         # INCH_STEP_DRIFT: {machine: un-stripped DB SKUs}
     lookahead_draw: dict | None = None,          # LOOKAHEAD_BUF: {sku: anticipated peak draw today}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
+    writeoff_cum: dict | None = None,            # R8B: cumulative expired GT per SKU (cap tightener)
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -2828,6 +2829,9 @@ def _assign_building_shift(
     Returns: {machine: [(sku, qty_int, co_type_str)]}
       co_type: "start" | "same_size_CO" | "diff_size_CO"
     """
+    # R8B cap tightener: demand-cap ceilings subtract cumulative expired GT so a SKU is
+    # never rebuilt to replace written-off (wasted) GT → total built <= demand.
+    _woc = writeoff_cum if writeoff_cum is not None else {}
     # Client inch-rule state (persisted across shifts by run_rolling_pipeline).
     machine_anchor_inch = machine_anchor_inch if machine_anchor_inch is not None else {}
     machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
@@ -3071,7 +3075,7 @@ def _assign_building_shift(
                 _b = _dyn_H(sku)   # per-SKU dynamic horizon overrides the flat buffer
             built_ahead = projected_gt.get(sku, 0.0)
             gap = shift_cure_demand.get(sku, 0.0) * _b - built_ahead
-            cap = demand_remaining.get(sku, 0.0) - built_ahead
+            cap = demand_remaining.get(sku, 0.0) - built_ahead - _woc.get(sku, 0.0)
             return min(max(0.0, gap), max(0.0, cap))
 
         def _gt_headroom(fwd_added: float) -> float:
@@ -3235,7 +3239,7 @@ def _assign_building_shift(
                         and _MACHINE_GROUP.get(m, "") != "STAGE1")
             s["eff_buf"] = eff_buf                        # T2: stored for the Phase-B rotation gate
             _base_buf = buf if _RT_IMMINENT else eff_buf  # T2: Phase A builds only flat when RT_IMMINENT
-            _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0))
+            _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0) - _woc.get(cur, 0.0))
                      if _cap_max else _defc(cur, _base_buf))
             if cur in eligible and _room > 0 and not flex_reclaim:
                 _ra = _bld_qty_per_shift(m, cur) / SHIFT_MINS   # per-SKU CT rate
@@ -3762,7 +3766,7 @@ def _assign_building_shift(
                         _fwd_shifts = (min(GT_SHELF_LIFE_SHIFTS, PACING_SHIFTS)
                                        if _PACING_ENABLED else GT_SHELF_LIFE_SHIFTS)
                         target = min(dr, draw * _fwd_shifts)
-                        room = target - projected_gt.get(sku, 0.0)
+                        room = target - projected_gt.get(sku, 0.0) - _woc.get(sku, 0.0)
                         if room <= 0:
                             continue
                         key = (# DELIVERY_PRIORITY: a behind committed SKU is pre-built first
@@ -3901,7 +3905,7 @@ def _assign_building_shift(
             # Without the projected_gt term, two machines eligible for the same
             # SKU each build up to the full remaining demand in one shift → the
             # 1-4% overbuild seen across ~26 SKUs. This keeps total build ≤ demand.
-            cap  = demand_remaining.get(sku, 0.0) - built_ahead
+            cap  = demand_remaining.get(sku, 0.0) - built_ahead - _woc.get(sku, 0.0)
             return min(max(0.0, gap), max(0.0, cap))
 
         def _priority_tier(sku: str, d: float) -> tuple:
@@ -4229,6 +4233,122 @@ def _bc_working_days_left(day, planning_days) -> int:
     return sum(1 for _d in range(day, planning_days + 1) if _d not in hol)
 
 
+def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False):
+    """Split each row's [StartTime,EndTime] run at the plant shift boundaries
+    (07:00 / 15:00 / 23:00) into one row per shift, and remove cross-shift OVERLAP by
+    sequencing each machine/press's rows on a continuous wall-clock cursor.
+    Qty carries NO decimals (floored). `even_qty=True` (CURING) makes every shift's Qty EVEN
+    by counting whole CYCLES (2 cavities = 2 tyres): a cycle straddling a shift boundary is
+    credited to its COMPLETION shift, so no half-cycle (odd) output ever appears.
+    Totals are preserved (remainder on the last/completion segment)."""
+    from datetime import datetime as _dt, timedelta as _td
+
+    def _p(s):
+        try:
+            return _dt.strptime(str(s), "%Y-%m-%d %H:%M")
+        except Exception:
+            return None
+
+    def _f(dt):
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    def _shift_of(dt):
+        h = dt.hour
+        if 7 <= h < 15:
+            return dt.strftime("%Y-%m-%d"), "A"
+        if 15 <= h < 23:
+            return dt.strftime("%Y-%m-%d"), "B"
+        if h >= 23:
+            return dt.strftime("%Y-%m-%d"), "C"
+        return (dt - _td(days=1)).strftime("%Y-%m-%d"), "C"
+
+    def _win_end(dt):
+        h = dt.hour
+        d = dt.replace(minute=0, second=0, microsecond=0)
+        if 7 <= h < 15:
+            return d.replace(hour=15)
+        if 15 <= h < 23:
+            return d.replace(hour=23)
+        if h >= 23:
+            return (d + _td(days=1)).replace(hour=7)
+        return d.replace(hour=7)
+
+    by = defaultdict(list)
+    for r in rows:
+        by[str(r.get(mkey, ""))].append(r)
+    out = []
+    for _m, rr in by.items():
+        rr = sorted(rr, key=lambda r: str(r.get("StartTime", "")))
+        cursor = None
+        carry = {}   # CURING even-Qty: per-SKU odd tyre carried to this press's next cure of the SAME sku
+        for r in rr:
+            s = _p(r.get("StartTime"))
+            e = _p(r.get("EndTime"))
+            if s is None or e is None or e <= s:
+                out.append(r)
+                continue
+            if cursor is not None and s < cursor:          # remove cross-shift overlap
+                dur = e - s
+                s = cursor
+                e = s + dur
+            total = (e - s).total_seconds() / 60.0
+            qty = float(r.get("Qty", 0) or 0)
+            qfloor = int(qty)          # FLOOR: the Qty column carries NO decimals (Qty >= 0)
+            co = float(r.get("CO_Mins", 0) or 0)
+            clean = float(r.get("Mould_Clean_Mins", 0) or 0)
+            segs = []
+            cur = s
+            while cur < e:
+                we = min(_win_end(cur), e)
+                segs.append((cur, we))
+                cur = we
+            # CURING even-Qty: fold in the odd tyre carried from this press's previous cure, emit
+            # an EVEN Qty (whole cycles), and carry any new odd tyre forward. This preserves the
+            # press's TOTAL (no per-row loss — only the very last odd tyre can strand), so the KPI
+            # and GT mass-balance stay intact. A boundary cycle is credited to its COMPLETION shift.
+            if even_qty and qfloor > 0:
+                _sku = str(r.get("SKUCode", ""))
+                _avail = qfloor + carry.get(_sku, 0)
+                qeven = _avail - (_avail % 2)
+                carry[_sku] = _avail % 2
+            else:
+                qeven = qfloor
+            cyc_total = (qeven // 2) if even_qty else 0
+            cyc_time = (total / cyc_total) if (even_qty and cyc_total > 0) else 0.0
+            _qa = _coa = _cla = 0.0
+            _cum = 0.0
+            _cyc_prev = 0
+            for _i, (ss, ee) in enumerate(segs):
+                last = (_i == len(segs) - 1)
+                seg_min = (ee - ss).total_seconds() / 60.0
+                _cum += seg_min
+                frac = seg_min / total if total > 0 else 1.0
+                d2, sh2 = _shift_of(ss)
+                nr = dict(r)
+                nr["Date"], nr["Shift"] = d2, sh2
+                nr["StartTime"], nr["EndTime"] = _f(ss), _f(ee)
+                if qty:
+                    if even_qty:
+                        if last:
+                            nr["Qty"] = qeven - _qa               # remainder to completion shift (even)
+                        else:
+                            _cyc_by = min(cyc_total, int(_cum / cyc_time)) if cyc_time > 0 else 0
+                            nr["Qty"] = 2 * max(0, _cyc_by - _cyc_prev)   # whole completed cycles → even
+                            _cyc_prev = _cyc_by
+                    else:
+                        nr["Qty"] = (qfloor - _qa) if last else int(qfloor * frac)   # floor, no decimals
+                    _qa += nr["Qty"]
+                if "CO_Mins" in r:
+                    nr["CO_Mins"] = round(co - _coa, 1) if last else round(co * frac, 1)
+                    _coa += nr["CO_Mins"]
+                if "Mould_Clean_Mins" in r:
+                    nr["Mould_Clean_Mins"] = round(clean - _cla, 1) if last else round(clean * frac, 1)
+                    _cla += nr["Mould_Clean_Mins"]
+                out.append(nr)
+            cursor = e
+    return sorted(out, key=lambda r: (str(r.get("StartTime", "")), str(r.get(mkey, ""))))
+
+
 def _write_rolling_building_excel(
     output_path: str,
     bld_shift_rows: list,          # per-shift rows (includes CO sentinels)
@@ -4244,6 +4364,8 @@ def _write_rolling_building_excel(
     cure_ct_map: "dict | None" = None,        # {sku: ct} — for Skip_Reason data checks
     curing_allowable: "dict | None" = None,   # {sku: [presses]} — for Skip_Reason
     sku_moulds: "dict | None" = None,         # {sku: set(moulds)} — for Skip_Reason
+    gt_waste_map: "dict | None" = None,       # {sku: expired GT units}  → "expired GT/carcass" col
+    carcass_waste_map: "dict | None" = None,  # {sku: expired carcass units}
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -4276,6 +4398,12 @@ def _write_rolling_building_excel(
         bld_shift_rows,
         key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
     )
+    # SINGLE SOURCE OF TRUTH: split every row at shift boundaries (no cross-shift overlap)
+    # ONCE here, so ALL sheets below (Shift Schedule, Daily GT & Carcass, Demand Fulfillment,
+    # Machine Utilization) read the same shift-accurate rows. The split preserves per-
+    # (machine,SKU) Qty/CO totals exactly, so per-SKU / per-machine sums and the KPIs are
+    # unchanged; only cross-midnight rows attribute their tail to the correct calendar day.
+    bld_shift_rows = _split_rows_at_shift_boundaries(bld_shift_rows, "Machine")
 
     _SENTINEL = {"CHANGEOVER", "MOULD_CLEAN", "C/O", "CO"}
 
@@ -4292,7 +4420,7 @@ def _write_rolling_building_excel(
     bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty", "CO_Mins",
                 "StartTime", "EndTime", "Machine_Group", "CO_Type"]
     _xl_header(ws, 3, bld_cols)
-    for ri, row in enumerate(bld_shift_rows, 4):
+    for ri, row in enumerate(bld_shift_rows, 4):     # already split (single source above)
         is_co = str(row.get("SKUCode", "")).upper() in _SENTINEL
         for ci, col in enumerate(bld_cols, 1):
             cell = ws.cell(row=ri, column=ci, value=row.get(col, ""))
@@ -4396,8 +4524,22 @@ def _write_rolling_building_excel(
 
     dem_cols = ["SKUCode", "Category", "Priority", "Demand", "GT_Inventory",
                 "Planned_Units", "Planned+GT", "Gap", "Fulfillment_Pct", "Status",
-                "CycleTime_min", "Eligible_Machines", "Presses_Needed", "Skip_Reason"]
+                "CycleTime_min", "Eligible_Machines", "Presses_Needed",
+                "expired GT/carcass", "Skip_Reason"]
     _xl_header(ws_dem, 1, dem_cols)
+    _gtw = gt_waste_map or {}
+    _carw = carcass_waste_map or {}
+
+    def _waste_cell(sku):
+        # "50C" = 50 carcass aged-out; "100GT" = 100 GT aged-out; both → "50C, 100GT".
+        c = int(round(_carw.get(sku, 0) or 0))
+        g = int(round(_gtw.get(sku, 0) or 0))
+        parts = []
+        if c > 0:
+            parts.append(f"{c}C")
+        if g > 0:
+            parts.append(f"{g}GT")
+        return ", ".join(parts)
 
     cat_map_d0: dict[str, str]   = {}
     pri_map_d0: dict[str, float] = {}
@@ -4416,13 +4558,18 @@ def _write_rolling_building_excel(
 
     dem_rows_out = []
     for sku, dem in sorted(demand_dict.items(), key=lambda x: -x[1]):
-        planned  = float(prod_by_sku.get(sku, 0))
-        gt_inv   = float(opening_gt.get(sku, 0))
-        # Total GT available to cure = building output THIS horizon + opening
-        # inventory carried in on Day 0. The curing sheet consumes both, so its
-        # Gap/Fulfillment already reflect this; Gap here now matches (previously
-        # Gap = demand − planned ignored the opening GT_Inventory).
-        planned_plus_gt = planned + gt_inv
+        planned_orig = float(prod_by_sku.get(sku, 0))
+        gt_inv   = float(opening_gt.get(sku, 0))       # DB opening — shown as-is in GT_Inventory
+        # EXPIRED GT is WASTE — it must NOT count as usable supply. Subtract the aged-out GT
+        # (shown separately in the "expired GT/carcass" column) from Planned and Planned+GT so
+        # they reflect only USABLE GT. Expiry is charged to built production first, then to the
+        # opening inventory (both drawn from the same per-SKU pool). GT_Inventory keeps the true
+        # DB opening. Carcass expiry is upstream (Stage-1), already reflected in built GT, so it
+        # shows only in the waste column.
+        _gt_exp  = float((gt_waste_map or {}).get(sku, 0.0))
+        planned  = max(0.0, planned_orig - _gt_exp)                        # usable built GT
+        _gt_usable = max(0.0, gt_inv - max(0.0, _gt_exp - planned_orig))   # usable opening GT
+        planned_plus_gt = planned + _gt_usable
         gap      = max(0, int(dem) - int(planned_plus_gt))
         fill_pct = round(100 * planned_plus_gt / dem, 1) if dem > 0 else 0.0
         status   = ("FULLY MET" if planned_plus_gt >= dem * 0.95
@@ -4440,6 +4587,7 @@ def _write_rolling_building_excel(
             "CycleTime_min": avg_ct if avg_ct is not None else "NA",
             "Eligible_Machines": len(sku_machine_map.get(sku, set())) or "NA",
             "Presses_Needed": p_needed,
+            "expired GT/carcass": _waste_cell(sku),
             "Skip_Reason": _sku_data_skip_reasons(
                 sku, sku_machine_map, cure_ct_map, curing_allowable, sku_moulds),
         })
@@ -4690,6 +4838,12 @@ def _write_rolling_curing_excel(
             c = ws.cell(row=row, column=ci, value=h)
             c.fill = _fill(bg); c.font = _bold(10, fg); c.alignment = _ctr()
 
+    # SINGLE SOURCE OF TRUTH: split every curing row at shift boundaries (no cross-shift
+    # overlap) ONCE, so the Shift Schedule + MouldInUse sheets read shift-accurate rows.
+    # even_qty=True → every shift's cured Qty is EVEN (2 cavities = 2 tyres/cycle; a boundary
+    # cycle is credited to its completion shift). Preserves per-(press,SKU) totals.
+    cure_shift_rows = _split_rows_at_shift_boundaries(cure_shift_rows, "Machine", even_qty=True)
+
     # ── Build priority + category lookup from df_day0 ─────────────────────────
     pri_map: dict[str, float] = {}
     cat_map: dict[str, str]   = {}
@@ -4818,7 +4972,7 @@ def _write_rolling_curing_excel(
                "CycleTime_min", "GT_Inventory", "Remarks"]
     _hdr(ws, 1, ss_cols)
     s_fill = {"A": _fill(_BLUE), "B": _fill(_LYELL), "C": _fill(_DGREY)}
-    for ri, r in enumerate(cure_shift_rows, 2):
+    for ri, r in enumerate(cure_shift_rows, 2):      # already split (single source above)
         st = r.get("_status", "RUNNING")
         if st == "CHANGEOVER":
             f = _fill(_ORANGE)
@@ -5894,6 +6048,47 @@ def run_rolling_pipeline(
     except Exception:
         opening_gt = {}
     gt_inventory: dict[str, float] = defaultdict(float, opening_gt)
+    # ── GT strict per-lot FIFO (R9G / no-waste fix) ───────────────────────────────
+    # GT held as DATED LOTS per SKU: gt_lots[sku] = [[build_day, qty], ...]. Curing
+    # consumes OLDEST-first; a lot older than GT_SHELF_LIFE_DAYS is dropped as WASTE at
+    # day-start and can NEVER be cured (mirrors the carcass bank). gt_inventory (scalar)
+    # is kept as the running SUM of live lots so every existing reader stays correct.
+    # writeoff_cum feeds the demand-cap fix (built<=demand) + the "expired GT/carcass" col.
+    gt_lots: dict[str, list] = {s: [[0, float(q)]] for s, q in dict(opening_gt).items() if q > 0}
+    writeoff_cum: dict[str, float] = defaultdict(float)   # cumulative expired GT per SKU
+    carcass_waste: dict[str, float] = defaultdict(float)  # cumulative expired carcass per SKU
+
+    def _gt_consume_lots(_s, _q):
+        """Consume _q units of GT for SKU _s from the oldest lots first (FIFO)."""
+        _lots = gt_lots.get(_s)
+        if not _lots:
+            return
+        _r = float(_q)
+        while _r > 1e-9 and _lots:
+            if _lots[0][1] <= _r + 1e-9:
+                _r -= _lots[0][1]
+                _lots.pop(0)
+            else:
+                _lots[0][1] -= _r
+                _r = 0.0
+
+    def _gt_expire_lots(_today):
+        """Drop every GT lot older than GT_SHELF_LIFE_DAYS as waste (return total)."""
+        _tot = 0.0
+        for _s in list(gt_lots.keys()):
+            _keep = []
+            for _bd, _q in gt_lots[_s]:
+                if _q <= 1e-9:
+                    continue
+                if (_today - _bd) > GT_SHELF_LIFE_DAYS:
+                    _tot += _q
+                    writeoff_cum[_s] += _q
+                    gt_inventory[_s] = max(0.0, gt_inventory.get(_s, 0.0) - _q)
+                else:
+                    _keep.append([_bd, _q])
+            gt_lots[_s] = _keep
+        return _tot
+
     # #1: Opening carcass inventory (consumed first by the Stage-1 carcass pass; KPI-neutral).
     opening_carcass: dict[str, float] = {}
     if _CARCASS_INV_ENABLED:
@@ -6949,6 +7144,12 @@ def run_rolling_pipeline(
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
+        # GT per-lot FIFO expiry at DAY START: drop lots older than the 3-day shelf as WASTE
+        # BEFORE any curing today, so expired GT can never be cured (strict FIFO). Feeds
+        # writeoff_cum (demand-cap fix) + the expired-GT waste column. Aging is calendar-day
+        # (runs on holidays too). Replaces the old end-of-day _writeoff_stale_gt.
+        day_writeoff = _gt_expire_lots(day)
+        writeoff_total += day_writeoff
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
         machine_day_skus = {str(_m): ({str(_s)} if _s else set())
                             for _m, _s in machine_current_sku.items()}
@@ -7209,6 +7410,7 @@ def run_rolling_pipeline(
                 press_count=press_count,
                 co_target_skus=co_target_skus_today,
                 days_left=_working_days_left(day),   # holiday-aware urgency horizon
+                writeoff_cum=writeoff_cum,           # R8B: cap tightener (built <= demand)
                 demand_dict=demand_dict,
                 machine_total_demand=machine_total_demand,
                 machine_anchor_inch=machine_anchor_inch,
@@ -7281,6 +7483,10 @@ def run_rolling_pipeline(
             if _STAGE2_CARCASS_GATE:
                 _cage = max(1, _STAGE1_CARCASS_LEAD + 1)      # usable window (shifts)
                 for _bs in list(_carcass_bank):                  # age the bank 1 shift
+                    _exp = sum(_q for (_a, _q) in _carcass_bank[_bs]      # lots aging out this shift = WASTE
+                               if not (_a - 1 > 0 and _q > 1e-9))
+                    if _exp > 0:
+                        carcass_waste[_bs] += _exp
                     _kept = [[_a - 1, _q] for (_a, _q) in _carcass_bank[_bs]
                              if _a - 1 > 0 and _q > 1e-9]
                     if _kept:
@@ -7628,6 +7834,8 @@ def run_rolling_pipeline(
                     # machines; curing must only draw real GT (Stage-2 / Unistage / VMI / BJ).
                     if machine not in _S1_MACHINES:
                         gt_inventory[sku]   = gt_inventory.get(sku, 0.0) + qty
+                        if qty > 0:                                    # FIFO: new dated GT lot
+                            gt_lots.setdefault(sku, []).append([day, float(qty)])
                         day_gt_built[sku]  += qty
                         if _DYNAMIC_CO_PLANNER_ENABLED:
                             _prev_tier = sku_campaign_tier.get(sku)
@@ -7888,6 +8096,8 @@ def run_rolling_pipeline(
                     else:
                         cured = min(cap, int(gt_avail), int(demand_left))
                     gt_inventory[sku]      = gt_avail - cured
+                    if cured > 0:                                     # FIFO: draw oldest lots first
+                        _gt_consume_lots(sku, cured)
                     day_cured_d[sku]      += cured
                     sku_cured[sku]        += cured
                     daily_cured[date_str] += cured
@@ -8043,6 +8253,17 @@ def run_rolling_pipeline(
                                         priority_deadline_map=(priority_deadline_map if _prio_active else None),
                                         day=day,
                                     )
+                                # Allowable-press gate (R3C fix): _select_dynamic_co_target ranks
+                                # by urgency across ALL demand SKUs and never sees this press's
+                                # allowable matrix, so late-month (once the press's own demand is
+                                # done) it can pick a mould-feasible but ALLOWABLE-INFEASIBLE SKU.
+                                # Reject any target this press is not curing-allowable for. Fall
+                                # back to press_to_demand_targets (always built) if press_allow_skus
+                                # is empty, so the gate never silently no-ops.
+                                if _target is not None:
+                                    _allow_p = press_allow_skus.get(press) or press_to_demand_targets.get(press)
+                                    if _allow_p and _target not in set(_allow_p):
+                                        _target = None
                                 # Mould gate: only fire the reactive CO if 2 eligible
                                 # moulds are free for the target; else keep this SKU.
                                 if _target is not None and not _try_mount(press, _target):
@@ -8217,9 +8438,8 @@ def run_rolling_pipeline(
                 print(f"    [Pool] Day {day}: machine {machine} dropped {finished}, "
                       f"added {replacements[:slots]}")
 
-        # ── 6. GT shelf-life writeoff ─────────────────────────────────────
-        day_writeoff = _writeoff_stale_gt(gt_inventory, last_build_day, day)
-        writeoff_total += day_writeoff
+        # ── 6. GT shelf-life writeoff — now done at DAY START via _gt_expire_lots
+        # (strict per-lot FIFO); day_writeoff / writeoff_total already updated there.
 
         # DELIVERY_PRIORITY: snapshot cured-so-far for any committed SKU whose deadline
         # is TODAY (all of today's curing is already reflected in demand_remaining here;
@@ -8538,6 +8758,8 @@ def run_rolling_pipeline(
         curing_allowable = dict(curing_allowable),
         sku_moulds     = ({s: set(m) for s, m in _sku_moulds.items()}
                           if _sku_moulds else None),
+        gt_waste_map      = dict(writeoff_cum),
+        carcass_waste_map = dict(carcass_waste),
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,

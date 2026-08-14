@@ -61,7 +61,7 @@ PLANNING_DAYS = 32                                # number of days in plan horiz
 # Aging stays CALENDAR-based (GT 3-day / carcass 1-day still age across a holiday);
 # in-flight changeovers/cleans complete during the idle day (setup crew). Env
 # PLANT_HOLIDAYS="2026-07-15,2026-07-16" overrides; cloud reads jkt_plan_params.
-PLANT_HOLIDAYS = ["2026-07-15"]
+PLANT_HOLIDAYS = False
 #   e.g. PLANT_HOLIDAYS = ["2026-07-15", "2026-07-16"]   (edit here or set the env var)
 
 # ══════════════════════════════════════════════════════════════════════════════
