@@ -194,10 +194,35 @@ def read_db(engine, plan_id: str):
     end = pd.to_datetime(_ed)
     planning_days = int((end.normalize() - start.normalize()).days) + 1
 
+    # ── plant holidays for THIS plan (jkt_holiday_calendar) ──────────────────────
+    # Full-day rows only (shift-level partial holidays are a later phase). Each active
+    # full-day row's [start_date, end_date] span is expanded to individual YYYY-MM-DD
+    # dates; multiple rows are unioned. Absent table / no rows → [] (holiday-free run).
+    def _read_holidays():
+        try:
+            hdf = pd.read_sql(text(
+                "SELECT start_date, end_date FROM jkt_holiday_calendar "
+                "WHERE plan_id = :p AND is_full_day = 1"), engine, params={"p": plan_id})
+        except Exception as _he:
+            print(f"[read_db] holiday-calendar read skipped ({type(_he).__name__}: {_he})")
+            return []
+        days: set = set()
+        for _, _hr in hdf.iterrows():
+            _s, _e = pd.to_datetime(_hr["start_date"]), pd.to_datetime(_hr["end_date"])
+            if pd.isna(_s) or pd.isna(_e):
+                continue
+            for _d in pd.date_range(_s.normalize(), _e.normalize(), freq="D"):
+                days.add(_d.strftime("%Y-%m-%d"))
+        return sorted(days)
+    _holidays = _read_holidays()
+    if _holidays:
+        print(f"[read_db] plant holidays for plan_id={plan_id}: {_holidays}")
+
     run_cfg = {
         "plan_id":          plan_id,
         "plan_start":       start.to_pydatetime(),
         "planning_days":    planning_days,
+        "holidays":         _holidays,
         "max_co_per_day":   max_co_per_day,     # PRESET-authoritative (resolved above)
         "press_efficiency": press_efficiency,   # PRESET-authoritative (resolved above)
         "plant_name":       _pv("plantName"),

@@ -52,7 +52,7 @@ RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
 # ══════════════════════════════════════════════════════════════════════════════
 
 PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 32                                # number of days in plan horizon (July = 31)
+PLANNING_DAYS = 31                                # number of days in plan horizon (July = 31)
 
 # ── Plant holidays — NON-working days (no building, no curing) ─────────────────
 # List of holiday dates as "YYYY-MM-DD" strings inside the plan horizon. Empty =

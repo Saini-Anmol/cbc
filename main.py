@@ -63,7 +63,7 @@ CLOUD_CONFIG: dict = {
     # limit). Verified July/Aug/June (mould-audit PASS, carcass=GT, EOD ≤2000 / 0 over).
     "STAGE2_CARCASS_GATE_ENABLED":            True,
     "STAGE1_CO_ENABLED":                      True,
-    "MAX_ENDOFDAY_CARCASS_INVENTORY":         2000,   # MUST equal bc_config (hard limit)
+    "MAX_ENDOFDAY_CARCASS_INVENTORY":         1200,   # MUST equal bc_config (hard limit)
     "GT_BUFFER_SHIFTS":                       2,
     "GT_BUFFER_SHIFTS_VMI":                   2,      # split buffer (VMI banks 2 shifts)
     "GT_BUFFER_SHIFTS_OTHER":                 1,      # BJ/UNI/STAGE bank 1
@@ -101,7 +101,7 @@ CLOUD_CONFIG: dict = {
     "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND":  True,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
-    "CURING_CO_CHANGEOVER_MINS":              490,    # match bc_config (was 480 — parity drift)
+    "CURING_CO_CHANGEOVER_MINS":              480,    # match bc_config (parity)
     "CURING_CO_DURATION_SHIFTS":              1,
     # ── Curing capacity-utilisation KPI denominator (fixed plant roster) ──
     "CURING_PRESS_COUNT":                     170,    # daily+monthly curing util denominator
@@ -139,6 +139,11 @@ def _apply_run_cfg(run_cfg: dict) -> None:
     """
     b2c_pipeline.MAX_CHANGEOVERS_PER_DAY = int(run_cfg["max_co_per_day"])
     curing_consumption.ConsumptionConfig.PRESS_EFFICIENCY = float(run_cfg["press_efficiency"])
+    # Plant holidays (jkt_holiday_calendar) → the engine reads bc_config.PLANT_HOLIDAYS at
+    # runtime; empty list = holiday-free run (bit-for-bit identical to no-holiday).
+    _hols = list(run_cfg.get("holidays", []) or [])
+    setattr(_bc, "PLANT_HOLIDAYS", _hols)
+    os.environ["PLANT_HOLIDAYS"] = ",".join(_hols)
 
 
 def _set_running_moulds_table(name: str) -> None:
@@ -181,6 +186,9 @@ def _set_plan_month(plan_start) -> None:
     os.environ["RUNNING_MOULDS_MONTH"] = pm
     setattr(_bc, "PLAN_MONTH", pm)
     setattr(_bc, "RUNNING_MOULDS_MONTH", pm)
+    # bc_config.PLAN_START is read directly by the holiday helpers (day-index anchor), so it
+    # must reflect THIS run's start, not bc_config's file default.
+    setattr(_bc, "PLAN_START", plan_start)
     for _modname in ("curing_consumption", "curing_b2c", "curing_consumption_dynamic",
                      "building", "building_b2c", "b2c_pipeline"):
         try:
@@ -233,6 +241,11 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         build_output=build_out,
         curing_output=curing_out,
         sku_desc_map=sku_desc,          # DB master descriptions → output sheets
+        # CLOUD↔LOCAL PARITY + feasibility: restrict curing to the 170 allowable presses,
+        # exactly like local_main.py. Without this, cloud would cure on running-moulds
+        # presses that are NOT in the allowable matrix (e.g. 85214/85215) — a feasibility
+        # violation and a source of local↔cloud divergence.
+        restrict_to_allowable_presses=getattr(_bc, "RESTRICT_PRESSES_TO_ALLOWABLE", True),
     )
 
     # ── write the 4 output tables (rules 4 & 5 applied inside write_db) ────
