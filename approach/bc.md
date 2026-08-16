@@ -831,7 +831,7 @@ building plan less even. Producing a flat, plant-like daily curve needs a **sepa
 
 **File inputs:** per-month `data/input/<month>_demand_tomerji.xlsx`;
 `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx` (historical inch-lock source, §4.5);
-`data/input/Cycle_time_Building.csv` (per-(SKU×machine) building CT); `feed_map.json`.
+`data/input/Cycle_time_Building.xlsx` (per-(SKU×machine) building CT); `feed_map.json`.
 
 **Cloud DB contract (the boundary tables — see §19 for the full mapping).**
 - **`connection.read_db` is PARAMS-ONLY** — it reads **everything** from **`jkt_plan_params`** alone:
@@ -948,7 +948,7 @@ DELIVERY_PRIORITY active on cloud (read from `jkt_demand`, gated by `jkt_plan_pa
 | `connection.py` | DB adapter — **`read_db()` is PARAMS-ONLY** (reads only `jkt_plan_params`; `jkt_demand` staged separately) / `write_db()` (6 output tables incl `jkt_plan_moulds`), `now_ist()`. Does **not** read `jkt_plan_presets`. |
 | `app.py` | Flask API (synchronous). |
 | `Dockerfile` | `python:3.14-slim` + tzdata; gunicorn 1 worker / 4 threads / 1800 s. Published `anmolsaini07/jkt-btp-planning:v2` (& `:latest`), linux/amd64, ~145 MB. |
-| `.dockerignore` | Re-includes 3 engine reference files read from the filesystem every run (else the cloud engine silently falls back and diverges from local): `data/input/Cycle_time_Building.csv`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx`. |
+| `.dockerignore` | Re-includes 3 engine reference files read from the filesystem every run (else the cloud engine silently falls back and diverges from local): `data/input/Cycle_time_Building.xlsx`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx`. |
 
 ### 19.2 What drives what
 

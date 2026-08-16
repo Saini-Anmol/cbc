@@ -45,4 +45,4 @@ scratch_*.py
 # these 3 small files (≈10/10/24 KB) — NOT their parent dirs (analysis_aug is 275 MB).
 !data/analysis_aug/machine_inch_dominant_aug.xlsx
 !data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx
-!data/input/Cycle_time_Building.csv
+!data/input/Cycle_time_Building.xlsx

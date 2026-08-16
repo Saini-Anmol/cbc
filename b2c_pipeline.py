@@ -43,6 +43,11 @@ import tempfile
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 
+# VERBOSE terminal logging. Default OFF = quiet (only the setup lines, warnings, the final
+# KPI summary, and output paths print). VERBOSE=1 restores the per-day / per-machine trace
+# (Pool moves, deferrals, pre-positions, per-day built/cured, cold-start / Runner-Out lines).
+_VERBOSE = (os.environ.get("VERBOSE", "0") != "0")
+
 import pandas as pd
 
 import cbc_env
@@ -417,6 +422,26 @@ _CO_SCORER_ENABLED = True
 # True = FULL RE-OPT (planned COs may be cancelled/replaced) — MEASURED WORSE (utility
 # picker churns and drops good planned COs, e.g. May −40k), left OFF.
 _SCORER_FULL_REOPT = os.environ.get("SCORER_FULL", "0") != "0"
+# ── P1: reactive building-supply CO gate — REJECTED (env REACTIVE_CO, default OFF) ──
+# When ON, every reactive curing CO must pass a HARD building-supply test (_supply_ok):
+# the target SKU must have curable GT already banked (≥1 shift of draw) OR a building
+# machine that can be reserved to feed it this shift (same-inch/flex/Stage-1, via
+# _bld_capacity). Intended to stop a press changing over toward a SKU whose GT never
+# arrives. A press whose demand is done but whose only reachable targets all fail the
+# supply test does NOT idle — a FORCED CO fires on the plain best target (bypasses ONLY
+# the supply test; the mould + allowable gates ALWAYS still apply), counted in
+# co_scorer_stats["forced"].
+#
+# MEASURED + REJECTED (2026-08, cap=12, deterministic 2-hashseed, feasibility no NEW
+# violations, OFF bit-for-bit): net −904 cured over 3 months — July +924 / June 0 /
+# Aug −1,828. forced=0 and build_blocked≈0 on ALL months → the target scenario (a CO
+# toward absent GT) essentially never occurs; the existing soft build-feed veto
+# (_co_utility min-with-feed + the _bld_capacity check in _commit/_best_alt) already
+# prevents it. The hard gate therefore only REORDERS targets (best supply-feasible over
+# best-overall): helps the building-limited month (July) but churns the well-supplied
+# month more (Aug). Same shape as the rejected Lever B. Kept OFF, code retained for the
+# record. OFF (default) = bit-for-bit identical to today.
+_REACTIVE_CO = os.environ.get("REACTIVE_CO", "0") != "0"
 
 # Phase 4 — GLOBAL MOULD OPTIMISER (experiment, default OFF). The gate + scorer above
 # allocate moulds per-press greedily (each CO grabs the first 2 free/own eligible
@@ -547,6 +572,87 @@ _RATIO_CO_RICH_RANKING_ENABLED = False
 # so it has a real shot at beating baseline rather than replacing what works.
 _EARLY_CO_ENABLED = False
 
+# ── Part B: pure-reactive curing COs (env REACTIVE_ONLY, default OFF = current hybrid) ──
+# Master toggle for Part B. When ON: the whole-horizon planned schedule (COScheduler +
+# co_by_day) and the curing_consumption_*.xlsx workbook are DROPPED; a single reactive CO
+# arbiter (_reactive_co, run once per shift AFTER building assignment) makes every
+# changeover decision. The user accepted the documented risk that pure-reactive planning
+# regresses coverage (three prior attempts 670k->~594k GT, 96.7%->~86% — see the
+# _DYNAMIC_CO_PLANNER_ENABLED note above); the deliverable is the clean single-rule
+# architecture, measured honestly. OFF (default) = bit-for-bit the current hybrid.
+#
+# MEASURED (2026-08, deterministic 2-seed, OFF bit-for-bit):
+#   B-1 (planned COs removed, existing reactive layer): Jun 604,774 / Jul 634,189 /
+#       Aug 617,384 = −128k cured vs hybrid (~−6pp; 245 mould-blocked COs on July).
+#   B-2 (single once-per-shift _reactive_co arbiter + machine-swap depth-1 + B-3 surplus):
+#       Jun 525,040 / Jul 579,936 / Aug 560,723 = −319k cured vs hybrid (~−15pp), WORSE
+#       than B-1. Clean architecture (one rule, 0 mould-blocks) but the once-per-shift model
+#       makes every CO a FULL-shift press idle and the arbiter fires the 12/day cap every
+#       day → curing capacity collapses. Confirms the documented pure-reactive regression.
+#   B-3 surplus release is the over-firing culprit — RCO_SURPLUS=0 (arbiter COs only
+#       TRULY-idle presses) recovers massively: Jun 588,581 / Jul 658,949 (90.5%, only
+#       −1.9pp!) / Aug 634,523 = −103k vs hybrid (vs −319k with surplus ON). So surplus
+#       should stay OFF. The residual gap (June/Aug) is the remaining full-shift-CO cost.
+# Kept OFF, code retained.
+#
+# ADOPTED reactive config = the B-1 MID-SHIFT base (RCO_ARBITER=0, the default) upgraded, in
+# order of impact:
+#   • RETARGET-ON-BLOCK — a mould-blocked press picks the neediest allowable SKU it CAN mount
+#     instead of idling (July mould-blocked 394->19). The single biggest lever.
+#   • FEED-GUARD RELAX under reactive — trust REAL starvation over the optimistic buildable_rate
+#     estimate: a press starved RCO_STARV_SHIFTS shifts leaves for a GT-on-hand SKU (starvation
+#     July 3,566 -> 2,678, below the hybrid). RCO_STARV_SHIFTS=4 (churn-tuned; 2 over-fires).
+#   • Supply-gate (point 3, _supply_ok) + depth-1 machine-swap + STRICT allowable gate (R3C:
+#     curing-allowable set only, no building-map fallback) + 8-shift->N starvation CO.
+#   • PRE-POSITIONING (RCO_PREPOS, point 2) — light foresight from LIVE state: an under-served
+#     buildable SKU (running < presses_needed) pulls a SURPLUS press (n-1 safe) via a proactive
+#     Day CO added to today_cos so co_press_map PRE-BUILDS the target's GT (building couples).
+#     Need-gated both sides + rate-limited (RCO_PREPOS_MAX=4/day). Net +11,546 (Aug +11k, Jul +2.9k).
+# MEASURED (deterministic 2-seed, OFF bit-for-bit, R3C/R17/R10 PASS): Jun 649,900 (+4,041, BEATS
+# hybrid) / Jul 670,131 (−2,455) / Aug 654,206 (−11,955) = 1,974,237 = ~−0.5pp vs hybrid.
+# Progression: plain B-1 −128k -> +supply/swap/retarget −56k -> +feed-guard-relax −22k -> +prepos −10k.
+# CAVEAT: the reactive CO churn leaves R5 (Stage-2 GT ≤ carcass) FAIL=3 on Aug (hybrid is R5=0) —
+# a small carcass-timing residual to resolve before any adoption. Aug stays the structural laggard.
+_REACTIVE_ONLY = (os.environ.get("REACTIVE_ONLY", "0") != "0")
+# B-3 sub-toggle: proactive SURPLUS-press release inside _reactive_co (a press whose SKU has
+# more presses than needed to finish in the remaining horizon COs early, with n-1 protection
+# + 3-shift hysteresis). RCO_SURPLUS=0 → the arbiter only COs TRULY-idle presses (demand
+# fully done) — tests whether stopping the every-shift over-firing recovers coverage. Only
+# meaningful when _REACTIVE_ONLY.
+_RCO_SURPLUS = (os.environ.get("RCO_SURPLUS", "1") != "0")
+# Reactive ENGINE selector (only under _REACTIVE_ONLY). Default OFF = the B-1 MID-SHIFT base
+# (a press cures until its demand hits 0, THEN COs mid-shift — best timing), now upgraded
+# with the supply-gate + depth-1 machine-swap + the 8-shift starvation CO (_CURING_ADAPT_CO).
+# RCO_ARBITER=1 = the once-per-shift _reactive_co arbiter (cleaner rule, full-shift CO cost).
+_RCO_ARBITER = (os.environ.get("RCO_ARBITER", "0") != "0")
+# Point 1 (better than the 8-shift wait): under _REACTIVE_ONLY the sustained-starvation
+# switch fires after only _RCO_STARV_SHIFTS consecutive 0-GT shifts (default 2), GATED by
+# the feed guard (only switches a SKU building genuinely CAN'T feed — buildable < curing
+# draw). Supply-aware + fast, instead of idling 8 shifts. env RCO_STARV_SHIFTS.
+_RCO_STARV_SHIFTS = int(os.environ.get("RCO_STARV_SHIFTS", "4"))
+# Point 2 (default ON under REACTIVE_ONLY): light forward-looking PRE-POSITIONING. Each day,
+# from LIVE state, a SKU under-served for the remaining horizon (running presses <
+# presses_needed) pulls a SURPLUS press (its SKU over-served, n-1 safe) via a proactive Day
+# CO added to today_cos → co_press_map pre-builds the target's GT (building couples to the
+# move). Need-gated on BOTH sides + buildable-checked → foresight without over-firing. env RCO_PREPOS.
+_RCO_PREPOS = (os.environ.get("RCO_PREPOS", "1") != "0")
+_RCO_PREPOS_MAX = int(os.environ.get("RCO_PREPOS_MAX", "4"))   # max pre-position COs/day (rate limit)
+# ── HYBRID planned-CO fixes (env, default OFF = bit-for-bit hybrid) ─────────────
+# MEASURED (2026-08, hybrid, restrict=ON, corrected CT, deterministic, OFF bit-for-bit):
+# ADOPTED best config = HYBRID_CO_DEFER=1 + PERSKU_FEED_V2=1 (item 2 + item 1) = +29,836
+# over 3 months (Jun 650,448 / Jul 685,342 / Aug 648,687 vs baseline 646,275/672,157/636,209),
+# R10/R8C/R17/R3C PASS. The four fixes OVERLAP (all cut wasteful COs) → non-additive: item 2
+# defer is the biggest (Jul +14,137 alone), item 1 V2 lifts Jun/Aug; item 3 (+4,845 Jul alone)
+# and item 4 don't stack on top of 1+2 (ALL-on under-prunes COs). Item 3 is a correctness fix
+# (stale-CO removal) — keep OFF for max KPI, ON if you want strict staleness cleanup.
+# Item 3: a dynamic CO changes the press's SKU, so ALL its future planned COs (booked against
+# the OLD sku) are stale. ON wipes them for ANY dynamic CO (not just a starvation switch).
+_HYBRID_CO_CANCEL = (os.environ.get("HYBRID_CO_CANCEL", "0") != "0")
+# Item 2 (ADOPT): defer a planned CO (to the next working day) instead of preempting it in
+# Shift A when the press's old SKU still has FULFILLABLE demand (live _supply_ok) and the press
+# is NOT surplus. The single biggest lever (Jul +14,137). Pair with PERSKU_FEED_V2.
+_HYBRID_CO_DEFER = True
+
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
     "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
@@ -565,7 +671,7 @@ _BLD_CT_SEC: dict[str, float] = {
 }
 
 # ── Per-(SKU × machine) building CT (sec/unit) — LIVE, toggle-gated ───────────
-# Loaded from bc_config.BLD_CT_FILE (data/input/Cycle_time_Building.csv). Gives a
+# Loaded from bc_config.BLD_CT_FILE (data/input/Cycle_time_Building.xlsx; .csv also read). Gives a
 # distinct CT for a machine depending on WHICH SKU it builds (e.g. VMI builds a
 # small 12"-14" tyre in ~43s but a large 15" in 51-74s). The file is the source
 # of truth for CT ONLY — allowability stays from the DB allowable matrix, and any
@@ -589,7 +695,10 @@ def _load_bld_ct_file() -> None:
         print(f"  [BLD_CT] file not found ({path}); using fixed per-machine CT")
         return
     try:
-        _df = pd.read_csv(path, dtype=str)
+        if str(path).lower().endswith((".xlsx", ".xls")):
+            _df = pd.read_excel(path, dtype=str)
+        else:
+            _df = pd.read_csv(path, dtype=str)
     except Exception as _e:
         print(f"  [BLD_CT] read failed ({_e}); using fixed per-machine CT")
         return
@@ -815,6 +924,11 @@ _CURING_ADAPT_CO = os.environ.get(
     "CURING_ADAPT_CO",
     "1" if getattr(_bc_cfg, "CURING_ADAPT_CO_ENABLED", False) else "0"
 ) != "0"
+# B-1 point 2: under pure-reactive there is no planned base, so the 8-shift starvation
+# CO (a press starved N=_CURING_STARV_SWITCH_SHIFTS shifts switches to a feedable SKU) is
+# wanted. Force it ON under _REACTIVE_ONLY (env CURING_ADAPT_CO=0 still overrides to off).
+if _REACTIVE_ONLY and "CURING_ADAPT_CO" not in os.environ:
+    _CURING_ADAPT_CO = True
 _CURING_STARV_SWITCH_SHIFTS = int(os.environ.get(
     "CURING_STARV_SWITCH_SHIFTS",
     str(getattr(_bc_cfg, "CURING_STARV_SWITCH_SHIFTS", 8))))
@@ -827,6 +941,10 @@ _CURING_ADAPT_FEED_GUARD = os.environ.get(
     "CURING_ADAPT_FEED_GUARD",
     "1" if getattr(_bc_cfg, "CURING_ADAPT_FEED_GUARD_ENABLED", False) else "0"
 ) != "0"
+# Point 1: the supply-aware switch REQUIRES the feed guard (else the fast 2-shift trigger
+# would fire on transient dips). Force it on under _REACTIVE_ONLY unless explicitly disabled.
+if _REACTIVE_ONLY and "CURING_ADAPT_FEED_GUARD" not in os.environ:
+    _CURING_ADAPT_FEED_GUARD = True
 DYN_BUF_FLOOR_VMI   = int(os.environ.get("DYN_BUF_FLOOR_VMI",
                           str(getattr(_bc_cfg, "DYN_BUF_FLOOR_VMI", 2))))
 DYN_BUF_FLOOR_OTHER = int(os.environ.get("DYN_BUF_FLOOR_OTHER",
@@ -1106,6 +1224,40 @@ _S1_BALANCED_INCH = (os.environ.get("S1_BALANCED_INCH", "0") != "0")
 # capacity (a machine on a small/near-done inch moves to a still-demanded one) → fewer Stage-2
 # clamps. Default tied to STAGE1_CO; env S1_INCH_FLEX overrides.
 _S1_INCH_FLEX = (os.environ.get("S1_INCH_FLEX", "1" if _STAGE1_CO else "0") != "0")
+# ── Part A: Stage-1 carcass hardening — A1+A2 REJECTED (env CARCASS_V2, default OFF) ──
+# Ported from optimizer/carcass_sched.py. A1 = most-constrained-SKU-first carcass ordering
+# (SKUs with the FEWEST eligible Stage-1 machines claim their machines first, before
+# flexible SKUs can steal them); A2 = cheapest-CO-first machine ranking in _gate_build
+# (continuation 0 / same-inch 60 / diff-inch 180 min — real CO minutes, not a binary flag).
+# A3 (successor-aware capacity) is a NO-OP in the forward-only greedy (no backward spill →
+# the successor's changeover can never be disturbed), so _gate_build's existing minute
+# budget already covers it.
+#
+# MEASURED + REJECTED (2026-08, cap=12, OFF bit-for-bit, isolated via CV2_A1/CV2_A2):
+#   • A2 is a COMPLETE NO-OP on the real data — A2-only == OFF baseline byte-for-byte
+#     (the CO-minute ranking selects the same machines as the existing CO-free-first rank).
+#   • A1 drives the whole effect and is NET-NEGATIVE: June +2,156 / July +828 / Aug −9,835
+#     = net −6,851. Most-constrained-first over-serves low-demand scarce SKUs early and
+#     starves the bulk SKUs on the well-supplied month (Aug built −10,345 → fewer Stage-2
+#     GT). Helps the constrained months, craters Aug — same shape as the rejected P1 gate.
+# Kept OFF, code retained for the record. A4 (global FIFO reconcile — makes R5/R9C pass by
+# construction but drops coverage) is a SEPARATE, coverage-dropping decision, not bundled here.
+# Effective only when the carcass model is on (_STAGE2_CARCASS_GATE + _STAGE1_CO, both ON
+# by default). Default OFF; CARCASS_V2=1 enables A1+A2 (CV2_A1/CV2_A2 isolate each).
+_CARCASS_V2 = (os.environ.get("CARCASS_V2", "0") != "0")
+# Split sub-flags to isolate A1 vs A2 (both default to CARCASS_V2's state).
+_CV2_A1 = _CARCASS_V2 and (os.environ.get("CV2_A1", "1") != "0")   # most-constrained-SKU-first
+_CV2_A2 = _CARCASS_V2 and (os.environ.get("CV2_A2", "1") != "0")   # cheapest-CO-first machine rank
+# A4 = global per-SKU carcass->Stage-2 FIFO reconcile (1 calendar-day aging): cap Stage-2 GT
+# carcass can't back + cascade to cured. MEASURED a NO-OP (2026-08, June/July/Aug bit-for-bit):
+# the greedy's in-loop per-shift clamp (_take=min(desired,bank), ~line 7745) ALREADY guarantees
+# R5 (Stage-2 <= carcass) cumulatively, so the global FIFO finds NO shortfall to cap → 0 units
+# reduced, coverage unchanged. It does NOT fix R9C=9 either — that residual is a RENDERER
+# aging-granularity artifact (3-shift window vs calendar-day boundary in _stage1_carcass_rows_co),
+# which a Stage-2-reduction cannot touch (an earlier version that also dropped carcass from
+# prod_log to chase R9C broke R5 by desyncing from the renderer — reverted). Kept OFF, safe/inert.
+# CV2_A4=1 turns it on alone; default = CARCASS_V2 state.
+_CV2_A4 = (os.environ.get("CV2_A4", "1" if _CARCASS_V2 else "0") != "0")
 
 # ── Stage-2 campaign consolidation (S2_CAMPAIGN) ──────────────────────────────
 # Reduce the churn of the 6 Stage-2 GT machines {8201,8301,8302,8501,8502,7301}
@@ -1905,6 +2057,83 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
         "no_elig_units": round(sum(no_elig.values())),
     }
     return rows, report
+
+
+def _fifo_reconcile_greedy(opening_carcass: dict, bld_shift_rows: list,
+                           s2_consume: dict, prod_log: list, sord: dict):
+    """A4 (port of optimizer/carcass_sched.py _fifo_reconcile): replay the plant
+    validator's GLOBAL per-SKU carcass->Stage-2 FIFO with 1 CALENDAR-day aging (R9C/R5).
+    Where carcass cannot back a Stage-2 GT unit at a shift, REDUCE that Stage-2 GT row;
+    DROP carcass unconsumed past 1 calendar day. MUTATES Stage-2 rows in bld_shift_rows
+    (Qty) and prod_log entries (qty) in place; ONLY reduces (never invents). Deterministic
+    (all iteration over sorted keys). Returns (reduced_by_sku, reduced_by_day)."""
+    from collections import deque
+    build_at: dict = defaultdict(float)      # (sku,g) -> carcass units built
+    keys_at:  dict = defaultdict(list)       # (sku,g) -> backing prod_log entries
+    for e in prod_log:
+        g = (int(e["day"]) - 1) * 3 + sord.get(e["shift"], 0)
+        build_at[(e["sku"], g)] += float(e.get("qty", 0.0))
+        keys_at[(e["sku"], g)].append(e)
+    s2_rows: dict = defaultdict(list)        # (sku,g) -> Stage-2 GT rows
+    for r in bld_shift_rows:
+        if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
+                and (r.get("Qty", 0) or 0) > 0):
+            _day = int(str(r["Date"]).split("-")[-1])
+            s2_rows[(str(r["SKUCode"]), (_day - 1) * 3 + sord.get(r.get("Shift"), 0))].append(r)
+    demand: dict = defaultdict(float)        # (sku,g) -> Stage-2 GT consumption
+    for _s, lst in s2_consume.items():
+        for (_day, _so, _q) in lst:
+            demand[(_s, (_day - 1) * 3 + _so)] += float(_q)
+
+    reduced_sku: dict = defaultdict(float)
+    reduced_day: dict = defaultdict(float)
+
+    def _reduce_s2(_s, _g, _amt):
+        _cut = 0.0
+        for _r in sorted(s2_rows.get((_s, _g), []),
+                         key=lambda x: str(x.get("Machine", "")), reverse=True):
+            if _amt <= 1e-9:
+                break
+            _q = float(_r.get("Qty", 0.0))
+            _t = min(_q, _amt)
+            _r["Qty"] = int(round(_q - _t))
+            _amt -= _t; _cut += _t
+            if _t > 0:
+                reduced_day[str(_r["Date"])] += _t
+        return _cut
+
+    skus = ({s for (s, _g) in build_at} | {s for (s, _g) in demand}
+            | set(opening_carcass or {}))
+    for _s in sorted(skus):
+        _gs = [g for (s2, g) in build_at if s2 == _s] + [g for (s2, g) in demand if s2 == _s]
+        if not _gs:
+            continue
+        _dmin, _dmax = min(_gs) // 3, max(_gs) // 3
+        q = deque()
+        _op = float((opening_carcass or {}).get(_s, 0.0))
+        if _op > 0:
+            q.append([-1, _op, None])            # opening carcass: never ages out
+        for _dn in range(_dmin, _dmax + 1):
+            for _sh in range(3):
+                _g = _dn * 3 + _sh
+                _add = build_at.get((_s, _g), 0.0)
+                if _add > 0:
+                    q.append([_dn, _add, _g])
+                _need = demand.get((_s, _g), 0.0)
+                while _need > 1e-9 and q:
+                    _use = min(q[0][1], _need)
+                    q[0][1] -= _use; _need -= _use
+                    if q[0][1] <= 1e-9:
+                        q.popleft()
+                if _need > 1e-9:                 # carcass short here -> cap Stage-2 GT
+                    _c = _reduce_s2(_s, _g, _need)
+                    reduced_sku[_s] += _c
+            # >1-calendar-day carcass can't back FUTURE demand: drop it from the deque so
+            # the next shift's shortfall test is correct. The RENDERER (_stage1_carcass_rows_co)
+            # already drops aged carcass from the emitted rows — do NOT mutate prod_log here.
+            while q and q[0][0] >= 0 and (_dn - q[0][0]) > 1:
+                q.popleft()
+    return dict(reduced_sku), dict(reduced_day)
 
 
 def _stage1_carcass_rows_co(prod_log: list, s2_gt_per_sku: dict, sku_inch: dict,
@@ -4366,6 +4595,7 @@ def _write_rolling_building_excel(
     sku_moulds: "dict | None" = None,         # {sku: set(moulds)} — for Skip_Reason
     gt_waste_map: "dict | None" = None,       # {sku: expired GT units}  → "expired GT/carcass" col
     carcass_waste_map: "dict | None" = None,  # {sku: expired carcass units}
+    expiry_rows: "list | None" = None,        # per-(day,shift,SKU) expired GT/carcass display rows
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -4420,14 +4650,25 @@ def _write_rolling_building_excel(
     bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty", "CO_Mins",
                 "StartTime", "EndTime", "Machine_Group", "CO_Type"]
     _xl_header(ws, 3, bld_cols)
-    for ri, row in enumerate(bld_shift_rows, 4):     # already split (single source above)
-        is_co = str(row.get("SKUCode", "")).upper() in _SENTINEL
+    # DISPLAY ONLY: interleave the expired GT/carcass waste rows chronologically. These
+    # are NOT in bld_shift_rows / prod_rows, so every aggregate sheet (Daily GT & Carcass
+    # production totals, Demand Fulfillment, Machine Utilization) and all KPIs are untouched.
+    _EXP_TYPES = {"expired_GT", "expired_carcass"}
+    _display_rows = sorted(
+        list(bld_shift_rows) + list(expiry_rows or []),
+        key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
+    )
+    for ri, row in enumerate(_display_rows, 4):     # already split (single source above)
+        is_co  = str(row.get("SKUCode", "")).upper() in _SENTINEL
+        is_exp = row.get("CO_Type", "") in _EXP_TYPES
         for ci, col in enumerate(bld_cols, 1):
             cell = ws.cell(row=ri, column=ci, value=row.get(col, ""))
             cell.alignment = _ctr()
             if is_co:
                 cell.fill = _fill(_CO)
                 cell.font = Font(bold=True)
+            elif is_exp:
+                cell.fill = _fill(_RED)   # waste marker (aged-out GT / carcass)
     for col in ws.columns:
         w = max((len(str(c.value or "")) for c in col), default=8)
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 38)
@@ -4468,7 +4709,7 @@ def _write_rolling_building_excel(
         for ci, col in enumerate(cat_cols, 1):
             ws_cat.cell(row=ri, column=ci, value=row.get(col, "")).alignment = _ctr()
     # KPI footer
-    n_bld_co = sum(1 for r in bld_shift_rows if str(r.get("SKUCode","")).upper() in _SENTINEL)
+    n_bld_co = len(bld_co_events)   # match the Changeover Plan sheet (actual CO events), not sentinel shift-rows
     ws_cat.cell(row=len(cat_data) + 3, column=1, value="Building COs scheduled").font = _bold()
     ws_cat.cell(row=len(cat_data) + 3, column=2, value=n_bld_co)
     ws_cat.column_dimensions["A"].width = 22
@@ -4496,22 +4737,33 @@ def _write_rolling_building_excel(
             daily_agg[d]["GT_Produced"] += qty
         daily_agg[d]["Total_Units"]  += qty
         daily_agg[d]["Active_SKUs"].add(sku)
+    # Per-day expired GT / carcass (from the waste rows — NOT production, so kept out of
+    # GT_Produced/Carcass_Produced above). Shows how much aged out each day (built-then-aged
+    # + any opening Day-0 stock that expired), giving a shift/day-level view of waste.
+    exp_by_day: dict[str, dict] = defaultdict(lambda: {"GT": 0, "Carcass": 0})
+    for _er in (expiry_rows or []):
+        _d = str(_er.get("Date", ""))
+        if _er.get("CO_Type") == "expired_GT":
+            exp_by_day[_d]["GT"] += int(_er.get("Qty", 0) or 0)
+        elif _er.get("CO_Type") == "expired_carcass":
+            exp_by_day[_d]["Carcass"] += int(_er.get("Qty", 0) or 0)
     # EndDay_GT_Inventory: total GT held overnight (all SKUs, after curing + writeoff)
     # — audits the MAX_ENDOFDAY_GT_INVENTORY plant cap directly in the sheet.
     _eod = endday_gt_by_date or {}
-    daily_cols = ["Date", "GT_Produced", "Carcass_Produced", "Total_Units",
-                  "Active_SKUs", "Cumulative_GT", "EndDay_GT_Inventory"]
+    daily_cols = ["Date", "GT_Produced", "Carcass_Produced", "Expired_GT", "Expired_Carcass",
+                  "Total_Units", "Active_SKUs", "Cumulative_GT", "EndDay_GT_Inventory"]
     _xl_header(ws_daily, 1, daily_cols)
     cum_gt = 0
     for ri, (date, v) in enumerate(sorted(daily_agg.items()), 2):
         cum_gt += v["GT_Produced"]
         vals = [date, v["GT_Produced"], v["Carcass_Produced"],
+                exp_by_day[date]["GT"], exp_by_day[date]["Carcass"],
                 v["Total_Units"], len(v["Active_SKUs"]), cum_gt,
                 int(round(_eod.get(date, 0)))]
         for ci, val in enumerate(vals, 1):
             ws_daily.cell(row=ri, column=ci, value=val).alignment = _ctr()
     ws_daily.column_dimensions["A"].width = 14
-    for ltr in "BCDEFG":
+    for ltr in "BCDEFGHI":
         ws_daily.column_dimensions[ltr].width = 16
 
     # ── Sheet 6: Demand Fulfillment (B2C) ─────────────────────────────────────
@@ -4523,9 +4775,10 @@ def _write_rolling_building_excel(
             prod_by_sku[sku] += int(row.get("Qty", 0) or 0)
 
     dem_cols = ["SKUCode", "Category", "Priority", "Demand", "GT_Inventory",
+                "expired GT/carcass",                      # col F — right after GT_Inventory
                 "Planned_Units", "Planned+GT", "Gap", "Fulfillment_Pct", "Status",
                 "CycleTime_min", "Eligible_Machines", "Presses_Needed",
-                "expired GT/carcass", "Skip_Reason"]
+                "Skip_Reason"]
     _xl_header(ws_dem, 1, dem_cols)
     _gtw = gt_waste_map or {}
     _carw = carcass_waste_map or {}
@@ -4614,7 +4867,7 @@ def _write_rolling_building_excel(
     tot_avail = sum(r["Planned+GT"]  for r in dem_rows_out)  # built + opening GT
     kpi_pct = round(100 * tot_bld / tot_dem, 1) if tot_dem else 0.0
     kpi_pct_avail = round(100 * tot_avail / tot_dem, 1) if tot_dem else 0.0
-    n_co_bld = sum(1 for r in bld_shift_rows if str(r.get("SKUCode","")).upper() in _SENTINEL)
+    n_co_bld = len(bld_co_events)   # same source as the Changeover Plan sheet (was sentinel shift-rows → off-by-one vs the sheet)
     footer = len(dem_rows_out) + 3
     ws_dem.cell(row=footer,   column=1, value="KPI SUMMARY").font = Font(bold=True)
     ws_dem.cell(row=footer+1, column=1, value="Total Customer Demand (units)")
@@ -5655,6 +5908,7 @@ def run_rolling_pipeline(
         building_inch_capacity=_building_inch_capacity,
         feed_ctx=_feed_ctx,
         priority_deadline_map=(priority_deadline_map if _prio_active else None),
+        reactive_only=_REACTIVE_ONLY,   # Part B: skip planned schedule + CC workbook
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -5669,7 +5923,8 @@ def run_rolling_pipeline(
     # seeding, today_cos lookup, the reactive mechanism's "tomorrow" lookahead)
     # is neutralized by this single reset. df_day0/co_events themselves are
     # still needed (SKU classification) so run_dynamic_consumption still runs.
-    if _DYNAMIC_CO_PLANNER_ENABLED or _ROLLING_HORIZON_CO_ENABLED or _RATIO_CO_ALLOCATION_ENABLED:
+    if (_DYNAMIC_CO_PLANNER_ENABLED or _ROLLING_HORIZON_CO_ENABLED or _RATIO_CO_ALLOCATION_ENABLED
+            or _REACTIVE_ONLY):
         co_by_day = {}
 
     # ── B: Master data ────────────────────────────────────────────────────────
@@ -6057,6 +6312,11 @@ def run_rolling_pipeline(
     gt_lots: dict[str, list] = {s: [[0, float(q)]] for s, q in dict(opening_gt).items() if q > 0}
     writeoff_cum: dict[str, float] = defaultdict(float)   # cumulative expired GT per SKU
     carcass_waste: dict[str, float] = defaultdict(float)  # cumulative expired carcass per SKU
+    # Per-(day, shift, SKU) expired GT/carcass rows for the building Shift Schedule (display +
+    # per-day Daily-GT-&-Carcass Expired columns). Kept OUT of bld_shift_rows / prod_rows so no
+    # KPI, utilization, CO-count, or feasibility production sum is affected — they are waste
+    # markers only (Qty visible, CO_Mins=0, Machine="—").
+    expiry_rows: list[dict] = []
 
     def _gt_consume_lots(_s, _q):
         """Consume _q units of GT for SKU _s from the oldest lots first (FIFO)."""
@@ -6072,9 +6332,12 @@ def run_rolling_pipeline(
                 _lots[0][1] -= _r
                 _r = 0.0
 
-    def _gt_expire_lots(_today):
-        """Drop every GT lot older than GT_SHELF_LIFE_DAYS as waste (return total)."""
+    def _gt_expire_lots(_today, _date_str=None):
+        """Drop every GT lot older than GT_SHELF_LIFE_DAYS as waste (return total).
+        When _date_str is given, also emit one expired_GT Shift-Schedule row per SKU
+        (attributed to Shift A = day start, when the lot is dropped)."""
         _tot = 0.0
+        _per: dict[str, float] = defaultdict(float)
         for _s in list(gt_lots.keys()):
             _keep = []
             for _bd, _q in gt_lots[_s]:
@@ -6083,10 +6346,19 @@ def run_rolling_pipeline(
                 if (_today - _bd) > GT_SHELF_LIFE_DAYS:
                     _tot += _q
                     writeoff_cum[_s] += _q
+                    _per[_s] += _q
                     gt_inventory[_s] = max(0.0, gt_inventory.get(_s, 0.0) - _q)
                 else:
                     _keep.append([_bd, _q])
             gt_lots[_s] = _keep
+        if _date_str is not None:
+            _st = _fmt_dt(_shift_start_dt(_date_str, "A"))
+            for _s, _q in _per.items():
+                if _q >= 0.5:
+                    expiry_rows.append({"Machine": "—", "Date": _date_str, "Shift": "A",
+                                        "SKUCode": _s, "Qty": int(round(_q)), "CO_Mins": 0,
+                                        "StartTime": _st, "EndTime": _st,
+                                        "Machine_Group": "", "CO_Type": "expired_GT"})
         return _tot
 
     # #1: Opening carcass inventory (consumed first by the Stage-1 carcass pass; KPI-neutral).
@@ -6820,7 +7092,7 @@ def run_rolling_pipeline(
     # ── Phase 3: Unified CO scorer ────────────────────────────────────────────
     # counters (provenance of every committed CO + why some were blocked)
     co_scorer_stats = {"planned": 0, "pullfwd": 0, "dynamic": 0, "retarget": 0,
-                       "idle": 0, "cancelled": 0, "build_blocked": 0}
+                       "idle": 0, "cancelled": 0, "build_blocked": 0, "forced": 0}
     _CO_COST_UNITS   = float(os.environ.get("CO_COST_UNITS", "0"))  # 0 = cost folded into shift-draw floor
     _DEFAULT_BLD_CT  = 120.0
 
@@ -6853,6 +7125,19 @@ def run_rolling_pipeline(
             return 0.0
         return sum(bld_free.get(str(_m), 0.0) / (_bld_ct_sec(_m, sku) / 60.0)
                    for _m in _ms)
+
+    def _supply_ok(sku: str, bld_free: dict) -> bool:
+        """P1 reactive building-supply test (only consulted when _REACTIVE_CO is ON).
+        True iff a curing CO to `sku` can actually be FED this shift — either curable GT
+        is already banked (≥1 shift of draw) OR a building machine can be reserved to
+        produce ≥1 shift of draw (same-inch/flex/Stage-1, via _bld_capacity). Prevents a
+        reactive CO to a SKU whose GT never arrives."""
+        _draw = _cure_qty_per_shift(cure_ct_map.get(sku, DEFAULT_CURING_CT))
+        if _draw <= 0:
+            return True
+        if gt_inventory.get(sku, 0.0) >= _draw:        # GT already in the pool
+            return True
+        return _bld_capacity(sku, bld_free) >= _draw   # a building machine reservable
 
     def _bld_commit(sku: str, units: float, bld_free: dict) -> None:
         """Live-decrement the shared building minutes when a CO to `sku` is committed."""
@@ -7141,22 +7426,206 @@ def run_rolling_pipeline(
               f"{len(_holiday_days)} idle day(s); {working_days} working days; "
               f"first working day = {_first_working_day}")
 
+    # ── Part B (REACTIVE_ONLY): the SINGLE reactive curing-CO rule ──────────────
+    _reactive_surplus: dict = defaultdict(int)     # B-3: consecutive-shift surplus counter/press
+
+    def _r_inch(_s):
+        return sku_inch.get(_s, _s[8:10] if len(_s) >= 10 else "")
+
+    def _reactive_co(day, shift, cur_shift_global, date_str):
+        """Run once per shift AFTER building assignment. Collect presses wanting a CO
+        (their SKU's demand done, or B-3 surplus), build each press's legal target list
+        (allowable + 2 free moulds + demand>0 + building-supply test), try a depth-1
+        machine-swap to unblock a mould-contended target, then fire best-first
+        (delivery-EDF > GT-in-pool > same-size CO > larger unmet demand > SKU tiebreak),
+        re-scoring after EVERY fire, with a forced-CO fallback that bypasses ONLY the
+        supply test (never mould/allowable). Deterministic. A fired CO rides
+        dynamic_co_tracker: CHANGEOVER this shift, RUNNING the new SKU next shift."""
+        if _is_holiday(day):                                   # B-5: no NEW CO on a holiday
+            return
+        _wdl = max(1, _working_days_left(day))
+
+        def _apply(press, target, forced=False, swap=False):
+            _old = press_state[press]["sku"]
+            press_count[_old] = max(0, press_count.get(_old, 0) - 1)
+            dynamic_co_tracker[press] = (cur_shift_global, target)
+            daily_co_count[day] += 1
+            mould_life[press]  = MOULD_CLEAN_CYCLES
+            clean_carry[press] = 0.0
+            _reactive_surplus[press] = 0
+            if forced: co_scorer_stats["forced"] += 1
+            elif swap: co_scorer_stats["swap"] = co_scorer_stats.get("swap", 0) + 1
+            else:      co_scorer_stats["dynamic"] += 1
+            cure_co_events.append({
+                "Date": date_str, "Day": day, "Shift": shift, "Press": press,
+                "From_SKU": _old, "Target_SKU": target, "CO_Type": "Dynamic",
+            })
+
+        def _wanting():
+            _w = []
+            for p in sorted(press_state):
+                st = press_state[p]
+                if st.get("status") != "RUNNING" or p in dynamic_co_tracker:
+                    continue
+                _cs  = st.get("sku")
+                _rem = demand_remaining.get(_cs, 0.0)
+                if _rem <= 0:                                  # demand done → free to CO
+                    _reactive_surplus[p] = 0
+                    _w.append(p); continue
+                if not _RCO_SURPLUS:                            # B-3 off → only CO truly-idle presses
+                    _reactive_surplus[p] = 0
+                    continue
+                _rate = _cure_qty_per_shift(cure_ct_map.get(_cs, DEFAULT_CURING_CT)) * 3
+                _need = math.ceil(_rem / (_rate * _wdl)) if _rate > 0 else 10 ** 9
+                if press_count.get(_cs, 0) - 1 >= max(1, _need):   # B-3 surplus + n-1 protection
+                    _reactive_surplus[p] += 1
+                    if _reactive_surplus[p] >= 3:              # 3-shift hysteresis
+                        _w.append(p)
+                else:
+                    _reactive_surplus[p] = 0
+            return _w
+
+        def _legal(press):
+            """(ready, forced) target lists. ready = supply-OK + 2 free moulds."""
+            _cur = press_state[press]["sku"]; _ci = _r_inch(_cur)
+            _bf = _bld_free_min_shift()
+            _ready, _forced = [], []
+            for t in (press_allow_skus.get(press) or ()):
+                if t == _cur or demand_remaining.get(t, 0.0) <= 0 or _n_free_for(t, press) < 2:
+                    continue
+                _draw = _cure_qty_per_shift(cure_ct_map.get(t, DEFAULT_CURING_CT))
+                _rec = (t, gt_inventory.get(t, 0.0) >= _draw, _r_inch(t) == _ci)
+                (_ready if _supply_ok(t, _bf) else _forced).append(_rec)
+            return _ready, _forced
+
+        def _score(press, rec):
+            t, gt_pool, same = rec
+            _dd = (priority_deadline_map or {}).get(t) if _prio_active else None
+            _edf = (0, float(_dd)) if _dd is not None else (1, 0.0)   # committed first, EDF
+            return (_edf, 1 if gt_pool else 0, 1 if same else 0,
+                    demand_remaining.get(t, 0.0), t)                  # NO horizon term
+
+        def _swap_unblock(press):
+            """Depth-1 machine-swap: free a target-eligible mould from a DEMAND-DONE donor
+            press (CO it to an allowable SKU that does NOT reuse that mould), so `press` can
+            then mount a currently mould-blocked target. Returns the newly-feasible target or
+            None. Safe: routes ownership through _try_mount; only evicts demand-done donors."""
+            _cur = press_state[press]["sku"]
+            for t in (press_allow_skus.get(press) or ()):
+                if t == _cur or demand_remaining.get(t, 0.0) <= 0:
+                    continue
+                _elig = _sku_moulds.get(t, set())
+                if len(_elig) < 2 or _n_free_for(t, press) >= 2:
+                    continue
+                _deficit = 2 - _n_free_for(t, press)
+                _freed = 0
+                for _m in sorted(x for x in _elig if _mould_owner.get(x) not in (None, press)):
+                    if _freed >= _deficit or daily_co_count[day] >= MAX_CHANGEOVERS_PER_DAY:
+                        break
+                    _q = _mould_owner.get(_m)
+                    if _q is None or _q in dynamic_co_tracker or press_state.get(_q, {}).get("status") != "RUNNING":
+                        continue
+                    _qs = press_state[_q]["sku"]
+                    if demand_remaining.get(_qs, 0.0) > 0:            # only evict demand-done donors
+                        continue
+                    _ht = next((s for s in (press_allow_skus.get(_q) or ())
+                                if s != _qs and demand_remaining.get(s, 0.0) > 0
+                                and _m not in _sku_moulds.get(s, set())
+                                and _n_free_for(s, _q) >= 2), None)
+                    if _ht is None:
+                        continue
+                    if _try_mount(_q, _ht):        # _m ∉ elig(_ht) → freed to the pool
+                        _apply(_q, _ht, swap=True)
+                        _freed += 1
+                if _n_free_for(t, press) >= 2:
+                    return t
+            return None
+
+        while daily_co_count[day] < MAX_CHANGEOVERS_PER_DAY:
+            _cands = []                                       # (score, press, target, forced)
+            for press in _wanting():
+                if press in dynamic_co_tracker:
+                    continue
+                _ready, _forced = _legal(press)
+                for _rec in _ready:
+                    _cands.append((_score(press, _rec), press, _rec[0], False))
+                if not _ready:
+                    _sw = _swap_unblock(press)
+                    if _sw is not None:
+                        _draw = _cure_qty_per_shift(cure_ct_map.get(_sw, DEFAULT_CURING_CT))
+                        _rec = (_sw, gt_inventory.get(_sw, 0.0) >= _draw,
+                                _r_inch(_sw) == _r_inch(press_state[press]["sku"]))
+                        _cands.append((_score(press, _rec), press, _sw, False))
+                    elif _forced:
+                        _f = max(_forced, key=lambda r: (demand_remaining.get(r[0], 0.0), r[0]))
+                        _cands.append((_score(press, _f), press, _f[0], True))
+            if not _cands:
+                break
+            _cands.sort(key=lambda x: x[0], reverse=True)
+            _sc, press, target, forced = _cands[0]
+            if press in dynamic_co_tracker or not _try_mount(press, target):
+                break                                         # safety: avoid a stuck loop
+            _apply(press, target, forced=forced)
+
+    def _do_swap_for(press, target, day, shift, cur_shift_global, date_str):
+        """B-1 point 1: depth-1 machine-swap for the MID-SHIFT path. `press` is mould-blocked
+        for `target`; free target-eligible mould(s) from DEMAND-DONE donor presses (CO each to
+        an allowable SKU that does NOT reuse the mould), so `press` can then mount `target`.
+        Returns True iff press is now mould-feasible. Deterministic; ownership only via
+        _try_mount; only evicts demand-done donors (never steals from a producing press)."""
+        _elig = _sku_moulds.get(target, set())
+        if len(_elig) < 2:
+            return False
+        _deficit = 2 - _n_free_for(target, press)
+        if _deficit <= 0:
+            return True
+        _freed = 0
+        for _m in sorted(x for x in _elig if _mould_owner.get(x) not in (None, press)):
+            if _freed >= _deficit or daily_co_count[day] >= MAX_CHANGEOVERS_PER_DAY:
+                break
+            _q = _mould_owner.get(_m)
+            if (_q is None or _q in dynamic_co_tracker or _q in co_press_map
+                    or press_state.get(_q, {}).get("status") != "RUNNING"):
+                continue
+            _qs = press_state[_q]["sku"]
+            if demand_remaining.get(_qs, 0.0) > 0:          # only evict demand-done donors
+                continue
+            _ht = next((s for s in (press_allow_skus.get(_q) or ())
+                        if s != _qs and demand_remaining.get(s, 0.0) > 0
+                        and _m not in _sku_moulds.get(s, set())
+                        and _n_free_for(s, _q) >= 2), None)
+            if _ht is None:
+                continue
+            if _try_mount(_q, _ht):                         # _m ∉ elig(_ht) → freed to the pool
+                press_count[_qs] = max(0, press_count.get(_qs, 0) - 1)
+                dynamic_co_tracker[_q] = (cur_shift_global, _ht)
+                daily_co_count[day] += 1
+                mould_life[_q]  = MOULD_CLEAN_CYCLES
+                clean_carry[_q] = 0.0
+                co_scorer_stats["swap"] = co_scorer_stats.get("swap", 0) + 1
+                cure_co_events.append({"Date": date_str, "Day": day, "Shift": shift,
+                                       "Press": _q, "From_SKU": _qs, "Target_SKU": _ht,
+                                       "CO_Type": "Dynamic"})
+                _freed += 1
+        return _n_free_for(target, press) >= 2
+
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
+        date     = plan_start + timedelta(days=day - 1)
+        date_str = date.strftime("%Y-%m-%d")
         # GT per-lot FIFO expiry at DAY START: drop lots older than the 3-day shelf as WASTE
         # BEFORE any curing today, so expired GT can never be cured (strict FIFO). Feeds
-        # writeoff_cum (demand-cap fix) + the expired-GT waste column. Aging is calendar-day
-        # (runs on holidays too). Replaces the old end-of-day _writeoff_stale_gt.
-        day_writeoff = _gt_expire_lots(day)
+        # writeoff_cum (demand-cap fix) + the expired-GT waste column + expired_GT Shift rows.
+        # Aging is calendar-day (runs on holidays too). Replaces the old end-of-day _writeoff_stale_gt.
+        day_writeoff = _gt_expire_lots(day, date_str)
         writeoff_total += day_writeoff
+        day_carcass_writeoff = 0.0                   # per-day expired carcass (accumulated in shift loop)
         # Reset the per-machine daily SKU set; the overnight carryover SKU counts as #1.
         machine_day_skus = {str(_m): ({str(_s)} if _s else set())
                             for _m, _s in machine_current_sku.items()}
         machine_day_diff_co = {}                    # Part 2: reset per-day diff-CO budget counter
         machine_day_co = {}                         # S2_CAMPAIGN: reset per-day total-CO budget counter
-        date     = plan_start + timedelta(days=day - 1)
-        date_str = date.strftime("%Y-%m-%d")
         if _ROLLING_HORIZON_CO_ENABLED:
             today_cos = _rolling_horizon_co_call(
                 day=day, planning_days=planning_days,
@@ -7187,16 +7656,58 @@ def run_rolling_pipeline(
             sku_campaign_tier = {}
         else:
             today_cos = co_by_day.get(day, [])
+        # ── Item 2: DEFER a planned CO instead of preempting a fulfillable, needed SKU ──
+        # A planned CO whose old SKU still has demand that WON'T finish today (>2 shifts) would
+        # otherwise preempt in Shift A (co_shift_idx=0), abandoning that unmet demand. If the SKU
+        # is still FULFILLABLE (building can supply it now, live _supply_ok) AND this press is NOT
+        # surplus (n-1 presses can't cover it), push the CO to the next working day instead — the
+        # press keeps producing its old SKU. Runs BEFORE the mould gate → no _try_mount residue.
+        # HYBRID_CO_DEFER=0 = bit-for-bit.
+        if _HYBRID_CO_DEFER and today_cos and not (_REACTIVE_ONLY and _RCO_ARBITER):
+            _wdl_d   = max(1, _working_days_left(day))
+            _bf_defer = _bld_free_min_shift()
+            _kept_d, _deferred_d = [], []
+            for (_p, _old, _new) in today_cos:
+                _remd = demand_remaining.get(_old, 0.0)
+                if _remd <= 0:
+                    _kept_d.append((_p, _old, _new)); continue
+                _odraw = (_cure_qty_per_shift(cure_ct_map.get(_old, DEFAULT_CURING_CT))
+                          * max(1, press_count.get(_old, 1)))
+                _nsh = math.ceil(_remd / _odraw) if _odraw > 0 else 99
+                if _nsh <= 2:                                   # finishes today → fire as planned
+                    _kept_d.append((_p, _old, _new)); continue
+                _rate_d = _cure_qty_per_shift(cure_ct_map.get(_old, DEFAULT_CURING_CT)) * 3
+                _need_d = math.ceil(_remd / (_rate_d * _wdl_d)) if _rate_d > 0 else 10 ** 9
+                _surplus_d = press_count.get(_old, 0) - 1 >= max(1, _need_d)
+                if _surplus_d or not _supply_ok(_old, _bf_defer):
+                    _kept_d.append((_p, _old, _new)); continue  # surplus or unfulfillable → fire (preempt)
+                _nwd = next((_x for _x in range(day + 1, planning_days + 1)
+                             if _x not in _holiday_days
+                             and daily_co_count.get(_x, 0) < MAX_CHANGEOVERS_PER_DAY), None)
+                if _nwd is None:
+                    _kept_d.append((_p, _old, _new)); continue  # nowhere to defer → fire
+                _deferred_d.append((_p, _old, _new, _nwd))
+            if _deferred_d:
+                today_cos = _kept_d
+                co_by_day[day] = _kept_d
+                for (_p, _old, _new, _nwd) in _deferred_d:
+                    daily_co_count[day] = max(0, daily_co_count.get(day, 0) - 1)
+                    co_by_day.setdefault(_nwd, []).append((_p, _old, _new))
+                    daily_co_count[_nwd] = daily_co_count.get(_nwd, 0) + 1
+                _VERBOSE and print(f"  [Rolling] Day {day}: deferred {len(_deferred_d)} planned CO(s) "
+                      f"(fulfillable + needed) → {[(c[0], c[3]) for c in _deferred_d]}")
         # ── Mould gate (planned COs) ──────────────────────────────────────────
         # A planned CO can only happen if 2 eligible moulds are free for the new
         # SKU. Gate HERE (day-start) — not at apply-time — because co_press_map
         # drives the curing sim THIS day; a CO blocked later would already have
         # been cured. Feasible COs get their moulds committed now (_try_mount);
         # blocked ones are dropped so the press keeps its old SKU all day.
-        if _mould_gate and _CO_SCORER_ENABLED:
+        if _mould_gate and _CO_SCORER_ENABLED and not (_REACTIVE_ONLY and _RCO_ARBITER):
             # Phase 3 — unified global CO solve (planned / pull-forward / retarget /
             # dynamic / idle under one utility + mould + building-feed gate). Runs even
             # when today_cos is empty (there may be idle presses to fill / pull-forwards).
+            # DISABLED only under the once-per-shift arbiter (_RCO_ARBITER); the B-1
+            # mid-shift base keeps it (idle-fill), like the original B-1 measurement.
             today_cos = _solve_day_cos(day, today_cos)
         elif _mould_gate and today_cos:
             # Phase 2a — scarce-first: claim moulds for the SCARCEST new-SKU first
@@ -7249,7 +7760,7 @@ def run_rolling_pipeline(
                 _cold.append((_ip, None, _tgt))
             if _cold:
                 today_cos = list(today_cos) + _cold
-                print(f"  [Rolling] Day 1: cold-started {len(_cold)} idle press(es) "
+                _VERBOSE and print(f"  [Rolling] Day 1: cold-started {len(_cold)} idle press(es) "
                       f"{[(c[0], c[2]) for c in _cold]}")
 
         # ── Runner-Out Day-1 CO (Day 1 only) ──────────────────────────────────────
@@ -7276,8 +7787,65 @@ def run_rolling_pipeline(
                 _roco.append((_p, _psku, _tgt))
             if _roco:
                 today_cos = list(today_cos) + _roco
-                print(f"  [Rolling] Day 1: forced Runner-Out CO on {len(_roco)} press(es) "
+                _VERBOSE and print(f"  [Rolling] Day 1: forced Runner-Out CO on {len(_roco)} press(es) "
                       f"{[(c[0], c[2]) for c in _roco]}")
+
+        # ── Point 2: light forward-looking PRE-POSITIONING (REACTIVE_ONLY) ──────────
+        # Recreate the static plan's foresight from LIVE state: an UNDER-SERVED buildable SKU
+        # (running presses < presses_needed for the remaining horizon) pulls a SURPLUS press
+        # (its own SKU over-served, n-1 safe) via a proactive Day CO added to today_cos → it
+        # flows through co_press_map so building PRE-BUILDS the target's GT (building couples to
+        # the move). Need-gated on BOTH sides + buildable-checked + rate-limited → foresight
+        # without the over-firing that killed the blind surplus release. Rides the CO cap.
+        if _REACTIVE_ONLY and _RCO_PREPOS and day > 1:
+            _wdl = max(1, _working_days_left(day))
+            def _pneed(_s):
+                _r = _cure_qty_per_shift(cure_ct_map.get(_s, DEFAULT_CURING_CT)) * 3
+                _rem = demand_remaining.get(_s, 0.0)
+                return math.ceil(_rem / (_r * _wdl)) if (_r > 0 and _rem > 0) else 0
+            _cop = {str(_p) for _p, _o, _n in today_cos}
+            _run: dict = defaultdict(int)
+            for _p, _st in press_state.items():
+                if (_st.get("status") == "RUNNING" and str(_p) not in _cop
+                        and _p not in dynamic_co_tracker):
+                    _run[_st["sku"]] += 1
+            _under = sorted(                                      # under-served buildable, biggest deficit first
+                ((_pneed(_s) - _run.get(_s, 0), _s) for _s in list(demand_remaining)
+                 if demand_remaining.get(_s, 0.0) > 0 and _run.get(_s, 0) < _pneed(_s)
+                 and _buildable_rate is not None and _buildable_rate.get(_s, 0.0) > 0),
+                reverse=True)
+            _limit = min(MAX_CHANGEOVERS_PER_DAY - daily_co_count[day], _RCO_PREPOS_MAX)
+            _pp = []
+            for _deficit, _t in _under:
+                if len(_pp) >= _limit:
+                    break
+                if _run.get(_t, 0) >= _pneed(_t):
+                    continue
+                _draw = _cure_qty_per_shift(cure_ct_map.get(_t, DEFAULT_CURING_CT))
+                if _bld_capacity(_t, _bld_free_min_shift()) < _draw:   # building can feed one more
+                    continue
+                _donor = None; _dsku = None
+                for _p in sorted(press_state):                   # a SURPLUS press, n-1 safe, allowable+mountable
+                    if str(_p) in _cop or _p in dynamic_co_tracker or press_state[_p].get("status") != "RUNNING":
+                        continue
+                    _ps = press_state[_p]["sku"]
+                    if _run.get(_ps, 0) - 1 < max(1, _pneed(_ps)):
+                        continue
+                    if _t not in set(press_allow_skus.get(_p) or ()):
+                        continue
+                    if _n_free_for(_t, _p) >= 2 and _try_mount(_p, _t):
+                        _donor = _p; _dsku = _ps
+                        break
+                if _donor is not None:
+                    press_state[_donor] = {"sku": _t, "status": "RUNNING"}
+                    _pp.append((_donor, _dsku, _t))
+                    _cop.add(str(_donor))
+                    _run[_dsku] -= 1; _run[_t] = _run.get(_t, 0) + 1
+            if _pp:
+                today_cos = list(today_cos) + _pp
+                daily_co_count[day] += len(_pp)                  # reserve budget so mid-shift + R10 hold
+                _VERBOSE and print(f"  [Rolling] Day {day}: pre-positioned {len(_pp)} press(es) "
+                      f"{[(c[0], c[2]) for c in _pp]}")
 
         co_press_map: dict[str, str] = {p: ns for p, _, ns in today_cos}
         # SKUs that curing presses are switching TO today — building must pre-build for these
@@ -7487,6 +8055,13 @@ def run_rolling_pipeline(
                                if not (_a - 1 > 0 and _q > 1e-9))
                     if _exp > 0:
                         carcass_waste[_bs] += _exp
+                        day_carcass_writeoff += _exp
+                        if _exp >= 0.5:
+                            _cst = _fmt_dt(_shift_start_dt(date_str, shift))
+                            expiry_rows.append({"Machine": "—", "Date": date_str, "Shift": shift,
+                                                "SKUCode": _bs, "Qty": int(round(_exp)), "CO_Mins": 0,
+                                                "StartTime": _cst, "EndTime": _cst,
+                                                "Machine_Group": "", "CO_Type": "expired_carcass"})
                     _kept = [[_a - 1, _q] for (_a, _q) in _carcass_bank[_bs]
                              if _a - 1 > 0 and _q > 1e-9]
                     if _kept:
@@ -7537,7 +8112,16 @@ def run_rolling_pipeline(
                         return 0.0
                     _elig = [m for m in s1_sku_to_machines.get(_sku, ())
                              if _s1_inch_ok(m, _sku) and _s1cap(m) > 1e-9]
-                    if _STAGE1_CO:
+                    if _STAGE1_CO and _CV2_A2:
+                        # A2: cheapest-changeover-first — continuation 0 / same-inch 60 /
+                        # diff-inch 180 (real CO minutes), then most spare capacity, then id.
+                        def _co_min_for(_m):
+                            _p = machine_cur_carcass.get(_m, "")
+                            if _p in ("", _sku):
+                                return 0.0
+                            return float(_co_cost(_m, sku_inch.get(_p, ""), sku_inch.get(_sku, "")))
+                        _elig.sort(key=lambda m: (_co_min_for(m), -_s1cap(m), m))
+                    elif _STAGE1_CO:
                         # co-free machines (already on _sku or unused) first, then most cap
                         _elig.sort(key=lambda m: (1 if _co_units(m, _sku) > 1e-9 else 0,
                                                   -_s1cap(m), m))
@@ -7611,7 +8195,14 @@ def run_rolling_pipeline(
                             _mach_on[_ci].remove(_m); _mach_on[_best].append(_m)
 
                 # PASS 1 — cover this shift's Stage-2 need beyond bank carry-in.
-                for _gs, _gneed in sorted(_s2_desired.items(), key=lambda kv: (-kv[1], kv[0])):
+                # A1: most-constrained-SKU-first (fewest eligible Stage-1 machines) so scarce
+                # SKUs claim their machines before flexible SKUs take them; else biggest-need-first.
+                if _CV2_A1:
+                    _pass1_iter = sorted(_s2_desired.items(),
+                                         key=lambda kv: (len(s1_sku_to_machines.get(kv[0], ())), kv[0]))
+                else:
+                    _pass1_iter = sorted(_s2_desired.items(), key=lambda kv: (-kv[1], kv[0]))
+                for _gs, _gneed in _pass1_iter:
                     _short = _gneed - _bank_avail(_gs)
                     if _short > 0:
                         _gate_build(_gs, _short)
@@ -7969,6 +8560,10 @@ def run_rolling_pipeline(
                         "CO_Type":       "carcass",
                     })
 
+            # ── Part B: single reactive CO rule (once per shift, AFTER building) ──
+            if _REACTIVE_ONLY and _RCO_ARBITER:
+                _reactive_co(day, shift, cur_shift_global, date_str)
+
             # ── 4. Curing simulation ───────────────────────────────────────
             # HOLIDAY: no press cures (iterate no presses). press_state + CO/clean carries
             # are left intact → a press mid-campaign resumes the same SKU on the next
@@ -8176,23 +8771,29 @@ def run_rolling_pipeline(
                     # target is picked by the same dynamic selector (which prefers SKUs with
                     # GT on hand = feedable), and this press's STALE future planned CO is
                     # blocked (it's now committed to the new SKU).
+                    _starv_thresh = (_RCO_STARV_SHIFTS if _REACTIVE_ONLY   # point 1: fast supply-aware
+                                     else _CURING_STARV_SWITCH_SHIFTS)
                     _starv_switch = (_CURING_ADAPT_CO and not _demand_done and not _early_co
-                                     and _consec_zero_gt[press] >= _CURING_STARV_SWITCH_SHIFTS
+                                     and _consec_zero_gt[press] >= _starv_thresh
                                      and press not in co_press_map
                                      and press not in dynamic_co_tracker)
                     # Feed guard: don't switch a SKU building CAN sustain (its 0-GT run is
                     # transient — the dynamic buffer is busy elsewhere and will return),
                     # only one that is genuinely building-limited (buildable < curing draw).
-                    if (_starv_switch and _CURING_ADAPT_FEED_GUARD
+                    # Point 1 (user): under _REACTIVE_ONLY, trust REAL starvation over the
+                    # (optimistic) buildable_rate estimate — a press starved _RCO_STARV_SHIFTS
+                    # shifts IS not being fed, so let it CO to a GT-on-hand SKU. Skip the guard.
+                    if (_starv_switch and _CURING_ADAPT_FEED_GUARD and not _REACTIVE_ONLY
                             and _buildable_rate is not None
                             and _buildable_rate.get(sku, 0.0)
                                 >= press_count.get(sku, 1) * cap * 3):
                         _starv_switch = False
-                    if (((_DYNAMIC_CO_TRACKER_ENABLED and _demand_done) or _early_co
+                    if (not (_REACTIVE_ONLY and _RCO_ARBITER)   # arbiter owns all COs only under RCO_ARBITER
+                            and (((_DYNAMIC_CO_TRACKER_ENABLED and _demand_done) or _early_co
                             or _starv_switch)
                             and not _cleaned          # a just-started clean defers any CO
                             and press not in co_press_map
-                            and press not in dynamic_co_tracker):
+                            and press not in dynamic_co_tracker)):
                         _next_day_cos = {p for p, _, _ in co_by_day.get(day + 1, [])}
                         # Phase 3 pull-forward: a press blocked here (planned CO booked
                         # TOMORROW) normally idles the rest of today. With the scorer on,
@@ -8207,6 +8808,7 @@ def run_rolling_pipeline(
                             if _slots_left > 0:
                                 _horizon_left = _working_days_left(day)   # holiday-aware horizon
                                 _pf_fired = False
+                                _forced_co = False                        # P1: set if supply test bypassed
                                 if _CO_SCORER_ENABLED and _mould_gate:
                                     # Pull-forward if tomorrow's planned CO is feasible now;
                                     # else fall back to the SAME tuned dynamic selector as
@@ -8221,6 +8823,43 @@ def run_rolling_pipeline(
                                                 _pf_target, DEFAULT_CURING_CT))):
                                         _target = _pf_target
                                         _pf_fired = True
+                                    elif _REACTIVE_CO or _REACTIVE_ONLY:
+                                        # P1 / B-1 supply-gate (point 3): pick the best dynamic
+                                        # target that PASSES the building-supply test, best-first
+                                        # — re-query the selector excluding each supply-failed SKU
+                                        # so the next-best is considered. If NONE is supply-feasible,
+                                        # fire a FORCED CO on the plain best target (bypasses
+                                        # ONLY the supply test; the allowable + mould gates
+                                        # below still apply). Deterministic.
+                                        _already = set(dynamic_co_tracker[p][1]
+                                                       for p in dynamic_co_tracker)
+                                        _excl = set(_already)
+                                        _target = None
+                                        while True:
+                                            _cand = _select_dynamic_co_target(
+                                                sku, demand_remaining, press_count,
+                                                cure_ct_map, priority_score_map,
+                                                gt_inventory, _horizon_left, _excl,
+                                                priority_deadline_map=(priority_deadline_map if _prio_active else None),
+                                                day=day,
+                                            )
+                                            if _cand is None:
+                                                break
+                                            if _supply_ok(_cand, _bf):
+                                                _target = _cand
+                                                break
+                                            _excl.add(_cand)      # supply-infeasible → next-best
+                                        if _target is None:
+                                            # forced fallback — best allowable/mould target regardless of supply
+                                            _target = _select_dynamic_co_target(
+                                                sku, demand_remaining, press_count,
+                                                cure_ct_map, priority_score_map,
+                                                gt_inventory, _horizon_left, _already,
+                                                priority_deadline_map=(priority_deadline_map if _prio_active else None),
+                                                day=day,
+                                            )
+                                            if _target is not None:
+                                                _forced_co = True
                                     else:
                                         _already = set(dynamic_co_tracker[p][1]
                                                        for p in dynamic_co_tracker)
@@ -8261,14 +8900,43 @@ def run_rolling_pipeline(
                                 # back to press_to_demand_targets (always built) if press_allow_skus
                                 # is empty, so the gate never silently no-ops.
                                 if _target is not None:
-                                    _allow_p = press_allow_skus.get(press) or press_to_demand_targets.get(press)
-                                    if _allow_p and _target not in set(_allow_p):
-                                        _target = None
-                                # Mould gate: only fire the reactive CO if 2 eligible
-                                # moulds are free for the target; else keep this SKU.
+                                    if _REACTIVE_ONLY:
+                                        # STRICT (R3C): only the curing-allowable set — no
+                                        # press_to_demand_targets fallback (which is a building
+                                        # map and can contain non-curing-allowable SKUs). Empty
+                                        # allowable set → don't fire (never CO to an unallowable
+                                        # press,SKU pair).
+                                        _allow_p = press_allow_skus.get(press)
+                                        if not _allow_p or _target not in set(_allow_p):
+                                            _target = None
+                                    else:
+                                        _allow_p = press_allow_skus.get(press) or press_to_demand_targets.get(press)
+                                        if _allow_p and _target not in set(_allow_p):
+                                            _target = None
+                                # Mould gate: only fire the reactive CO if 2 eligible moulds
+                                # are free for the target. B-1 point 1: if blocked, try a
+                                # depth-1 machine-swap (free a mould from a demand-done donor)
+                                # before giving up; else keep this SKU.
                                 if _target is not None and not _try_mount(press, _target):
-                                    mould_blocked_cos += 1
-                                    _target = None
+                                    if (_REACTIVE_ONLY
+                                            and _do_swap_for(press, _target, day, shift,
+                                                             cur_shift_global, date_str)
+                                            and _try_mount(press, _target)):
+                                        pass                    # swap unblocked the original target
+                                    elif _REACTIVE_ONLY:
+                                        # retarget-on-block: the contended moulds are held by
+                                        # producing presses (swap can't free them) — instead of
+                                        # idling, pick the neediest allowable SKU this press CAN
+                                        # mount (2 free moulds) and CO there.
+                                        _rt = _pick_retarget(press)
+                                        if _rt is not None and _rt != _target and _try_mount(press, _rt):
+                                            _target = _rt
+                                        else:
+                                            mould_blocked_cos += 1
+                                            _target = None
+                                    else:
+                                        mould_blocked_cos += 1
+                                        _target = None
                                 if _target is not None and _CO_SCORER_ENABLED:
                                     if _pf_fired:
                                         # consume tomorrow's planned CO so it can't fire twice
@@ -8278,6 +8946,8 @@ def run_rolling_pipeline(
                                         daily_co_count[day + 1] = max(
                                             0, daily_co_count.get(day + 1, 0) - 1)
                                         co_scorer_stats["pullfwd"] += 1
+                                    elif _forced_co:
+                                        co_scorer_stats["forced"] += 1     # P1: supply test bypassed
                                     else:
                                         co_scorer_stats["dynamic"] += 1
                                 if _target is not None:
@@ -8299,14 +8969,19 @@ def run_rolling_pipeline(
                                     # completes or itself starves N shifts.
                                     if _CURING_ADAPT_CO:
                                         _consec_zero_gt[press] = 0
-                                        if _starv_switch:
-                                            for _fd in range(day + 1, planning_days + 1):
-                                                _cofd = co_by_day.get(_fd)
-                                                if _cofd and any(p == press for (p, _o, _n) in _cofd):
-                                                    co_by_day[_fd] = [
-                                                        (p, o, n) for (p, o, n) in _cofd if p != press]
-                                                    daily_co_count[_fd] = max(
-                                                        0, daily_co_count.get(_fd, 0) - 1)
+                                    # Item 3: wipe this press's STALE future planned COs (booked
+                                    # against its OLD sku). Baseline = starv-switch only (under
+                                    # _CURING_ADAPT_CO); HYBRID_CO_CANCEL makes it comprehensive for
+                                    # ANY dynamic CO. Presence-guarded → idempotent (pull-forward
+                                    # already removed day+1).
+                                    if _HYBRID_CO_CANCEL or (_CURING_ADAPT_CO and _starv_switch):
+                                        for _fd in range(day + 1, planning_days + 1):
+                                            _cofd = co_by_day.get(_fd)
+                                            if _cofd and any(p == press for (p, _o, _n) in _cofd):
+                                                co_by_day[_fd] = [
+                                                    (p, o, n) for (p, o, n) in _cofd if p != press]
+                                                daily_co_count[_fd] = max(
+                                                    0, daily_co_count.get(_fd, 0) - 1)
                                     _co_here = max(0.0, min(float(CURING_CO_CHANGEOVER_MINS),
                                                             _avail - prod_mins))
                                     press_stats[press]["co_mins"] += _co_here
@@ -8328,7 +9003,8 @@ def run_rolling_pipeline(
                                         "CO_Type":    "Early-CO" if (_early_co and not _demand_done) else "Dynamic",
                                     })
                                     print(
-                                        f"    [DynCO] Day {day} Shift {shift}: "
+                                        f"    [DynCO{'/FORCED' if _forced_co else ''}] "
+                                        f"Day {day} Shift {shift}: "
                                         f"press {press} {sku}→{_target} "
                                         f"(slot {MAX_CHANGEOVERS_PER_DAY - _slots_left + 1}"
                                         f"/{MAX_CHANGEOVERS_PER_DAY})"
@@ -8435,7 +9111,7 @@ def run_rolling_pipeline(
             new_pool.extend(replacements[:slots])
             machine_pool[machine] = new_pool
             if finished:
-                print(f"    [Pool] Day {day}: machine {machine} dropped {finished}, "
+                _VERBOSE and print(f"    [Pool] Day {day}: machine {machine} dropped {finished}, "
                       f"added {replacements[:slots]}")
 
         # ── 6. GT shelf-life writeoff — now done at DAY START via _gt_expire_lots
@@ -8498,13 +9174,14 @@ def run_rolling_pipeline(
         dem_met    = total_demand - sum(max(0, v) for v in demand_remaining.values())
         cov        = dem_met / total_demand * 100 if total_demand > 0 else 0
         if day % 5 == 0 or day == 1 or day == planning_days:
-            print(f"  Day {day:2d} | built {d_gt_built:6,.0f} | cured {d_cured:6,.0f} | "
+            _VERBOSE and print(f"  Day {day:2d} | built {d_gt_built:6,.0f} | cured {d_cured:6,.0f} | "
                   f"presses {n_active} | COs {len(today_cos)} | "
                   f"writeoff {day_writeoff:,.0f} | coverage {cov:.1f}%")
         daily_summary.append({
             "Day": day, "Date": date_str, "Holiday": bool(_holiday),
             "GT_Built": int(round(d_gt_built)), "GT_Cured": int(round(d_cured)),
             "GT_Writeoff": int(round(day_writeoff)),
+            "Carcass_Writeoff": int(round(day_carcass_writeoff)),
             "EndDay_GT_Inventory": int(round(endday_gt_inv)),
             "Active_Presses": n_active, "COs_Today": len(today_cos),
             "Demand_Coverage": round(cov, 2),
@@ -8551,7 +9228,11 @@ def run_rolling_pipeline(
     # Curing CO breakdown (planned schedule + reactive dynamic) and mould cleans.
     _n_co_planned = sum(1 for e in cure_co_events if e.get("CO_Type") == "Planned")
     _n_co_dynamic = sum(1 for e in cure_co_events if e.get("CO_Type") in ("Dynamic", "Early-CO"))
-    _n_co_total   = _n_co_planned + _n_co_dynamic
+    # Cold-start COs (Day-1 IDLE_PRESS_ACTIVATE) ARE charged a full 480-min changeover shift,
+    # so they must be COUNTED too — else the CO count (303) and the utilization CO-minutes
+    # (306×480) disagree. Including them makes count == minutes/480.
+    _n_co_cold    = sum(1 for e in cure_co_events if e.get("CO_Type") == "Cold-Start")
+    _n_co_total   = _n_co_planned + _n_co_dynamic + _n_co_cold
     # One event per clean trigger = the authoritative clean count (matches the
     # Changeover Plan sheet exactly). Cross-checked against total clean-minutes/480.
     _n_mould_cleans = len(mould_clean_events)
@@ -8577,10 +9258,12 @@ def run_rolling_pipeline(
         _ci = sorted(_d["ceil_by_inch"].items(), key=lambda z: -z[1])[:6]
         print(f"    recoverable by inch : " + "  ".join(f"{k}:{v:,.0f}" for k, v in _ri))
         print(f"    ceiling by inch     : " + "  ".join(f"{k}:{v:,.0f}" for k, v in _ci))
-    print(f"  GT written off       : {writeoff_total:>10,.0f}")
+    print(f"  Expired GT           : {writeoff_total:>10,.0f}")
+    print(f"  Expired carcass      : {sum(carcass_waste.values()):>10,.0f}")
     print(f"  Starvation events    : {starvation_n:>10,}")
     print(f"  Curing COs (total)   : {_n_co_total:>10,}"
-          f"  (planned {_n_co_planned:,} + dynamic {_n_co_dynamic:,})")
+          f"  (planned {_n_co_planned:,} + dynamic {_n_co_dynamic:,}"
+          + (f" + cold-start {_n_co_cold:,}" if _n_co_cold else "") + ")")
     print(f"  Mould cleans taken   : {_n_mould_cleans:>10,}  "
           f"(events={_n_mould_cleans}, by-minutes={_n_cleans_by_mins}; "
           f"clean {'ON' if _MOULD_CLEAN_ENABLED else 'OFF'})")
@@ -8598,10 +9281,12 @@ def run_rolling_pipeline(
         print(f"  Inch leave-gate [deficit-done, dwell-pass, dwell-BLOCK]: {_INCH_DBG}")
     if _CO_SCORER_ENABLED:
         _cs = co_scorer_stats
+        _forced_txt = f" forced={_cs['forced']}" if _REACTIVE_CO else ""
         print(f"  CO scorer ({'FULL' if _SCORER_FULL_REOPT else 'ADD'}) : "
               f"planned={_cs['planned']} pullfwd={_cs['pullfwd']} "
               f"retarget={_cs['retarget']} dynamic={_cs['dynamic']} "
-              f"cancelled={_cs['cancelled']} build_blocked={_cs['build_blocked']}")
+              f"cancelled={_cs['cancelled']} build_blocked={_cs['build_blocked']}"
+              f"{_forced_txt}")
     if _MOULD_GLOBAL_OPT_ENABLED:
         print(f"  Global mould opt ({_MOULD_GLOBAL_OPT_MODE}): "
               f"direct-add={mould_global_stats['add']} "
@@ -8687,6 +9372,47 @@ def run_rolling_pipeline(
                 _s2_gt_per_sku[_s] += r["Qty"]
                 _day = int(str(r["Date"]).split("-")[-1])
                 _s2_gt_consume[_s].append((_day, _SORD_C.get(r.get("Shift"), 0), float(r["Qty"])))
+        # A4: global per-SKU carcass->Stage-2 FIFO reconcile (1 calendar-day aging). Caps
+        # Stage-2 GT carcass can't back + drops aged carcass, then cascades to cured. Only
+        # reduces. Makes R5/R9C pass by construction; coverage drops by design.
+        if _CV2_A4:
+            _a4_red_sku, _a4_red_day = _fifo_reconcile_greedy(
+                (opening_carcass if _CARCASS_INV_ENABLED else {}),
+                bld_shift_rows, dict(_s2_gt_consume), _s1_prod_log, _SORD_C)
+            if _a4_red_sku:
+                _s2_gt_per_sku = defaultdict(float); _s2_gt_consume = defaultdict(list)
+                for r in bld_shift_rows:
+                    if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
+                            and (r.get("Qty", 0) or 0) > 0):
+                        _s = str(r["SKUCode"]); _s2_gt_per_sku[_s] += r["Qty"]
+                        _day = int(str(r["Date"]).split("-")[-1])
+                        _s2_gt_consume[_s].append((_day, _SORD_C.get(r.get("Shift"), 0), float(r["Qty"])))
+                _cured_cut_day: dict = defaultdict(float)
+                for _s in sorted(_a4_red_sku):
+                    _avail = _s2_gt_per_sku.get(_s, 0.0) + float(opening_gt.get(_s, 0.0))
+                    _exc = sku_cured.get(_s, 0.0) - _avail
+                    for _cr in sorted((r for r in cure_shift_rows
+                                       if str(r.get("SKUCode")) == _s and (r.get("Qty", 0) or 0) > 0),
+                                      key=lambda x: (str(x["Date"]), _SORD_C.get(x.get("Shift"), 0)),
+                                      reverse=True):
+                        if _exc <= 0.5:
+                            break
+                        _q = float(_cr.get("Qty", 0.0)); _t = min(_q, _exc)
+                        _cr["Qty"] = int(round(_q - _t)); _exc -= _t
+                        _cured_cut_day[str(_cr["Date"])] += _t
+                        sku_cured[_s] = max(0.0, sku_cured.get(_s, 0.0) - _t)
+                        daily_cured[str(_cr["Date"])] = max(0.0, daily_cured.get(str(_cr["Date"]), 0.0) - _t)
+                        demand_remaining[_s] = demand_remaining.get(_s, 0.0) + _t
+                for _r in daily_summary:
+                    _r["GT_Built"] = int(round(_r["GT_Built"] - _a4_red_day.get(_r["Date"], 0.0)))
+                    _r["GT_Cured"] = int(round(_r["GT_Cured"] - _cured_cut_day.get(_r["Date"], 0.0)))
+                total_built = sum(r["GT_Built"] for r in daily_summary)
+                total_cured = sum(r["GT_Cured"] for r in daily_summary)
+                dem_met   = total_demand - sum(max(0, v) for v in demand_remaining.values())
+                final_cov = dem_met / total_demand * 100 if total_demand > 0 else 0
+                print(f"  [A4 reconcile] Stage-2 GT capped {sum(_a4_red_sku.values()):,.0f} "
+                      f"over {len(_a4_red_sku)} SKU(s); cured cascade "
+                      f"{sum(_cured_cut_day.values()):,.0f} -> coverage {final_cov:.2f}%")
         _carc_rows, _carc_rep, _carc_co = _stage1_carcass_rows_co(
             _s1_prod_log, dict(_s2_gt_per_sku), sku_inch,
             opening_carcass=(opening_carcass if _CARCASS_INV_ENABLED else None),
@@ -8752,7 +9478,7 @@ def run_rolling_pipeline(
         demand_dict    = demand_dict,
         planning_days  = planning_days,
         working_days   = _working_days_count(plan_start, planning_days),  # holiday-adjusted util denom
-        n_curing_cos   = len(co_events),
+        n_curing_cos   = _n_co_total,  # ACTUAL executed COs (planned+dynamic). co_events is the stale pre-computed plan — defer/pull-forward change the real count.
         endday_gt_by_date = {r["Date"]: r["EndDay_GT_Inventory"] for r in daily_summary},
         cure_ct_map    = cure_ct_map,
         curing_allowable = dict(curing_allowable),
@@ -8760,6 +9486,7 @@ def run_rolling_pipeline(
                           if _sku_moulds else None),
         gt_waste_map      = dict(writeoff_cum),
         carcass_waste_map = dict(carcass_waste),
+        expiry_rows       = expiry_rows,
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,
@@ -8809,7 +9536,8 @@ def run_rolling_pipeline(
     return {
         "total_built":       total_built,
         "total_cured":       total_cured,
-        "gt_writeoff":       writeoff_total,
+        "gt_writeoff":       writeoff_total,             # expired GT (aged out)
+        "carcass_writeoff":  sum(carcass_waste.values()),  # expired carcass (aged out)
         "starvation_events": starvation_n,
         "demand_coverage":   final_cov,
         "demand_remaining":  demand_remaining,

@@ -225,7 +225,16 @@ _SAME_INCH_RANK  = os.environ.get("SAME_INCH_RANK", "safe")   # "safe" | "top"
 # Confirms the July gap is building/mould CAPACITY, not CO mis-prioritization (only ~4.5k July was
 # ever curing-side recoverable). Env PERSKU_FEED=1 to re-enable for experiments.
 _PERSKU_FEED = os.environ.get("PERSKU_FEED", "0") != "0"
-
+# PERSKU_FEED_V2 — the BETTER per-SKU feasibility model. The v1 above split a shared machine
+# PROPORTIONAL to draw (too pessimistic → over-blocked, −21k). v2 uses DEFICIT-FIRST allocation:
+# contending SKUs (most-constrained = fewest eligible machines first) claim their required draw,
+# preferring machines OUTSIDE the target's set — so a flexible SKU is served elsewhere and only a
+# CAPTIVE SKU consumes the target's machines. The target's feasible draw is then the residual on
+# its machines. Blocks only GENUINELY infeasible COs. Default OFF; PERSKU_FEED_V2=1 enables.
+# MEASURED (ADOPT): fixes the v1 −21k bug — Jul +7,747 alone (679,904), and as part of the
+# adopted 1+2 config lifts Jun/Aug most. Validated the thesis that a CORRECT building-aware
+# gate improves KPIs (the v1 regression was the proportional model, not the idea).
+_PERSKU_FEED_V2 = True
 _NAVY  = "1F3864"
 _WHITE = "FFFFFF"
 _BLUE  = "D6E4F0"
@@ -489,7 +498,7 @@ class COScheduler:
         # currently drawing it, weighted by draw. Floored at one full machine's GT/day (building
         # can dedicate a machine to a target) so it can only ever TIGHTEN below the static sum for
         # a genuinely contended SKU, never over-block. OFF / no ctx → the static rate (bit-for-bit).
-        _perSKU_feed_on = _PERSKU_FEED and bool(feed_ctx) and bool(_sku_inch)
+        _perSKU_feed_on = (_PERSKU_FEED or _PERSKU_FEED_V2) and bool(feed_ctx) and bool(_sku_inch)
         _feed_sm = (feed_ctx or {}).get("sku_machines", {})
         _feed_ms = (feed_ctx or {}).get("machine_skus", {})
         _feed_gt = (feed_ctx or {}).get("machine_gtday", {})
@@ -498,16 +507,60 @@ class COScheduler:
             _static = buildable_rate.get(target) if buildable_rate is not None else None
             if not _perSKU_feed_on:
                 return _static
-            _ms = _feed_sm.get(str(target))
+            _tgt = str(target)
+            _ms = _feed_sm.get(_tgt)
             if not _ms:
                 return _static
             _newdraw = (n_t + 1) * rate_t                    # target's draw WITH the added press
             _dctm = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+
+            if _PERSKU_FEED_V2:
+                # DEFICIT-FIRST feasibility. Contending SKUs (most-constrained = fewest eligible
+                # machines first) claim their REQUIRED draw, preferring machines OUTSIDE the
+                # target's set (a flexible SKU is served elsewhere; only a captive SKU consumes
+                # target's machines). Target's feasible = residual capacity on its machines.
+                _tset = set(_ms)
+                _others = []                                 # (n_elig, sku, req, machines)
+                _seen = set()
+                for _m in _ms:
+                    for _s in _feed_ms.get(_m, ()):
+                        if _s == _tgt or _s in _seen:
+                            continue
+                        _seen.add(_s)
+                        _ns = press_count.get(_s, 0)
+                        if _ns <= 0:
+                            continue
+                        _sm = list(_feed_sm.get(_s) or ())
+                        if _sm:
+                            _others.append((len(_sm), _s,
+                                            _ns * _qty_per_press_per_day(ct_map.get(_s, _dctm)), _sm))
+                # residual capacity over EVERY machine any contender (or target) can use
+                _residual = {}
+                for _m in _ms:
+                    _residual[_m] = _feed_gt.get(_m, 0.0)
+                for (_nm, _s, _req, _sm) in _others:
+                    for _m in _sm:
+                        _residual.setdefault(_m, _feed_gt.get(_m, 0.0))
+                _others.sort(key=lambda x: (x[0], x[1]))     # most-constrained first, deterministic
+                for (_nm, _s, _req, _sm) in _others:
+                    _order = sorted(_sm, key=lambda m: (m in _tset, m))   # outside-target machines first
+                    _left = _req
+                    for _m in _order:
+                        if _left <= 0:
+                            break
+                        _take = min(_residual.get(_m, 0.0), _left)
+                        _residual[_m] -= _take
+                        _left -= _take
+                _feasible = min(_newdraw, sum(_residual.get(_m, 0.0) for _m in _ms))
+                _floor = max((_feed_gt.get(_m, 0.0) for _m in _ms), default=0.0)
+                return max(_feasible, _floor)
+
+            # v1 (proportional-to-draw — retained for A/B; documented net −21k)
             feasible = 0.0
             for _m in _ms:
                 _tot = 0.0                                   # total same-inch draw contending for _m
                 for _s in _feed_ms.get(_m, ()):
-                    if _s == str(target):
+                    if _s == _tgt:
                         _tot += _newdraw
                     else:
                         _ns = press_count.get(_s, 0)
@@ -1838,6 +1891,7 @@ def run_dynamic_consumption(
     building_inch_capacity: dict | None = None,
     feed_ctx: dict | None = None,                # PERSKU_FEED: {sku_machines, machine_skus, machine_gtday}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
+    reactive_only: bool = False,                 # Part B: skip planned schedule + CC workbook, keep ETL
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -1863,7 +1917,7 @@ def run_dynamic_consumption(
         output_path = DYNAMIC_CC_OUTPUT
 
     print("\n" + "=" * 70)
-    print("  B2C Phase 0 Extended — 31-Day Dynamic Curing Consumption (May)")
+    print(f"  B2C Phase 0 Extended — {planning_days}-Day Dynamic Curing Consumption and CO plan")
     print("=" * 70)
     print(f"  Demand file : {os.path.basename(demand_path)}")
     print(f"  Plan start  : {plan_start.strftime('%d-%b-%Y')} | Days: {planning_days}")
@@ -1982,6 +2036,17 @@ def run_dynamic_consumption(
         print(f"  [Day0] Added {len(ro_rows)} Runner-Out SKUs | "
               f"Total rows: {len(df_day0)} "
               f"({n_demand_raw} demand + {len(ro_rows)} non-demand CO candidates)")
+
+    # Part B (REACTIVE_ONLY): the single reactive CO arbiter replaces the planned schedule
+    # entirely — skip Pass 1 (COScheduler), Pass 2 (DaySimulator) and the
+    # curing_consumption_*.xlsx export. df_day0 + ct_map (+ df_excluded) are already built
+    # by the Day-0 ETL/classify above and are all the rolling pipeline needs.
+    if reactive_only:
+        print("  [reactive_only] planned CO schedule + consumption workbook SKIPPED")
+        return {
+            "daily_sheets": [], "co_events": [],
+            "ct_map": ct_map, "df_day0": df_day0, "df_excluded": df_excluded,
+        }
 
     # Pass 1: CO schedule
     print("\n  [Pass 1] Computing CO schedule …")

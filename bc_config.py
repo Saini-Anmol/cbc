@@ -83,7 +83,10 @@ DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_correct_plan.xlsx")
 # Toggle OFF (or env BLD_CT_FILE=0) reproduces the fixed-per-machine-CT plan
 # bit-for-bit. See b2c_pipeline._bld_ct_sec / _load_bld_ct_file.
 BLD_CT_FILE_ENABLED = True
-BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.csv")
+# CORRECT building-CT source (per-(SKU,machine) sec/unit). Loader reads .xlsx or .csv by
+# extension (b2c_pipeline._load_bld_ct_file). The old *_Cycle_time_Building.csv variants are
+# retired — this xlsx is the single authoritative CT file.
+BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.xlsx")
 
 # ── Per-machine dominant-inch ranking file (inch-locking source) ─────────────
 # When DOMINANT_INCH_FILE_ENABLED, each building machine's dominant inch AND its

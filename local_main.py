@@ -10,6 +10,24 @@ same inputs.
 """
 from __future__ import annotations
 
+import os as _os
+# ── ADOPTED config — HYBRID CO (planned COScheduler + reactive layer) ──────────
+# `python local_main.py` runs the HYBRID engine (the well-tested baseline; benefits from
+# the end-of-horizon "+1 planning-day" boost). The pure-reactive Part-B engine is retained
+# and can be turned on for A/B with the env vars below (REACTIVE_ONLY=1 + optional sub-toggles):
+#   REACTIVE_ONLY=1   pure-reactive (no planned COs) + all levers (retarget-on-block,
+#                     feed-guard relax, supply-gate, machine-swap, starvation switch, pre-position)
+#   RCO_ARBITER=0     mid-shift base (best timing) | 1 = once-per-shift arbiter
+#   RCO_STARV_SHIFTS=4  supply-aware starvation switch after N 0-GT shifts
+#   RCO_PREPOS=1 / RCO_PREPOS_MAX=4   forward-looking pre-positioning
+# setdefault → an explicit env override still wins for A/B.
+_os.environ.setdefault("REACTIVE_ONLY", "0")     # HYBRID CO (default). Set 1 for pure-reactive.
+# ADOPTED hybrid planned-CO fixes (items 1+2): defer-not-preempt + deficit-first building
+# supply. +29,836 / 3 months, feasibility-clean. Item 3 (HYBRID_CO_CANCEL) and item 4
+# (CURING_ADAPT_CO) are OFF (non-additive / no-op). Env overrides still win.
+_os.environ.setdefault("HYBRID_CO_DEFER", "1")   # item 2 — defer a fulfillable, needed SKU's CO
+_os.environ.setdefault("PERSKU_FEED_V2", "1")    # item 1 — deficit-first per-SKU building supply
+
 import bc_config
 from b2c_pipeline import run_rolling_pipeline
 

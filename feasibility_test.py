@@ -23,7 +23,7 @@ Exit code 1 if any rule FAILs, else 0.
 HARD BUSINESS RULES VALIDATED (exactly as agreed with the plant planner)
 ================================================================================
 R1.  CYCLE TIMES.
-       - BUILDING CT is taken ONLY from data/input/Cycle_time_Building.csv,
+       - BUILDING CT is taken ONLY from data/input/Cycle_time_Building.xlsx,
          per (SKU Code, machine), in seconds/unit. NO 94% efficiency divisor on
          building. A built (SKU,machine) pair with no CSV entry is a FAIL
          (missing-source), never silently defaulted.
@@ -135,7 +135,7 @@ CONFIG = {
     "building":      "data/output/main_output/bc_building_schedule_2026-07-01.xlsx",
     "curing":        "data/output/main_output/bc_curing_b2c_2026-07-01.xlsx",
     "demand":        "data/input/july_correct_plan.xlsx",   # None → bc_config.DEMAND_FILE
-    "bld_ct_file":   None,                                   # None → bc_config.BLD_CT_FILE (Cycle_time_Building.csv)
+    "bld_ct_file":   None,                                   # None → bc_config.BLD_CT_FILE (Cycle_time_Building.xlsx)
     # ── MONTH / HORIZON ─────────────────────────────────────────────────────────
     "plan_month":    "2026-07",     # YYYY-MM — DB plan_month (moulds / opening GT / running-moulds)
     "plan_start":    "2026-07-01",  # YYYY-MM-DD — anchors the aging / horizon clock
@@ -271,8 +271,9 @@ def load_sources():
 
     # building CT from the CSV ONLY (R1) — per (SKU Code, machine), seconds. No 0.94.
     def _bld_ct_csv():
-        path = ARGS.bld_ct_file or getattr(bc, "BLD_CT_FILE", os.path.join("data", "input", "Cycle_time_Building.csv"))
-        df = pd.read_csv(path, dtype=str)
+        path = ARGS.bld_ct_file or getattr(bc, "BLD_CT_FILE", os.path.join("data", "input", "Cycle_time_Building.xlsx"))
+        df = (pd.read_excel(path, dtype=str) if str(path).lower().endswith((".xlsx", ".xls"))
+              else pd.read_csv(path, dtype=str))
         if "SKU Code" not in df.columns:
             raise ValueError(f"'SKU Code' column missing in {path}")
         mach_cols = [c for c in df.columns[2:]]
@@ -567,6 +568,11 @@ def parse_building(path):
         if not m or m.lower() in ("nan", "none") or "total" in m.lower() or "average" in m.lower():
             continue
         cotype = str(r.get("CO_Type", "")).strip()
+        # Expired GT / carcass are WASTE display markers (Machine "—", CO_Mins 0), NOT
+        # production or changeovers — skip entirely so they never count toward build/CO/
+        # shift-minute rules (R5/R8/R10/R11/R18).
+        if cotype in ("expired_GT", "expired_carcass"):
+            continue
         qty = num(r.get("Qty"))
         co = num(r.get("CO_Mins"))
         rows.append({
@@ -669,7 +675,7 @@ def r13_curing_roster(cur):
 def r1_r18_building_ct(bld):
     ctmap = SRC.get("bld_ct")
     if ctmap is None:
-        rule_result("R1B", "Building CT sourced from Cycle_time_Building.csv (no 0.94)", 0,
+        rule_result("R1B", "Building CT sourced from Cycle_time_Building.xlsx (no 0.94)", 0,
                     skipped_reason="building CT CSV not loaded")
         rule_result("R18B", "Building Production_Mins = Qty x CT_sec/60", 0,
                     skipped_reason="building CT CSV not loaded")
@@ -681,7 +687,7 @@ def r1_r18_building_ct(bld):
         n += 1
         ct = ctmap.get((r["sku"], r["machine"]))
         if ct is None:
-            add("R1B", "no building CT in Cycle_time_Building.csv for this (SKU,machine)",
+            add("R1B", "no building CT in Cycle_time_Building.xlsx for this (SKU,machine)",
                 r["date"], r["shift"], r["machine"], r["sku"], r["qty"],
                 expected="CSV CT (sec)", actual="MISSING")
             continue
@@ -693,7 +699,7 @@ def r1_r18_building_ct(bld):
             add("R18B", "Qty x CT_sec/60 does not match the row's time span (CT/qty reconciliation)",
                 r["date"], r["shift"], r["machine"], r["sku"], r["qty"], round(ct, 1),
                 round(prod, 1), expected=f"span {round(dur, 1)} min", actual=round(prod, 1))
-    rule_result("R1B", "Building CT sourced from Cycle_time_Building.csv (no 0.94)", n)
+    rule_result("R1B", "Building CT sourced from Cycle_time_Building.xlsx (no 0.94)", n)
     rule_result("R18B", "Building Prod_Mins = Qty x CT_sec/60 matches time span", n)
 
 

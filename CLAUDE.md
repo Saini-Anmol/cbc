@@ -786,7 +786,7 @@ Machines not certified for any current-demand Stage-2 SKU show 0% — correct be
 | [app.py](app.py) | **Flask API** — `POST /app/v1/jkt/planning-scheduling/plan/generate-plan {plan_id}`, `GET /health`. Synchronous. |
 | [approach/deployment.md](approach/deployment.md) | Deployment spec — DB contract, config mapping, phases, parity-gate results. |
 | [requirements.txt](requirements.txt) | Pinned runtime deps (Flask, SQLAlchemy, PyMySQL, pandas, numpy, scipy, openpyxl). |
-| [Dockerfile](Dockerfile) / [.dockerignore](.dockerignore) | linux/amd64 image (gunicorn, port 5001). **`.dockerignore` MUST re-include 3 engine reference files** (`data/input/Cycle_time_Building.csv`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `machine_inch_dominant_4months_Apr-Jul.xlsx`) — read from the filesystem every run; without them the cloud engine silently falls back and diverges from local. Secrets injected at runtime (`--env-file .env`, never baked). Published: `anmolsaini07/jkt-btp-planning:v2` (+ `:latest`), ~145 MB. |
+| [Dockerfile](Dockerfile) / [.dockerignore](.dockerignore) | linux/amd64 image (gunicorn, port 5001). **`.dockerignore` MUST re-include 3 engine reference files** (`data/input/Cycle_time_Building.xlsx`, `data/analysis_aug/machine_inch_dominant_aug.xlsx`, `machine_inch_dominant_4months_Apr-Jul.xlsx`) — read from the filesystem every run; without them the cloud engine silently falls back and diverges from local. Secrets injected at runtime (`--env-file .env`, never baked). Published: `anmolsaini07/jkt-btp-planning:v2` (+ `:latest`), ~145 MB. |
 
 ---
 
