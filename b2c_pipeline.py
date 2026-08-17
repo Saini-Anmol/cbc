@@ -653,6 +653,29 @@ _HYBRID_CO_CANCEL = (os.environ.get("HYBRID_CO_CANCEL", "0") != "0")
 # is NOT surplus. The single biggest lever (Jul +14,137). Pair with PERSKU_FEED_V2.
 _HYBRID_CO_DEFER = True
 
+# ── Holiday fix #1: NO new curing CO fires on a plant holiday (decision: no setup-crew
+# starts a NEW changeover on the idle day; only in-flight COs/cleans finish). Every CO the
+# plan placed on a holiday is DEFERRED to the next WORKING day that still has CO budget; if
+# none remain (month-end) it is dropped. Makes planned/dynamic/scorer COs match the reactive
+# guard (_reactive_co already returns on a holiday). INERT when PLANT_HOLIDAYS is empty →
+# no-holiday runs are bit-for-bit identical. HOLIDAY_CO_DEFER=0 reproduces the old behavior
+# (planned COs fire on the holiday). ──
+_HOLIDAY_CO_DEFER = (os.environ.get("HOLIDAY_CO_DEFER", "1") != "0")
+
+# ── Holiday fix #2/#3: make BUILDING holiday-aware. Both default OFF (env-gated) + inert when
+# PLANT_HOLIDAYS is empty → double-layer bit-for-bit parity.
+#  #2 NO-PERISH (avoid waste): don't pre-build perishable stock that will just age out over an
+#     upcoming holiday — cap the carcass PASS-2 lead + the GT forward-buffer window to the WORKING
+#     shifts actually reachable before the holiday. Only ever SHRINKS a build target → no overbuild.
+#  #3 BRIDGE: pre-build EXTRA GT before a holiday so presses run full-rate on the first post-holiday
+#     shift. MEASURED NO-OP (July, all 3 holiday scenarios byte-identical with/without it): the
+#     existing 9-shift forward-buffer already pre-builds enough to bridge a 1-2 day holiday, and a
+#     ≥3-day holiday is shelf-blocked — so no gap is left for a separate bridge lever. Kept OFF +
+#     documented (like FIXED_ESCAPE / global-mould-opt). #2 is ADOPTED ON: cuts pre-holiday carcass
+#     writeoff ~0.9-1.4k, cured-neutral, feasibility-clean, and no-holiday runs stay bit-for-bit.
+_HOLIDAY_NO_PERISH = (os.environ.get("HOLIDAY_NO_PERISH_PREBUILD", "1") != "0")
+_HOLIDAY_BRIDGE    = (os.environ.get("HOLIDAY_BRIDGE_BUILD",       "0") != "0")
+
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
     "7001":51.6,  "7002":52.6,  "7003":56.0,  "7004":53.0,
@@ -3043,6 +3066,8 @@ def _assign_building_shift(
     lookahead_draw: dict | None = None,          # LOOKAHEAD_BUF: {sku: anticipated peak draw today}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
     writeoff_cum: dict | None = None,            # R8B: cumulative expired GT per SKU (cap tightener)
+    fwd_work_shifts: int | None = None,          # #2 NO-PERISH: working shifts inside the GT shelf window (None → full 9)
+    bridge_shifts: int = 0,                      # #3 BRIDGE: consecutive holiday shifts imminent (0 → no bridge)
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -3944,7 +3969,10 @@ def _assign_building_shift(
                         _prio_behind = (_prio_on_bld and _pdm_bld.get(sku) is not None
                                         and (demand_remaining.get(sku, 0.0)
                                              - projected_gt.get(sku, 0.0)) > 0)
-                        if (not _bld_limited and not _prio_behind
+                        # #3 BRIDGE: a bridgeable holiday is imminent → bank this live-draw SKU's
+                        # GT ahead (bypass the starvation-risk gate exactly like _prio_behind).
+                        _bridge_need = (_HOLIDAY_BRIDGE and bridge_shifts > 0)
+                        if (not _bld_limited and not _prio_behind and not _bridge_need
                                 and (not _IDLE_UNMET_ENABLED or _IDLE_UNMET_KEEP_GATE)
                                 and _FWD_RISK_SHIFTS > 0
                                 and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
@@ -3994,7 +4022,16 @@ def _assign_building_shift(
                         # plant-like same-day pull) instead of the full 9-shift shelf window. OFF → 9.
                         _fwd_shifts = (min(GT_SHELF_LIFE_SHIFTS, PACING_SHIFTS)
                                        if _PACING_ENABLED else GT_SHELF_LIFE_SHIFTS)
-                        target = min(dr, draw * _fwd_shifts)
+                        # #2 NO-PERISH: cap the forward window to the WORKING shifts reachable before
+                        # a holiday (holiday shifts cure nothing → GT built for them would age out).
+                        # None → full 9-shift shelf (bit-for-bit).
+                        if _HOLIDAY_NO_PERISH and fwd_work_shifts is not None:
+                            _fwd_shifts = min(_fwd_shifts, fwd_work_shifts)
+                        # #3 BRIDGE: raise the floor to cover the holiday + first post-holiday shift so
+                        # presses keep feeding through the idle day (shelf-safe holidays only; the call
+                        # site zeroes bridge_shifts when the holiday is too long for the 3-day shelf).
+                        _floor_shifts = (bridge_shifts + 1) if _bridge_need else 0
+                        target = min(dr, draw * max(_fwd_shifts, _floor_shifts))
                         room = target - projected_gt.get(sku, 0.0) - _woc.get(sku, 0.0)
                         if room <= 0:
                             continue
@@ -4596,6 +4633,7 @@ def _write_rolling_building_excel(
     gt_waste_map: "dict | None" = None,       # {sku: expired GT units}  → "expired GT/carcass" col
     carcass_waste_map: "dict | None" = None,  # {sku: expired carcass units}
     expiry_rows: "list | None" = None,        # per-(day,shift,SKU) expired GT/carcass display rows
+    holiday_dates: "set | None" = None,       # #4: plant-holiday date strings → Holiday flag + idle-day rows
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -4750,20 +4788,32 @@ def _write_rolling_building_excel(
     # EndDay_GT_Inventory: total GT held overnight (all SKUs, after curing + writeoff)
     # — audits the MAX_ENDOFDAY_GT_INVENTORY plant cap directly in the sheet.
     _eod = endday_gt_by_date or {}
-    daily_cols = ["Date", "GT_Produced", "Carcass_Produced", "Expired_GT", "Expired_Carcass",
+    # #4 Holiday reporting: a plant holiday builds/cures nothing, so it has NO production rows and
+    # was previously MISSING from this sheet entirely (GT inventory carried but was invisible). Add
+    # a Holiday flag column and force a row for every holiday date so the idle day, its carried GT,
+    # and any GT/carcass that aged out DURING the holiday are all visible in day/shift context.
+    _hol_set = set(holiday_dates or [])
+    _all_dates = sorted(set(daily_agg.keys()) | _hol_set)
+    daily_cols = ["Date", "Holiday", "GT_Produced", "Carcass_Produced", "Expired_GT", "Expired_Carcass",
                   "Total_Units", "Active_SKUs", "Cumulative_GT", "EndDay_GT_Inventory"]
     _xl_header(ws_daily, 1, daily_cols)
     cum_gt = 0
-    for ri, (date, v) in enumerate(sorted(daily_agg.items()), 2):
+    for ri, date in enumerate(_all_dates, 2):
+        v = daily_agg.get(date, {"GT_Produced": 0, "Carcass_Produced": 0,
+                                 "Total_Units": 0, "Active_SKUs": set()})
+        _is_hol = date in _hol_set
         cum_gt += v["GT_Produced"]
-        vals = [date, v["GT_Produced"], v["Carcass_Produced"],
+        vals = [date, ("Y" if _is_hol else ""), v["GT_Produced"], v["Carcass_Produced"],
                 exp_by_day[date]["GT"], exp_by_day[date]["Carcass"],
                 v["Total_Units"], len(v["Active_SKUs"]), cum_gt,
                 int(round(_eod.get(date, 0)))]
         for ci, val in enumerate(vals, 1):
-            ws_daily.cell(row=ri, column=ci, value=val).alignment = _ctr()
+            cell = ws_daily.cell(row=ri, column=ci, value=val)
+            cell.alignment = _ctr()
+            if _is_hol:
+                cell.fill = _fill(_GREY)
     ws_daily.column_dimensions["A"].width = 14
-    for ltr in "BCDEFGHI":
+    for ltr in "BCDEFGHIJ":
         ws_daily.column_dimensions[ltr].width = 16
 
     # ── Sheet 6: Demand Fulfillment (B2C) ─────────────────────────────────────
@@ -5826,6 +5876,22 @@ def run_rolling_pipeline(
     planning_days = planning_days or PLANNING_DAYS
     build_output  = build_output  or BUILD_OUTPUT
     curing_output = curing_output or CURING_OUTPUT
+    # #5 robustness: THIS run's plan_start is the single source of truth for the holiday
+    # calendar. The CO scheduler (curing_consumption_dynamic) and the urgency helpers
+    # (_bc_holiday_day_set) each re-derive holiday day-indices from their OWN imported-by-value
+    # PLAN_START global — the same "imported BY VALUE" hazard CLAUDE.md documents for
+    # RUNNING_MOULDS_MONTH. Align both globals to plan_start here so all three derivations agree;
+    # warn if they had diverged (they never should on the local/cloud paths).
+    try:
+        import curing_consumption_dynamic as _ccd_mod
+        _prev_ps = getattr(_bc_cfg, "PLAN_START", None)
+        if _prev_ps is not None and _prev_ps != plan_start:
+            print(f"  [Rolling] #5 WARNING: bc_config.PLAN_START ({_prev_ps}) != run plan_start "
+                  f"({plan_start}); aligning holiday calendar to plan_start.")
+        _bc_cfg.PLAN_START = plan_start
+        _ccd_mod.PLAN_START = plan_start
+    except Exception as _e:
+        print(f"  [Rolling] #5 PLAN_START sync skipped ({_e})")
     # SKU code → description for the output sheets. Cloud passes it (from the DB
     # master); local builds it from the demand file's "SKU Description" column,
     # consolidated across market rows. Missing → "NA" downstream. Purely cosmetic
@@ -7656,6 +7722,27 @@ def run_rolling_pipeline(
             sku_campaign_tier = {}
         else:
             today_cos = co_by_day.get(day, [])
+        # ── Holiday fix #1: defer EVERY CO planned on a holiday to the next working day ──
+        # No new changeover starts on an idle day (decision B). Each CO rolls to the next
+        # non-holiday day with CO budget; month-end overflow is dropped. Runs BEFORE the
+        # HYBRID_CO_DEFER / mould gate / scorer so no mould is committed and no pre-build is
+        # injected on the holiday. Inert unless this day is a holiday.
+        if _HOLIDAY_CO_DEFER and today_cos and _is_holiday(day):
+            _hol_moved, _hol_lost = 0, 0
+            for (_p, _old, _new) in today_cos:
+                daily_co_count[day] = max(0, daily_co_count.get(day, 0) - 1)
+                _nwd = next((_x for _x in range(day + 1, planning_days + 1)
+                             if _x not in _holiday_days
+                             and daily_co_count.get(_x, 0) < MAX_CHANGEOVERS_PER_DAY), None)
+                if _nwd is None:
+                    _hol_lost += 1; continue
+                co_by_day.setdefault(_nwd, []).append((_p, _old, _new))
+                daily_co_count[_nwd] = daily_co_count.get(_nwd, 0) + 1
+                _hol_moved += 1
+            today_cos = []
+            co_by_day[day] = []
+            _VERBOSE and print(f"  [Rolling] Day {day} HOLIDAY: deferred {_hol_moved} CO(s) "
+                               f"→ next working day, {_hol_lost} dropped (month-end)")
         # ── Item 2: DEFER a planned CO instead of preempting a fulfillable, needed SKU ──
         # A planned CO whose old SKU still has demand that WON'T finish today (>2 shifts) would
         # otherwise preempt in Shift A (co_shift_idx=0), abandoning that unmet demand. If the SKU
@@ -7702,14 +7789,16 @@ def run_rolling_pipeline(
         # drives the curing sim THIS day; a CO blocked later would already have
         # been cured. Feasible COs get their moulds committed now (_try_mount);
         # blocked ones are dropped so the press keeps its old SKU all day.
-        if _mould_gate and _CO_SCORER_ENABLED and not (_REACTIVE_ONLY and _RCO_ARBITER):
+        if (_mould_gate and _CO_SCORER_ENABLED and not (_REACTIVE_ONLY and _RCO_ARBITER)
+                and not (_HOLIDAY_CO_DEFER and _is_holiday(day))):
             # Phase 3 — unified global CO solve (planned / pull-forward / retarget /
             # dynamic / idle under one utility + mould + building-feed gate). Runs even
             # when today_cos is empty (there may be idle presses to fill / pull-forwards).
             # DISABLED only under the once-per-shift arbiter (_RCO_ARBITER); the B-1
             # mid-shift base keeps it (idle-fill), like the original B-1 measurement.
+            # Holiday fix #1: skipped on a holiday so no NEW idle-fill/scorer CO starts.
             today_cos = _solve_day_cos(day, today_cos)
-        elif _mould_gate and today_cos:
+        elif _mould_gate and today_cos and not (_HOLIDAY_CO_DEFER and _is_holiday(day)):
             # Phase 2a — scarce-first: claim moulds for the SCARCEST new-SKU first
             # (fewest eligible moulds) so a 2-mould SKU is not blocked by a 6-mould
             # SKU grabbing a shared mould first. Pure reordering — the SET of COs
@@ -7748,7 +7837,9 @@ def run_rolling_pipeline(
         # whatever moulds remain free after the demand-driven COs (contention-safe). Modeled
         # as a planned CO with old_sku=None: co_shift_idx resolves to Shift A (no old demand),
         # so the press is CHANGEOVER in Shift A and RUNNING its target from Shift B.
-        if _IDLE_PRESS_ACTIVATE and day == 1 and _idle_presses:
+        # #6: fire Day-1 setup COs on the FIRST WORKING day, not literally day 1 — if day 1 is a
+        # plant holiday, the cold-start must wait for the first working shift (no CO on a holiday).
+        if _IDLE_PRESS_ACTIVATE and day == _first_working_day and _idle_presses:
             _cold = []
             for _ip in _idle_presses:
                 _tgt = _pick_retarget(_ip)          # neediest allowable SKU w/ 2 free moulds
@@ -7760,8 +7851,8 @@ def run_rolling_pipeline(
                 _cold.append((_ip, None, _tgt))
             if _cold:
                 today_cos = list(today_cos) + _cold
-                _VERBOSE and print(f"  [Rolling] Day 1: cold-started {len(_cold)} idle press(es) "
-                      f"{[(c[0], c[2]) for c in _cold]}")
+                _VERBOSE and print(f"  [Rolling] Day {day} (first working day): cold-started "
+                      f"{len(_cold)} idle press(es) {[(c[0], c[2]) for c in _cold]}")
 
         # ── Runner-Out Day-1 CO (Day 1 only) ──────────────────────────────────────
         # Plant rule: a press running a NO-DEMAND SKU at Day-0 (Runner-Out) must change over
@@ -7769,7 +7860,7 @@ def run_rolling_pipeline(
         # sit idle on the dead SKU. Force a Day-1 CO for any RO press not already scheduled one
         # today. Same contention-safe mount as the cold-start; exempt from the daily CO cap.
         # Toggle: bc_config.RUNNER_OUT_DAY1_CO_ENABLED (env RUNNER_OUT_DAY1_CO=0 disables).
-        if day == 1 and getattr(_bc_cfg, "RUNNER_OUT_DAY1_CO_ENABLED", True):
+        if day == _first_working_day and getattr(_bc_cfg, "RUNNER_OUT_DAY1_CO_ENABLED", True):
             _co_presses = {str(_p) for _p, _os, _ns in today_cos}
             _roco = []
             for _p, _st in list(press_state.items()):
@@ -7965,6 +8056,32 @@ def run_rolling_pipeline(
                           ({k: v for k, v in machine_skus.items()
                             if not (k in _PS_MAX_BUILD and _ps_built_sofar[k] >= _PS_MAX_BUILD[k])}
                            if _PS_MAX_BUILD else machine_skus))   # drop ps3/ps4 once at monthly cap
+            # ── Holiday fix #2/#3 scalars (computed HERE where the holiday set is visible; the
+            #    building fn is module-level and cannot see _holiday_days). Both inert unless a
+            #    holiday falls inside the shelf window. ──
+            _si_now = SHIFTS.index(shift)
+            _fwd_work_shifts = None
+            if _HOLIDAY_NO_PERISH:
+                _fwd_work_shifts = 0
+                for _k in range(GT_SHELF_LIFE_SHIFTS):          # working shifts in the next 9 calendar shifts
+                    _abs = _si_now + 1 + _k
+                    _dd  = day + (_abs // 3)
+                    if _dd > planning_days:
+                        break
+                    if not _is_holiday(_dd):
+                        _fwd_work_shifts += 1
+            _bridge_shifts = 0
+            if _HOLIDAY_BRIDGE:
+                _k = 0                                          # count consecutive holiday shifts starting next shift
+                while True:
+                    _abs = _si_now + 1 + _k
+                    _dd  = day + (_abs // 3)
+                    if _dd > planning_days or not _is_holiday(_dd):
+                        break
+                    _bridge_shifts += 1; _k += 1
+                # shelf guard: GT built now must survive to the first post-holiday shift (≤ 9 shifts ≈ 3 days)
+                if _bridge_shifts + (2 - _si_now) > GT_SHELF_LIFE_SHIFTS:
+                    _bridge_shifts = 0
             shift_plan = _assign_building_shift(
                 shift_cure_demand=dict(shift_cure_demand),
                 machine_skus=_ms_capped,
@@ -7978,6 +8095,8 @@ def run_rolling_pipeline(
                 press_count=press_count,
                 co_target_skus=co_target_skus_today,
                 days_left=_working_days_left(day),   # holiday-aware urgency horizon
+                fwd_work_shifts=_fwd_work_shifts,     # #2 NO-PERISH: shelf window capped to working shifts
+                bridge_shifts=_bridge_shifts,         # #3 BRIDGE: pre-build through an imminent holiday
                 writeoff_cum=writeoff_cum,           # R8B: cap tightener (built <= demand)
                 demand_dict=demand_dict,
                 machine_total_demand=machine_total_demand,
@@ -8233,7 +8352,21 @@ def run_rolling_pipeline(
                                  else max(_s2_desired.get(_gs, 0.0), shift_cure_demand.get(_gs, 0.0)))
                         if _rate <= 0:
                             continue
-                        _buf = min(_rate * (1 + _STAGE1_CARCASS_LEAD),
+                        # #2 NO-PERISH: cap the carcass pre-build LEAD to the WORKING shifts before a
+                        # holiday. Carcass has a 1-day shelf, so anything banked for a holiday shift
+                        # (no Stage-2 runs) strands and is written off. None-adjacent → full LEAD (parity).
+                        _eff_lead = _STAGE1_CARCASS_LEAD
+                        if _HOLIDAY_NO_PERISH:
+                            _si_c = SHIFTS.index(shift); _work_life = 0
+                            for _kk in range(_cage):
+                                _absc = _si_c + 1 + _kk
+                                _ddc  = day + (_absc // 3)
+                                if _ddc > planning_days:
+                                    break
+                                if not _is_holiday(_ddc):
+                                    _work_life += 1
+                            _eff_lead = max(0, min(_STAGE1_CARCASS_LEAD, _work_life - 1))
+                        _buf = min(_rate * (1 + _eff_lead),
                                    max(0.0, demand_remaining.get(_gs, 0.0)))
                         _extra = _buf - _bank_avail(_gs)
                         if _STAGE1_CO:                       # keep the carryable buffer ≤ cap
@@ -9487,6 +9620,8 @@ def run_rolling_pipeline(
         gt_waste_map      = dict(writeoff_cum),
         carcass_waste_map = dict(carcass_waste),
         expiry_rows       = expiry_rows,
+        holiday_dates     = {(plan_start + timedelta(days=_d - 1)).strftime("%Y-%m-%d")
+                             for _d in _holiday_days},
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,

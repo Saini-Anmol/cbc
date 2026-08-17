@@ -51,12 +51,13 @@ Verified month inputs (this cycle):
 
 | Month | DEMAND_FILE | Demand | PLANNING_DAYS | plan_month |
 |-------|-------------|--------|---------------|-----------|
-| June  | `june_demand_tomerji.xlsx`   | 717,765 | 30 | 2026-06 |
-| July  | `july_demand_tomerJi1.xlsx`  | 778,981 | 31 | 2026-07 |
-| Aug   | `august_demand_tomerji.xlsx` | 701,933 | 31 | 2026-08 |
+| June  | `correct_june_plan.xlsx`     | 704,194 | 30 | 2026-06 |
+| July  | `july_correct_plan.xlsx`     | 727,779 | 31 | 2026-07 |
+| Aug   | `august_demand_tomerji.xlsx` | 689,563 | 31 | 2026-08 |
 
-> ⚠️ June is now `june_demand_tomerji.xlsx` (717,765), **NOT** the old `june_production_data.xlsx`
-> (656,608) — June KPIs are not comparable to older June baselines.
+> ⚠️ June is now `correct_june_plan.xlsx` (704,194, 97 SKUs), **NOT** the old `june_production_data.xlsx`
+> (656,608) — June KPIs are not comparable to older June baselines. July is now `july_correct_plan.xlsx`
+> (727,779, 102 SKUs); August (`august_demand_tomerji.xlsx`, updated in place) is 689,563 (91 SKUs).
 
 Everything else derives automatically: **all 5 output paths are stamped** with `PLAN_START`
 (+ horizon) — `bc_building_schedule_<date>.xlsx`, `bc_curing_b2c_<date>.xlsx`,
@@ -103,17 +104,19 @@ structural.
 **MAX_CHANGEOVERS_PER_DAY = 12** re-confirmed best single value under the lock (sweep 10/12/14/16;
 July-only prefers 16 for +2,677). Carcass lead kept at 2.
 
-### Adopted-approach KPIs (hist-lock + Lever A, `MAX_CO=12`, deterministic, audit PASS, cap 0-over)
+### Adopted-approach KPIs (hist-lock + Lever A + hybrid CO items 1+2, `MAX_CO=12`, deterministic, feasibility-clean, cap 0-over, local==cloud byte-parity)
 
-| Month | Demand | GT cured | Coverage | Curing COs | Cleans | Starvation |
-|-------|--------|----------|----------|-----------|--------|-----------|
-| June  | 717,765 | 636,201 | 88.64% | 249 | 46 | 1,422 |
-| July  | 778,981 | 673,221 | 86.38% | 213 | 59 | 1,719 |
-| Aug   | 701,933 | 648,118 | 92.33% | 283 | 53 | 2,143 |
-| **Total** | 2,198,679 | **1,957,540** | **89.03%** | — | — | 5,284 |
+| Month | Demand file | Demand | Days | GT built | GT cured | Coverage | Curing COs | Starvation | Expired GT | Expired carcass |
+|-------|-------------|--------|------|----------|----------|----------|-----------|-----------|-----------|----------------|
+| June  | `correct_june_plan.xlsx`     | 704,194 | 30 | 645,568 | **650,381** | **92.36%** | 256 | 2,654 | 666   | 10,008 |
+| July  | `july_correct_plan.xlsx`     | 727,779 | 31 | 679,223 | **685,342** | **94.17%** | 306 | 2,926 | 1,279 | 9,914  |
+| Aug   | `august_demand_tomerji.xlsx` | 689,563 | 31 | 644,523 | **648,687** | **94.07%** | 284 | 3,234 | 1,420 | 10,264 |
+| **Total** | | 2,121,536 | | | **1,984,410** | — | — | — | — | — |
 
-> These use the NEW inputs (per-month `*_tomerji.xlsx`, month-keyed `Daily_Running_Moulds`,
-> single `gt_inventory_manual`) — NOT comparable to older CLAUDE.md baselines.
+> These SUPERSEDE the older 636,201 / 673,221 / 648,118 numbers (new hybrid-CO stack + new demand
+> files). They use the NEW inputs (`correct_june_plan.xlsx` / `july_correct_plan.xlsx` /
+> `august_demand_tomerji.xlsx`, month-keyed `Daily_Running_Moulds`, single `gt_inventory_manual`)
+> — NOT comparable to older CLAUDE.md baselines.
 
 ---
 
@@ -232,6 +235,22 @@ idle/starvation. **Keep at 4.**
   `(ΣUsed+ΣCO+ΣClean)/ΣAvailable`; per-press `Occupancy_Pct = Util + CO_Pct +
   Mould_Clean_Utilization_%`, `Available = planning_days×3×480` (whole month).
 
+### 4b. Expired GT / carcass outputs (building) — LIVE
+- **Building "Daily GT & Carcass"** sheet: new per-day `Expired_GT` + `Expired_Carcass` columns
+  (right after `Carcass_Produced`), plus the `Holiday` flag column (from §9 fix #4).
+- **Building "Shift Schedule"** sheet: new `expired_GT` / `expired_carcass` waste ROWS (`CO_Type`
+  values; Machine `"—"`, `CO_Mins` 0, `Qty` = expired units, tinted). **DISPLAY-ONLY** — kept OUT
+  of `prod_rows` so every aggregate sheet, KPI, utilization, CO count, and feasibility production
+  sum is UNCHANGED; `feasibility_test.py` skips these rows.
+- **Terminal:** "Expired GT" + "Expired carcass" KPI lines (`writeoff_total` / Σcarcass_waste).
+  Result dict keys: `gt_writeoff`, `carcass_writeoff`.
+- **Semantics (state clearly):** expired GT/carcass are WASTE (aged out). **EXCLUDED** from GT
+  cured, coverage, and usable-built (Demand-Fulfillment `Planned_Units` = gross built − expired
+  GT); **INCLUDED** only in the gross terminal "Total GT built" (it was physically produced, then
+  aged out). Expired GT = built-then-aged + any Day-0 opening stock that expired. The
+  Demand-Fulfillment "expired GT/carcass" per-SKU column is **DEMAND-SCOPED** (can under-sum vs the
+  authoritative terminal total by the expiry on non-demand SKUs).
+
 ### 5. Idle building machines → highest-unmet-demand targeting ("IUkeep") — ADOPTED (LIVE)
 The forward buffer (Phase C, §"Forward-buffer") used to fill idle building capacity toward the
 **nearest-to-starve** SKU. This lever re-ranks those Phase-C candidates by **biggest unmet-demand
@@ -309,6 +328,63 @@ preset table (the FRONTEND copies the selected preset's values into params on pl
 backend copy-back). Two BTP presets exist: **`BTP Preset Main`** (impPriorityFlag=1) / **`BTP Preset`**
 (impPriorityFlag=0); CTP presets untouched. Cloud parity verified: with `impPriorityFlag=1`, cloud ==
 local (July 671,324 / Aug 638,594); with `=0`, cloud == baseline (672,696 / 649,334) — byte-identical.
+
+### 8. Hybrid curing-CO items 1+2 — ADOPTED (LIVE, hardcoded ON, both paths)
+
+Two coupled curing-CO levers, both hardcoded `True` at module level (so the cloud path inherits
+them automatically — byte-parity verified). Combined they are **+29,836 cured over 3 months**,
+feasibility-clean. `REACTIVE_ONLY=0` (hybrid) is the default; pure-reactive (`REACTIVE_ONLY=1`)
+regressed **~−128k**.
+
+- **Item 1 — `_PERSKU_FEED_V2 = True`** (`curing_consumption_dynamic.py`, hardcoded ON):
+  building-aware deficit-first per-SKU feed feasibility. Replaces the optimistic un-apportioned
+  `buildable_rate` — contending same-inch SKUs claim their required draw **most-constrained-first**
+  (preferring machines OUTSIDE the target's set), so the target's feasible draw = the residual on
+  its own machines. The 5b / surplus CO guards then block only **GENUINELY infeasible** planned COs.
+- **Item 2 — `_HYBRID_CO_DEFER = True`** (`b2c_pipeline.py`, hardcoded ON): DEFER a planned curing
+  CO to the next working day instead of preempting in Shift A, when the press's OLD SKU still has
+  FULFILLABLE demand (live `_supply_ok`) that won't finish today AND the press is NOT surplus. The
+  single biggest lever (**July +14,137 alone**). Mirror-image of pull-forward.
+- **Items 3 & 4 measured non-additive / no-op → left OFF:** Item 3 (`HYBRID_CO_CANCEL`, stale-CO
+  wipe) and Item 4 (adaptive starvation-CO). Both toggles are MODULE-LEVEL.
+
+### 9. Plant-holiday feature — LIVE (config `PLANT_HOLIDAYS`, default False = INERT)
+
+`bc_config.PLANT_HOLIDAYS` = a list of `"YYYY-MM-DD"` dates or `False` (default `False` = INERT;
+no-holiday runs are **bit-for-bit identical** to before). **Cloud** reads holidays from
+`jkt_holiday_calendar` → `connection.read_db` → `run_cfg["holidays"]` → `main._apply_run_cfg` →
+`PLANT_HOLIDAYS`. A holiday = a **fully idle day** (0 building, 0 curing); GT inventory carries
+across it; **aging stays CALENDAR-based** (GT 3-day / carcass 1-day age across a holiday);
+utilization denominators drop holiday shifts; in-flight COs/cleans complete.
+
+Six fixes (all toggle-gated, defaults as noted; all INERT without holidays):
+- **#1 `_HOLIDAY_CO_DEFER`** (env `HOLIDAY_CO_DEFER`, default ON): NO new curing CO fires on a
+  holiday — every CO the plan placed on a holiday is deferred to the next WORKING day with CO
+  budget (month-end overflow dropped). Makes planned / dynamic / scorer match the already-guarded
+  reactive path. Verified: 0 COs land on holidays.
+- **#2 `_HOLIDAY_NO_PERISH`** (env `HOLIDAY_NO_PERISH_PREBUILD`, default ON): don't pre-build
+  perishable stock that ages out over a holiday — caps the carcass PASS-2 lead AND the GT
+  forward-buffer window to the WORKING shifts reachable before the holiday. Only ever SHRINKS a
+  target (no overbuild). Cuts pre-holiday carcass writeoff ~0.9–1.4k, cured-neutral.
+- **#3 `_HOLIDAY_BRIDGE`** (env `HOLIDAY_BRIDGE_BUILD`, default OFF): pre-build extra GT through a
+  holiday. MEASURED NO-OP (the existing 9-shift forward-buffer already bridges 1–2 day holidays;
+  ≥3-day holidays are shelf-blocked). Kept OFF + documented, like FIXED_ESCAPE / global-mould-opt.
+- **#4 reporting:** building "Daily GT & Carcass" sheet gains a `Holiday` flag column + a row for
+  every holiday date (idle day, carried GT, and any GT/carcass that aged out DURING the holiday
+  are now visible; previously the holiday date was missing entirely).
+- **#5 robustness:** unified the 3 holiday-index derivations onto one `plan_start` (fixed a
+  def-time-default gotcha in `curing_consumption_dynamic._holiday_day_index_set` + aligns
+  `bc_config.PLAN_START` / the curing module `PLAN_START` to the run's plan_start at pipeline entry,
+  with a divergence warning) — the same "imported BY VALUE" hazard documented for `RUNNING_MOULDS_MONTH`.
+- **#6 wiring:** Day-1 setup COs (idle-press cold-start + Runner-Out Day-1 CO) now gate on
+  `_first_working_day`, not `day==1`, so no setup CO fires if day 1 is itself a holiday.
+
+**Honest KPI (July, `july_correct_plan.xlsx`, no-holiday baseline 685,342 cured):** holiday on the
+15th → **672,724**; 15th+16th → **651,601**; 15th+27th → **649,486**. A single holiday is a net
+win vs the pre-fix behaviour (**+904**, less waste); MULTI-holiday cured DROPS — the honest cost of
+#1 (no "free" changeovers on idle days, the realism model chosen) — while waste falls in every case.
+Feasibility clean (R8B/R8C demand-cap PASS, 0 overbuild); no-holiday bit-for-bit; cloud parity
+byte-identical.
 
 ---
 
@@ -885,21 +961,24 @@ When answering "should we / what if / what's wrong" questions:
 
 The rolling pipeline is **deterministic** (verified, fixed + random `PYTHONHASHSEED`).
 Current committed stack: **historical inch-lock (INCH_HIST_LOCK, 27 fixed / 12 flexible, ±2 band
-OFF) + Lever A flexible-inch scarcity targeting (FLEX_SCARCE_INCH) + mould gate + retarget + CO
-scorer + mould life v2 + mould clean + 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 10k GT
-cap)**, `MAX_CO=12`, carcass lead 2. `FIXED_ESCAPE` (Lever B), `+3/−3 escape`, global mould
-optimiser are OFF. Inputs: per-month `*_tomerji.xlsx`, month-keyed `Daily_Running_Moulds`
-(`plan_month`), single `gt_inventory_manual`, building start-free.
+OFF) + Lever A flexible-inch scarcity targeting (FLEX_SCARCE_INCH) + hybrid curing-CO items 1+2
+(PERSKU_FEED_V2 + HYBRID_CO_DEFER, +29,836 net) + mould gate + retarget + CO scorer + mould life v2
++ mould clean + 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 10k GT cap)**, `MAX_CO=12`, carcass
+lead 2. `FIXED_ESCAPE` (Lever B), `+3/−3 escape`, global mould optimiser, hybrid items 3/4, plant
+holidays (`PLANT_HOLIDAYS=False`) are OFF/inert. Inputs: per-month demand files, month-keyed
+`Daily_Running_Moulds` (`plan_month`), single `gt_inventory_manual`, building start-free.
 
-**LOCAL, `MAX_CO=12`, all exact mould-feasibility-audit PASS, demand-cap 0-over, deterministic:**
+**LOCAL, `MAX_CO=12`, all feasibility-clean, demand-cap 0-over, deterministic, local==cloud byte-parity:**
 
-| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Cleans | Writeoff | Starv |
-|-------|-------------|--------|----------|----------|----------|-----------|--------|----------|-------|
-| June | `june_demand_tomerji.xlsx`   | 717,765 | 631,586 | **636,201** | **88.64%** | 249 | 46 | 1,252 | 1,422 |
-| July | `july_demand_tomerJi1.xlsx`  | 778,981 | 669,065 | **673,221** | **86.38%** | 213 | 59 | 1,752 | 1,719 |
-| Aug  | `august_demand_tomerji.xlsx` | 701,933 | 643,722 | **648,118** | **92.33%** | 283 | 53 | 1,019 | 2,143 |
-| **Total** | | 2,198,679 | | **1,957,540** | **89.03%** | — | — | — | 5,284 |
+| Month | Demand file | Demand | Days | GT built | GT cured | Coverage | Curing COs | Starv | Expired GT | Expired carcass |
+|-------|-------------|--------|------|----------|----------|----------|-----------|-------|-----------|----------------|
+| June | `correct_june_plan.xlsx`     | 704,194 | 30 | 645,568 | **650,381** | **92.36%** | 256 | 2,654 | 666   | 10,008 |
+| July | `july_correct_plan.xlsx`     | 727,779 | 31 | 679,223 | **685,342** | **94.17%** | 306 | 2,926 | 1,279 | 9,914  |
+| Aug  | `august_demand_tomerji.xlsx` | 689,563 | 31 | 644,523 | **648,687** | **94.07%** | 284 | 3,234 | 1,420 | 10,264 |
+| **Total** | | 2,121,536 | | | **1,984,410** | — | — | — | — | — |
 
+> These SUPERSEDE the older 636,201 / 673,221 / 648,118 numbers (new hybrid-CO stack + new demand
+> files `correct_june_plan.xlsx` / `july_correct_plan.xlsx` / `august_demand_tomerji.xlsx`).
 > Measured with **per-month opening GT** (`gt_inventory_manual` `plan_month`-filtered: June 7,644 /
 > July 8,989 / Aug 7,488) + the **Lever-A determinism fix** (inch-scarcity sort now tiebreaks on the
 > inch string → identical across all `PYTHONHASHSEED`). Deterministic, mould-audit PASS, demand-cap
@@ -926,9 +1005,10 @@ measured + REJECTED. The remaining July lever is **more moulds/presses on 15"/13
 
 **Per-SKU demand cap verified on all 3 months: 0 SKUs cured above demand.**
 
-> ⚠️ **June demand file is now `june_demand_tomerji.xlsx` (717,765, 113 SKUs).** The old
-> `june_production_data.xlsx` (656,608) and `demand_tomerji_june_normalized.xlsx` (742,094, has
-> 3 stray NaN-`plan_id` rows) are RETIRED for June — do not use them (June KPIs differ accordingly).
+> ⚠️ **June demand file is now `correct_june_plan.xlsx` (704,194, 97 SKUs); July is
+> `july_correct_plan.xlsx` (727,779, 102 SKUs); Aug `august_demand_tomerji.xlsx` (689,563, 91 SKUs).**
+> The old `june_production_data.xlsx` (656,608), `demand_tomerji_june_normalized.xlsx` (742,094, has
+> 3 stray NaN-`plan_id` rows), and the old July file are RETIRED — do not use them (KPIs differ accordingly).
 > **Always sanity-check the demand total against the expected month total before trusting a run.**
 > Per-SKU demand cap verified on all 3 current months: **0 SKUs cured above demand.**
 

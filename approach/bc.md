@@ -13,9 +13,10 @@
 > Config: `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=8000` (env `GT_CAP_MAX`; cloud
 > aligned — `main.CLOUD_CONFIG` pins 8000 too, so local↔cloud byte-parity; see §8),
 > `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
-> **Adopted LOCAL KPIs (mould-audit PASS, cap 0-over, deterministic, per-month opening GT):** June
-> 636,201/88.64% · July 673,221/86.38% · Aug 648,118/92.33% = **1,957,540 / 89.03%**. The rules are physical
-> restrictions that make the plan floor-realistic (KPI below the mould-blind baseline by design).
+> **Adopted LOCAL KPIs (hybrid CO items 1+2 §5.4, no holiday, mould-audit PASS, cap 0-over,
+> deterministic, per-month opening GT, local==cloud byte-parity):** June 650,381/92.36% · July
+> 685,342/94.17% · Aug 648,687/94.07% = **1,984,410 cured**. The rules are physical restrictions that
+> make the plan floor-realistic (KPI below the mould-blind baseline by design).
 
 **Building-to-Curing (B2C):** the building schedule is the **primary output**; the
 curing schedule is **fully derived** from it. Building runs first; curing consumes
@@ -96,8 +97,9 @@ Legacy behaviour (for reference): building started **2 shifts before** curing (M
 building Apr 30 Shift B), and pre-start GT was credited to the curing opening balance.
 
 ### 2.3 Demand file
-Per-month `data/input/<month>_demand_tomerji.xlsx` (June `june_demand_tomerji.xlsx` 717,765 /
-July `july_demand_tomerJi1.xlsx` 778,981 / Aug `august_demand_tomerji.xlsx` 701,933). Columns:
+Per-month demand file (June `correct_june_plan.xlsx` 704,194 / 30 days / 97 SKUs;
+July `july_correct_plan.xlsx` 727,779 / 31 days / 102 SKUs; Aug `august_demand_tomerji.xlsx`
+689,563 / 31 days / 91 SKUs). Columns:
 `SKUCode`, `Requirement` (the per-SKU **demand cap**), `ConsolidatedPriorityScore` (a static input;
 priority is actually recomputed in code as min-max of Requirement — any file score is ignored, v1).
 (Older revisions used `demand_may.xlsx` / `june_production_data.xlsx` — retired.)
@@ -379,6 +381,24 @@ KPI ≈ flat (−253 tyres); starvation −103. Before its CO shift the press ru
 shift it is CHANGEOVER; after, the NEW SKU. The pre-build injection follows the press's own CO shift
 (§5.2), preserving the simultaneity rule.
 
+### 5.4 Hybrid curing-CO (items 1+2, ADOPTED — hardcoded ON, local + cloud)
+
+Two coupled changes to how planned curing COs are gated/timed. Both are **module-level** flags, so
+**cloud inherits them automatically**. Combined **1+2 = +29,836 cured / 3 months, feasibility-clean.**
+Hybrid (`REACTIVE_ONLY = 0`) is the default; pure-reactive regressed ~−128k. Items 3
+(`HYBRID_CO_CANCEL`) and 4 (adaptive starvation-CO) measured **non-additive / no-op → left OFF**.
+
+- **Item 1 — building-aware DEFICIT-FIRST per-SKU feed** (`_PERSKU_FEED_V2 = True`,
+  `curing_consumption_dynamic.py`). Replaces the optimistic un-apportioned `buildable_rate`: contending
+  same-inch SKUs each claim their required draw **most-constrained-first** (preferring machines
+  **outside** the target's eligible set), so the target's feasible draw = the **residual on its own
+  machines**. The 5b / surplus CO guards then block only **genuinely infeasible** planned COs (no longer
+  falsely-blocking feasible ones).
+- **Item 2 — HYBRID planned-CO DEFER** (`_HYBRID_CO_DEFER = True`, `b2c_pipeline.py`). DEFER a planned
+  curing CO to the **next working day** instead of preempting it in Shift A, **when** the press's old SKU
+  still has FULFILLABLE demand (live `_supply_ok`) that won't finish today **AND** the press is not
+  surplus. The mirror image of the pull-forward. **Biggest single lever (July +14,137 alone).**
+
 ---
 
 ## 6. Rolling per-shift pipeline (THE default)
@@ -569,6 +589,42 @@ data → June + non-priority files run bit-for-bit).
   pulled earlier = shared-mould contention (a hard capacity limit, not misallocation); 2 SKUs are
   physically infeasible by date.**
 
+### 8.4 Plant holidays (`PLANT_HOLIDAYS`, default INERT)
+
+`bc_config.PLANT_HOLIDAYS` = a list of `"YYYY-MM-DD"` dates, or `False` (default = **INERT** — a
+no-holiday run is **bit-for-bit identical** to before). **Cloud:** `jkt_holiday_calendar` →
+`connection.read_db` → `run_cfg["holidays"]` → `main._apply_run_cfg` → `PLANT_HOLIDAYS`. A holiday is a
+**fully idle day** (0 build, 0 cure); GT inventory **carries across** it; aging stays **CALENDAR-based**
+(GT 3-day / carcass 1-day age across the holiday); utilization denominators **drop** the holiday shifts;
+in-flight COs / cleans complete on the idle day.
+
+Six fixes (all toggle-gated, all INERT without holidays):
+- **#1 `_HOLIDAY_CO_DEFER`** (env `HOLIDAY_CO_DEFER`, default ON): **no NEW curing CO on a holiday** —
+  each is deferred to the next WORKING day with CO budget (month-end overflow dropped). Makes
+  planned / dynamic / scorer COs match the already-guarded reactive path. Verified **0 COs on holidays**.
+- **#2 `_HOLIDAY_NO_PERISH`** (env `HOLIDAY_NO_PERISH_PREBUILD`, default ON): don't pre-build perishable
+  stock that would age out over a holiday — caps the carcass PASS-2 lead **and** the GT forward-buffer
+  window to the WORKING shifts reachable before the holiday. Only **SHRINKS** a target (never overbuilds).
+  Cuts pre-holiday carcass write-off ~0.9–1.4k, cured-neutral.
+- **#3 `_HOLIDAY_BRIDGE`** (env `HOLIDAY_BRIDGE_BUILD`, default **OFF**): pre-build extra GT *through* a
+  holiday. **MEASURED NO-OP** — the existing 9-shift forward-buffer already bridges 1–2 day holidays,
+  and ≥3-day holidays are shelf-blocked. Kept OFF + documented.
+- **#4 reporting:** "Daily GT & Carcass" sheet gains a **`Holiday` flag** column + a row for every
+  holiday date (idle day, carried GT, and GT/carcass aged out DURING the holiday now visible; the
+  holiday date was previously missing).
+- **#5 robustness:** unified the 3 holiday-index derivations onto one `plan_start` (fixed a
+  def-time-default gotcha in `curing_consumption_dynamic._holiday_day_index_set`; aligns
+  `bc_config.PLAN_START` / the curing module `PLAN_START` to the run's plan_start at pipeline entry, with
+  a divergence warning) — the "imported BY VALUE" hazard also flagged for `RUNNING_MOULDS_MONTH`.
+- **#6 wiring:** Day-1 setup COs (idle-press cold-start + Runner-Out Day-1 CO) gate on
+  `_first_working_day`, not `day == 1`, so none fire if day 1 is a holiday.
+
+**Honest KPI (July, no-holiday baseline 685,342 cured):** 15th → 672,724; 15th + 16th → 651,601;
+15th + 27th → 649,486. A **single** holiday nets a small win vs pre-fix (+904, less waste); a
+**multi**-holiday cured DROPS — the honest cost of #1 (no free changeovers on idle days, the chosen
+realism model) — while **waste falls every case**. Feasibility clean (R8B/R8C demand-cap PASS, 0
+overbuild); no-holiday bit-for-bit; cloud parity byte-identical.
+
 ---
 
 ## 9. Buffer mechanisms (flat + round-trip)
@@ -679,6 +735,7 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 | `TOPUP_LOOKAHEAD_DAYS_GT` | 3 | TopUp pre-build days (legacy); must equal shelf life |
 | `MAX_ENDOFDAY_GT_INVENTORY` | **8000** | Overnight GT-hold cap (env `GT_CAP_MAX`, default "8000"); **`main.CLOUD_CONFIG` pins 8000 too — local↔cloud aligned** (§8) |
 | `DELIVERY_PRIORITY_ENABLED` | **True** | Master toggle for committed-delivery SKUs (§8.3); INERT with no priority data. Cloud-gated by `jkt_plan_params.impPriorityFlag` (§17.1) |
+| `PLANT_HOLIDAYS` | **False** | List of `"YYYY-MM-DD"` idle days, or `False` = INERT (no-holiday run bit-for-bit identical). Cloud: `jkt_holiday_calendar` → `run_cfg["holidays"]` (§8.4) |
 | `INCH_HIST_LOCK_ENABLED` / `_MIN_SHARE` / `_MAX_INCHES` | **True / 0.02 / 3** | Historical inch-lock: per-machine allowed-inch sets from the 4-mo report (§4.5) |
 | `FLEX_SCARCE_INCH` (env) | **ON** | Lever A — flexible machines feed the scarcest allowed inch (§4.5) |
 | `FIXED_ESCAPE_ENABLED` | **False** | Lever B (fixed-machine escape) — REJECTED, kept off (§4.5) |
@@ -696,8 +753,9 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 **Live scheduling toggles (`b2c_pipeline.py`):** `_GLOBAL_ASSIGN_ENABLED`,
 `_GLOBAL_CONSTRAINT_MODE="below"`, `_ROUND_TRIP_BUFFER_ENABLED`, `_BUILDING_RATIO_ENABLED`,
 `_INCH_FLEX_ENABLED`, `_ENDOFDAY_GT_CAP_ENABLED`, `_FORWARD_BUFFER_ENABLED`, `_FWD_RISK_SHIFTS=1.0`,
-`_MOULD_CLEAN_ENABLED` (§5.1), `_CO_SHIFT_SPREAD_ENABLED` (hardcoded `True`, §5.3) — all ON by
-default. `_CURING_RATIO_ENABLED` in `curing_consumption_dynamic.py`.
+`_MOULD_CLEAN_ENABLED` (§5.1), `_CO_SHIFT_SPREAD_ENABLED` (hardcoded `True`, §5.3),
+`_HYBRID_CO_DEFER` (hardcoded `True`, §5.4) — all ON by default. `_CURING_RATIO_ENABLED` and
+`_PERSKU_FEED_V2` (hardcoded `True`, §5.4) in `curing_consumption_dynamic.py`.
 
 ---
 
@@ -765,15 +823,19 @@ building start-free. Fully deterministic; mould-audit PASS; demand-cap 0-over on
 > effect is **June inert (634,086 ON==OFF) / July −1,372 / Aug −10,740** — accepted, since meeting the
 > committed date outranks overall KPI.
 
-| Month | Demand file | Demand | GT built | GT cured | Coverage | Curing COs | Cleans | Starv |
-|-------|-------------|--------|----------|----------|----------|-----------|--------|-------|
-| June | `june_demand_tomerji.xlsx`   | 717,765 | 631,586 | **636,201** | **88.64%** | 249 | 46 | 1,422 |
-| July | `july_demand_tomerJi1.xlsx`  | 778,981 | 669,065 | **673,221** | **86.38%** | 213 | 59 | 1,719 |
-| Aug  | `august_demand_tomerji.xlsx` | 701,933 | 643,722 | **648,118** | **92.33%** | 283 | 53 | 2,143 |
-| **Total** | | 2,198,679 | | **1,957,540** | **89.03%** | — | — | 5,284 |
+Now measured with the **hybrid curing-CO stack (items 1+2, §5.4)** ON and the **new demand files**
+(§2.3). These SUPERSEDE the older pre-hybrid-CO numbers in earlier revisions (different CO stack + inputs):
 
-> Measured with per-month opening GT (`gt_inventory_manual` `plan_month`-filtered) + the Lever-A
-> determinism fix (inch-scarcity sort tiebreaks on the inch string). Re-run after any DB opening-GT edit.
+| Month | Demand file | Demand | Days | GT built | GT cured | Coverage | Curing COs | Starv | Expired GT | Expired carcass |
+|-------|-------------|--------|------|----------|----------|----------|-----------|-------|-----------|-----------------|
+| June | `correct_june_plan.xlsx`     | 704,194 | 30 | 645,568 | **650,381** | **92.36%** | 256 | 2,654 | 666   | 10,008 |
+| July | `july_correct_plan.xlsx`     | 727,779 | 31 | 679,223 | **685,342** | **94.17%** | 306 | 2,926 | 1,279 | 9,914  |
+| Aug  | `august_demand_tomerji.xlsx` | 689,563 | 31 | 644,523 | **648,687** | **94.07%** | 284 | 3,234 | 1,420 | 10,264 |
+| **Total** | | 2,121,536 | — | | **1,984,410** | — | — | — | — | — |
+
+> Hybrid CO items 1+2 ON, no holiday, `MAX_CHANGEOVERS_PER_DAY = 12`, deterministic, feasibility-clean,
+> **local == cloud byte-parity verified**. Measured with per-month opening GT (`gt_inventory_manual`
+> `plan_month`-filtered) + the Lever-A determinism fix. Re-run after any DB opening-GT edit.
 
 **Lever A delta:** June +570 / July +1,860 / Aug +1,374 = **+3,804 net** vs hist-lock-only, starvation
 ↓/flat all 3. **Lever B (FIXED_ESCAPE) REJECTED:** −2,572. **CO sweep** (10/12/14/16) confirmed 12 best
@@ -858,13 +920,26 @@ previous: `curing_consumption_<days>day_<date>.xlsx`, `bc_building_schedule_<dat
 | File | Contents |
 |------|----------|
 | `curing_consumption_<days>day_<date>.xlsx` | day sheets + CO_Schedule + Day0_Summary + Summary |
-| `bc_building_schedule_<date>.xlsx` | Shift Schedule; Machine Utilization; Daily GT & Carcass (`EndDay_GT_Inventory` audit col); Demand Fulfillment (B2C) |
+| `bc_building_schedule_<date>.xlsx` | Shift Schedule (+ `expired_GT` / `expired_carcass` waste rows); Machine Utilization; Daily GT & Carcass (`EndDay_GT_Inventory` audit col + `Expired_GT` / `Expired_Carcass` + `Holiday` flag cols); Demand Fulfillment (B2C) |
 | `bc_curing_b2c_<date>.xlsx` | Shift Schedule; Changeover Plan (all curing COs); Machine Utilization; Demand Fulfillment |
 
 **Building Shift Schedule — `Qty` / `CO_Mins` split.** CHANGEOVER rows previously wrote the CO
 duration (minutes) into `Qty`, mixing units and minutes. Now CHANGEOVER rows have **`Qty = 0`** and a
 separate **`CO_Mins`** column holds the duration; production/carcass rows have `CO_Mins = 0`. So `Qty`
 is purely summable (= GT + carcass). `Machine_Group` shows the plant display labels (§4.1).
+
+**Expired GT / carcass reporting (waste, aged out).** The building "Daily GT & Carcass" sheet gains
+per-day **`Expired_GT`** + **`Expired_Carcass`** columns (after `Carcass_Produced`) plus the `Holiday`
+flag (§8.4 #4). The building Shift Schedule gains **`expired_GT`** / **`expired_carcass`** waste **rows**
+(`CO_Type`; `Machine = "—"`, `CO_Mins = 0`, `Qty = expired units`) — these are **DISPLAY-ONLY**, kept
+**OUT of `prod_rows`**, so every aggregate / KPI / utilization / CO-count and the feasibility production
+sum are **UNCHANGED** (`feasibility_test.py` skips these rows). The terminal prints **"Expired GT"** +
+**"Expired carcass"** KPI lines; the result dict carries `gt_writeoff` / `carcass_writeoff`.
+**Semantics:** expired GT / carcass are **WASTE** (aged out) — **EXCLUDED** from GT cured, coverage, and
+usable-built (Demand-Fulfillment `Planned_Units` = gross built − expired GT); **INCLUDED** only in the
+gross terminal "Total GT built" (produced then aged out). Expired GT = built-then-aged **plus** any Day-0
+opening stock that expired. The Demand-Fulfillment per-SKU "expired GT/carcass" column is
+**DEMAND-SCOPED** (can under-sum vs the authoritative terminal total by expiry on non-demand SKUs).
 
 **Curing Shift Schedule — real wall-clock + CO visibility.** `StartTime`/`EndTime` are real
 datetimes ("YYYY-MM-DD HH:MM", **mid-shift capable** — a partially-fed press ends mid-shift, a
@@ -889,6 +964,9 @@ the `DEFAULT_CURING_CT = 17` default (no real data). (For May demand all 85 SKUs
 - **Starvation event** = a RUNNING curing press with demand remaining but zero GT that shift.
   Distinct from IDLE (demand met). Curing output "Remarks" distinguishes `STARVED (no GT)` vs
   `IDLE (demand met)`; the sheet's STARVED count reconciles with the printed KPI.
+- **Expired GT / carcass** (`gt_writeoff` / `carcass_writeoff`) = stock that **aged out** before use
+  (GT > 3 days, carcass > 1 day). WASTE — EXCLUDED from GT cured, coverage, and usable-built; counted
+  only in the gross "Total GT built". See §17.2 for the sheet columns and semantics.
 
 ### 18.2 Edge cases
 | Edge case | Handling |

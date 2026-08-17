@@ -96,8 +96,13 @@ import bc_config as _bc
 # Urgency (Class A/B CO gating) must count WORKING days remaining, not calendar days,
 # so a holiday-shortened horizon fires COs on time. Empty holidays ⇒ working==calendar
 # ⇒ byte-for-byte identical to today (the parity guarantee).
-def _holiday_day_index_set(plan_start=PLAN_START):
-    """1-based day indices (relative to plan_start) that are plant holidays."""
+def _holiday_day_index_set(plan_start=None):
+    """1-based day indices (relative to plan_start) that are plant holidays.
+    #5 robustness: read the module PLAN_START at CALL time (not a def-time default) so a
+    run that syncs PLAN_START gets the right holiday indices — the default-arg gotcha would
+    otherwise pin the import-time value and diverge from the main loop's plan_start."""
+    if plan_start is None:
+        plan_start = PLAN_START
     out = set()
     base = plan_start.date() if hasattr(plan_start, "date") else plan_start
     for _h in (getattr(_bc, "PLANT_HOLIDAYS", []) or []):

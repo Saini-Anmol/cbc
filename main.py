@@ -111,6 +111,17 @@ CLOUD_CONFIG: dict = {
 # module; +3/−3 escape and the global mould optimiser — env-gated default OFF) are MODULE-LEVEL
 # in b2c_pipeline.py, so the cloud path inherits them automatically by importing the engine.
 # They are NOT bc_config attributes and cannot be pinned here; keep them in sync in the engine.
+#
+# ALSO module-level (cloud inherits automatically, verified byte-parity — see below):
+#   • Hybrid curing-CO items 1+2: `_PERSKU_FEED_V2=True` (curing_consumption_dynamic, deficit-first
+#     building-feed) + `_HYBRID_CO_DEFER=True` (defer a fulfillable/needed SKU's CO). Both hardcoded ON.
+#     `_REACTIVE_ONLY` env-default "0" (hybrid) → cloud runs hybrid like local_main.
+#   • Holiday fixes: `_HOLIDAY_CO_DEFER` (no new CO on a holiday → next working day) + `_HOLIDAY_NO_PERISH`
+#     (don't pre-build perishable stock into a holiday) default ON; `_HOLIDAY_BRIDGE` default OFF
+#     (measured no-op). The holiday INPUT is DB-driven: jkt_holiday_calendar → connection.read_db
+#     → run_cfg["holidays"] → _apply_run_cfg → bc_config.PLANT_HOLIDAYS (empty ⇒ holiday-free, inert).
+#   • Expired GT/carcass output columns + Shift-Schedule waste rows are pure engine writer code (shared).
+# CLOUD↔LOCAL parity re-verified July 2026 (no-holiday 685,342 + 1/2-holiday) all 7 KPIs byte-identical.
 
 for _k, _v in CLOUD_CONFIG.items():
     setattr(_bc, _k, _v)
