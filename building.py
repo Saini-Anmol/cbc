@@ -55,9 +55,9 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════════
 # All tunables for a run. Plant-specific knobs (machine groupings,
 # cycle times, shift definitions, caps) live here as class attributes.
-# DB credentials come from cbc_env (.env) — never hardcoded. If the helper or
+# DB credentials come from bc_config (.env) — never hardcoded. If the helper or
 # .env is missing, fail loudly rather than fall back to a baked-in secret.
-from cbc_env import db_config as _cbc_db_config
+from bc_config import db_config as _cbc_db_config
 from bc_config import PLAN_MONTH
 _DB = _cbc_db_config()
 
@@ -260,242 +260,6 @@ def _ps_dedicated_skus(allow_df) -> set:
 # inventory, SKU→eligible-machines matrix, changeover times, SKU→size,
 # current running-machine snapshot, and a 3-month history map that
 # seeds the GA so random chromosomes resemble real plant practice.
-class ETL:
-    S1_NAME_MAP = {
-        "midland4stage1":"7804","midland2stage1":"7802","bj2stage1":"6802",
-        "bj8stage1":"7201","sai3stage1":"8003","bj7stage1":"7104",
-        "bj9stage1":"7105","bj3stage1":"6803","bj4stage1":"7101",
-        "bj5stage1":"7102","88d1stage1":"8101","ltmstage1":"7601",
-        "midland5stage1":"7701","midland3stage1":"7803","bj10stage1":"7106",
-        "sai1stage1":"8001","sai2stage1":"8002","midland1stage1":"7801",
-        "nrm11stage1":"6911","nrm9stage1":"6909",
-        "bj6stage1":"7103",
-    }
-    S2_NAME_MAP = {
-        "bj8":"7201","bj7":"7104","bj9":"7105","vmi1":"8501","vmi2":"8502",
-        "bj4":"7101","bj5":"7102","newirm":"7301","bj6":"7103","oldirm":"8201",
-        "vmi2Maxx":"7002","gtic1":"8301","vmi3Maxx":"7003","gtic2":"8302",
-        "us1":"7501","us2":"7502","bj10":"7106","us3":"7503",
-        "vmi4Maxx":"7004","vmi1Maxx":"7001",
-        "VMIExxium01":"6001","VMIExxium02":"6002",
-        "VMIExxium03":"6003","VMIExxium04":"6004",
-    }
-
-    def __init__(self, engine=None):
-        self.engine = engine
-
-    def _sql(self, q):
-        return pd.read_sql(q, self.engine)
-
-    def load_curing_schedule(self):
-        """Read the curing plan building schedules against.
-
-        Source = Config.CURING_PLAN_FILE (set by cbc.py to the Phase-C feed-aware
-        bridge). Handles both shapes:
-          • a flat file (csv/xlsx) with SKUCode/StartTime/EndTime/Qty columns, and
-          • a curing-scheduler workbook with a 'Shift Schedule' sheet (title rows
-            above the header, e.g. the provided jkt_plan.xlsx).
-        Falls back to the legacy jkt_plan.csv path if nothing is configured.
-        """
-        src = getattr(Config, "CURING_PLAN_FILE", None) or \
-            r'/Users/ajaygour/Downloads/jkt_plan.csv'
-
-        def _has_cols(d):
-            cols = {str(c).strip().lower() for c in d.columns}
-            return {"skucode", "starttime", "endtime"}.issubset(cols)
-
-        df = None
-        if str(src).lower().endswith((".xlsx", ".xls", ".xlsm")):
-            xl = pd.ExcelFile(src)
-            # Prefer a 'Shift Schedule' sheet; else the first sheet that parses.
-            sheets = (["Shift Schedule"] if "Shift Schedule" in xl.sheet_names
-                      else []) + list(xl.sheet_names)
-            for sh in sheets:
-                for hdr in (0, 1, 2, 3):
-                    try:
-                        cand = pd.read_excel(src, sheet_name=sh, header=hdr)
-                    except Exception:
-                        continue
-                    if _has_cols(cand):
-                        df = cand
-                        break
-                if df is not None:
-                    break
-            if df is None:
-                raise ValueError(
-                    f"No sheet with SKUCode/StartTime/EndTime found in {src}")
-        else:
-            df = pd.read_csv(src)
-
-        # Normalise lowercase/variant column names to the canonical ones.
-        canon = {"skucode": "SKUCode", "starttime": "StartTime",
-                 "endtime": "EndTime", "qty": "Qty"}
-        df = df.rename(columns={c: canon[str(c).strip().lower()]
-                                for c in df.columns
-                                if str(c).strip().lower() in canon})
-        df["StartTime"] = pd.to_datetime(df["StartTime"])
-        df["EndTime"]   = pd.to_datetime(df["EndTime"])
-        df["SKUCode"]   = df["SKUCode"].astype(str)
-        df["Qty"]       = pd.to_numeric(df.get("Qty", 0), errors="coerce").fillna(0)
-        # Drop changeover/cleaning placeholder rows and zero-demand rows.
-        df = df[(df["SKUCode"] != "CHANGEOVER") & (df["Qty"] > 0)].copy()
-        print(f"  [Curing plan] {len(df)} rows from {os.path.basename(str(src))}")
-        return df
-
-    def load_gt_inventory(self):
-        # df = pd.read_csv(r"/Users/ajaygour/Downloads/BTP_3April_LP.csv")
-        # df["StartTime"] = pd.to_datetime(df["StartTime"])
-        # df["EndTime"]   = pd.to_datetime(df["EndTime"])
-        # return df
-        return self._sql(
-            f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
-        )
-
-    def load_carcass_inventory(self):
-        try:
-            return self._sql(
-                f"SELECT sizeCode AS SKUCode, CarcassInv AS Carcass_Inventory "
-                f"FROM {Config.DB_NAME}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
-            )
-        except Exception:
-            return pd.DataFrame(columns=["SKUCode","Carcass_Inventory"])
-
-    def load_machine_allowable(self):
-        df = self._sql(
-            f"SELECT * FROM {Config.DB_NAME}.Master_Building_Allowable_Machines"
-        )
-        def _parse(s):
-            if pd.isna(s) or not str(s).strip(): return []
-            # keep numeric IDs (normalised) AND alphanumeric machine codes like ps3/ps4
-            out = []
-            for p in str(s).split(','):
-                p = p.strip()
-                if not p:
-                    continue
-                out.append(str(int(p)) if p.isdigit() else p)
-            return out
-        df = df.rename(columns={"Machines": "_machines_raw"})
-        df["Machines"] = df["_machines_raw"].apply(_parse)
-        # ── ps3/ps4 MASTER ON/OFF (bc_config.PS_MACHINES_ENABLED, default OFF) ──────────────
-        # OFF strips ps3/ps4 from every allowable list -> the plant's ORIGINAL line without the
-        # new machines (measures max production without them). Env PS_MACHINES=1 forces ON.
-        try:
-            from bc_config import PS_MACHINES_ENABLED as _PS_ON
-        except Exception:
-            _PS_ON = False
-        if os.environ.get("PS_MACHINES") is not None:
-            _PS_ON = (os.environ.get("PS_MACHINES") != "0")
-        if not _PS_ON:
-            df["Machines"] = df["Machines"].apply(lambda ms: [m for m in ms if m not in ("ps3", "ps4")])
-        # ps3/ps4 SKU-EXCLUSIVITY (env PS_EXCLUSIVE, default ON): any SKU allowable on a NEW
-        # ps machine is built ONLY on the ps machine(s) — the plant dedicated ps3/ps4 to these
-        # SKUs, which also frees the shared VMI pool for other inches. Removes all non-ps
-        # machines from those SKUs' allowable list.
-        import os as _os
-        # Default OFF: measured -33k (dedicating ps3/ps4's VMI-type SKUs relieves VMI, not the
-        # BJ bottleneck). ps3/ps4 add the most value SHARED in the pool. Set PS_EXCLUSIVE=1 to
-        # re-enable dedication (dynamic set via bc_config.PS_DEDICATION / _ps_dedicated_skus).
-        if _os.environ.get("PS_EXCLUSIVE", "0") == "1":
-            _PS = {"ps3", "ps4"}
-            _env = _os.environ.get("PS_EXCL_SKUS", "").strip()
-            if _env:                                     # fixed override (A/B / pinning a set)
-                _sel = {s.strip() for s in _env.split(",") if s.strip()}
-            else:                                        # DYNAMIC: choose from THIS month's demand
-                _sel = _ps_dedicated_skus(df)
-            def _ps_excl(sku, ms):
-                has_ps = [m for m in ms if m in _PS]
-                if not has_ps:
-                    return ms
-                return has_ps if sku in _sel else [m for m in ms if m not in _PS]
-            df["Machines"] = [_ps_excl(str(s).strip(), ms)
-                              for s, ms in zip(df["SKUCode"], df["Machines"])]
-        return df[["SKUCode", "Machines"]]
-
-    def load_changeover_map(self):
-        df = self._sql(f"SELECT * FROM {Config.DB_NAME}.Master_Building_ChangeoverTime")
-        co_map = {}
-        for _, r in df.iterrows():
-            co_map[str(r["MachineCode"])] = {
-                "same": float(r["Same Size(Minutes)"]) + 10,
-                "diff": float(r["Different Size(Minutes)"]) + 10,
-            }
-        return co_map
-
-    def load_sku_sizes(self):
-        df = self._sql(
-            f"SELECT SKUCode, Size "
-            f"FROM {Config.DB_NAME}.Master_Curing_Allowable_Machines"
-        )
-        return dict(zip(df["SKUCode"].astype(str), df["Size"].astype(str)))
-
-    def load_history_map(self):
-        """3-month run counts → {(machine, sku): count}.
-
-        Source: DB tables Building_Stage1_Best_Machines + Building_Stage2_Best_Machines
-        (cols: sizeCode, MachineName, count, MachineNo). Falls back to the legacy
-        master_building_stage1/2_best_machine.csv files if the DB is unavailable.
-        """
-        frames = []
-        if self.engine is not None:
-            for table in ("Building_Stage1_Best_Machines",
-                          "Building_Stage2_Best_Machines"):
-                try:
-                    frames.append(self._sql(
-                        f"SELECT MachineNo, sizeCode, count "
-                        f"FROM {Config.DB_NAME}.{table}"))
-                except Exception as e:  # noqa: BLE001
-                    print(f"  ⚠️  history table {table}: {e}")
-        if not frames:
-            here = os.path.dirname(os.path.abspath(__file__))
-            for fp in (os.path.join(here, "master_building_stage1_best_machine.csv"),
-                       os.path.join(here, "master_building_stage2_best_machine.csv")):
-                if os.path.exists(fp):
-                    try:
-                        frames.append(pd.read_csv(fp))
-                    except Exception as e:  # noqa: BLE001
-                        print(f"  ⚠️  {fp}: {e}")
-                else:
-                    print(f"  ⚠️  history source missing (DB + file): {fp}")
-
-        hist = {}
-        for df in frames:
-            for _, r in df.iterrows():
-                try:
-                    m = str(int(r["MachineNo"]))
-                    s = str(r["sizeCode"])
-                    c = float(r["count"])
-                except (ValueError, TypeError, KeyError):
-                    continue
-                if not m or not s or c <= 0:
-                    continue
-                hist[(m, s)] = hist.get((m, s), 0.0) + c
-        print(f"  [History] Loaded {len(hist)} (machine, SKU) pairs.")
-        return hist
-
-    def load_running_machines(self):
-        rows = []
-        for table, name_map in [
-            ("TBMStage1_ProductionEventData", self.S1_NAME_MAP),
-            ("TBMStage2_ProductionEventData", self.S2_NAME_MAP),
-        ]:
-            try:
-                df = self._sql(
-                    f"SELECT WorkCenter, RecipeCode "
-                    f"FROM {Config.DB_NAME}.{table} "
-                    f"ORDER BY DtAndTime DESC"
-                )
-                df = df.drop_duplicates(subset=["WorkCenter"])
-                for _, r in df.iterrows():
-                    mid = name_map.get(str(r["WorkCenter"]))
-                    if mid:
-                        rows.append({"Machine":str(mid),"SKUCode":str(r["RecipeCode"])})
-            except Exception as e:
-                print(f"  ⚠️  {table}: {e}")
-        return (
-            pd.DataFrame(rows) if rows
-            else pd.DataFrame(columns=["Machine","SKUCode"])
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2991,6 +2755,7 @@ class HybridDailyScheduler:
 # Top-level entry: reads every input from DB, runs the scheduler for
 # Config.PLANNING_DAYS days, writes the output workbook.
 def run_from_database_hybrid(plan_start=None, output_path=None):
+    from connection import ETL  # ETL now lives in the DB layer (connection.py)
     if create_engine is None:
         raise ImportError("sqlalchemy not installed.")
     plan_start = plan_start or Config.PLAN_DATE
@@ -3003,7 +2768,7 @@ def run_from_database_hybrid(plan_start=None, output_path=None):
     # Use the hardened engine (pool_pre_ping / pool_recycle) so a dropped/stale
     # connection reconnects instead of raising "invalid transaction" errors.
     try:
-        from cbc_env import make_engine as _mk
+        from bc_config import make_engine as _mk
         engine = _mk()
     except Exception:  # noqa: BLE001 — fallback to a plain engine
         engine = create_engine(

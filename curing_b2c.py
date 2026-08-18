@@ -50,7 +50,7 @@ if (os.path.exists(_VENV_PY)
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
-import cbc_env
+import bc_config
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -72,7 +72,7 @@ from bc_config import (
     PLAN_MONTH,
 )
 
-DB = cbc_env.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
+DB = bc_config.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
 
 # ── Excel colour palette (same as curing_lp.py) ───────────────────────────────
 _GREEN  = "C6EFCE"
@@ -192,151 +192,6 @@ def _load_demand(demand_path: Optional[str]) -> pd.DataFrame:
     return out[out["Demand"] > 0].reset_index(drop=True)
 
 
-def _load_cycle_times(engine) -> dict:
-    try:
-        df = _sql(engine,
-            f"SELECT Sapcode AS sku, `Cure Time` AS raw_ct "
-            f"FROM {DB}.Master_Curing_Design_CycleTime")
-        df["sku"] = df["sku"].astype(str).str.strip()
-        df["ct"]  = (pd.to_numeric(df["raw_ct"], errors="coerce") + 0) / 0.94
-        return {r["sku"]: float(r["ct"]) for _, r in df.iterrows() if pd.notna(r["ct"])}
-    except Exception as e:
-        print(f"  ⚠  Cycle times: {e}")
-        return {}
-
-
-def _load_opening_gt(engine) -> dict:
-    try:
-        df = _sql(engine,
-            f"SELECT sizeCode AS sku, gtInventory AS qty "
-            f"FROM {DB}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
-        df["sku"] = df["sku"].astype(str).str.strip()
-        df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
-        return {r["sku"]: float(r["qty"]) for _, r in df.iterrows()}
-    except Exception as e:
-        print(f"  ⚠  Opening GT inventory: {e}")
-        return {}
-
-
-def _load_opening_carcass(engine) -> dict:
-    """Opening Stage-1 CARCASS inventory per SKU (sizeCode → CarcassInv), plan_month-filtered —
-    the exact analog of _load_opening_gt for carcass_inventory_manual. Consumed FIRST in the
-    Stage-1 carcass schedule so the plant's on-hand carcass is not wasted."""
-    try:
-        df = _sql(engine,
-            f"SELECT sizeCode AS sku, CarcassInv AS qty "
-            f"FROM {DB}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
-        df["sku"] = df["sku"].astype(str).str.strip()
-        df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
-        return {r["sku"]: float(r["qty"]) for _, r in df.iterrows() if float(r["qty"]) > 0}
-    except Exception as e:
-        print(f"  ⚠  Opening carcass inventory: {e}")
-        return {}
-
-
-def _load_press_state(engine) -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: press, sku, mould_life
-    press = WCNAME_clean (e.g. "75206") — same format as CO events from
-    curing_consumption_dynamic.py. MUST NOT use wcID — that format never
-    matches CO event press IDs and silently breaks all CO transitions.
-    """
-    try:
-        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
-        if "updatedAt" in rm.columns:
-            rm = rm.drop(columns=["updatedAt"])
-
-        rm["press"]      = rm["WCNAME"].str.replace(r"(LH|RH)$", "", regex=True).str.strip()
-        rm["sku"]        = rm["Sapcode"].astype(str).str.strip()
-        rm["mould_life"] = pd.to_numeric(
-            rm["Mould life"] if "Mould life" in rm.columns else 6000,
-            errors="coerce",
-        ).fillna(6000)
-
-        valid = rm[
-            rm["press"].notna() & (rm["press"] != "") &
-            rm["sku"].notna()   & (rm["sku"]   != "") & (rm["sku"] != "nan")
-        ].copy()
-
-        # One row per press (LH+RH both strip to same WCNAME_clean with same SKU)
-        return valid[["press", "sku", "mould_life"]].drop_duplicates("press").reset_index(drop=True)
-    except Exception as e:
-        print(f"  ⚠  Press state: {e}")
-        return pd.DataFrame(columns=["press", "sku", "mould_life"])
-
-
-def _load_mould_tracker(engine) -> pd.DataFrame:
-    try:
-        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
-        # Schema-adaptive (the mapping table has flipped naming across cycles):
-        # current/original `Mould`/`Matl.Code`/`Active Flag`=1, or prior `Mold_Name`/`Item_Code`.
-        _mcols = set(_sql(engine, f"SHOW COLUMNS FROM {DB}.Master_Mapping_Mould_SKU")["Field"].astype(str))
-        if {"Mould", "Matl.Code"} <= _mcols:
-            _mwhere = " WHERE `Active Flag` = 1" if "Active Flag" in _mcols else ""
-            mms = _sql(engine,
-                f"SELECT `Mould` AS MouldNo, `Matl.Code` AS sku "
-                f"FROM {DB}.Master_Mapping_Mould_SKU{_mwhere}")
-        else:
-            mms = _sql(engine,
-                f"SELECT `Mold_Name` AS MouldNo, `Item_Code` AS sku "
-                f"FROM {DB}.Master_Mapping_Mould_SKU")
-
-        active = mms   # active-flag already applied above when present
-        compat = (active.groupby("MouldNo")["sku"]
-                        .apply(lambda x: ", ".join(x.astype(str).str.strip()))
-                        .reset_index()
-                        .rename(columns={"sku": "Compatible_SKUs"}))
-
-        assigned: dict[str, str] = {}
-        life_map: dict[str, int] = {}
-        if "Current MouldNo" in rm.columns:
-            for _, r in rm.iterrows():
-                life = int(pd.to_numeric(r.get("Mould life", 6000), errors="coerce") or 6000)
-                for mn in str(r.get("Current MouldNo", "")).split(","):
-                    mn = mn.strip()
-                    if mn:
-                        assigned[mn] = str(r.get("WCNAME", "FREE")).strip()
-                        life_map[mn] = life
-
-        rows = []
-        for _, row in compat.iterrows():
-            mn = str(row["MouldNo"]).strip()
-            rows.append({
-                "MouldNo":          mn,
-                "Compatible_SKUs":  row["Compatible_SKUs"],
-                "Life_Remaining":   life_map.get(mn, 6000),
-                "Assigned_Machine": assigned.get(mn, "FREE"),
-            })
-        return pd.DataFrame(rows)
-    except Exception as e:
-        print(f"  ⚠  Mould tracker: {e}")
-        return pd.DataFrame(columns=["MouldNo", "Compatible_SKUs", "Life_Remaining", "Assigned_Machine"])
-
-
-def _load_curing_allowable(engine) -> dict:
-    """SKUCode -> list of eligible press IDs (strings)."""
-    try:
-        df = _sql(engine, f"SELECT * FROM {DB}.Master_Curing_Allowable_Machines_source")
-        df.columns = [str(c).strip() for c in df.columns]
-        # First column is SKUCode; remaining columns are press IDs (as column names or values)
-        sku_col = df.columns[0]
-        result: dict[str, list] = {}
-        for _, row in df.iterrows():
-            sku = str(row[sku_col]).strip()
-            presses = []
-            for c in df.columns[1:]:
-                val = str(row[c]).strip()
-                if val not in ("", "nan", "None", "0"):
-                    try:
-                        presses.append(str(int(float(val))))
-                    except (ValueError, TypeError):
-                        pass
-            if presses:
-                result[sku] = presses
-        return result
-    except Exception as e:
-        print(f"  ⚠  Curing allowable: {e}")
-        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -845,8 +700,10 @@ def run_curing_b2c(
 
     Returns dict with keys: shift_rows, daily_cured, sku_cured, press_stats
     """
+    from connection import (_load_cycle_times, _load_opening_gt, _load_opening_carcass,
+                            _load_press_state, _load_mould_tracker, _load_curing_allowable)  # ETL now in the DB layer
     if engine is None:
-        engine = cbc_env.make_engine()
+        engine = bc_config.make_engine()
 
     print("\n" + "=" * 70)
     print("  B2C Curing Schedule Generator")

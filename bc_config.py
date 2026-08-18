@@ -21,7 +21,127 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-import cbc_env
+# ── env / project paths / DB engine (absorbed from the former cbc_env.py) ──
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(HERE, ".env")
+
+# Project data layout (inputs the user drops in, outputs we write).
+INPUT_DIR = os.path.join(HERE, "data", "input")
+OUTPUT_DIR = os.path.join(HERE, "data", "output")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ★ RUN PARAMETERS — EDIT THESE EACH MONTH BEFORE RUNNING ★
+#   The only lines you normally change for a new month. DEMAND_FILE uses INPUT_DIR
+#   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
+#   Detailed notes for each param remain in their original sections further below.
+# ══════════════════════════════════════════════════════════════════════════════
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
+DEMAND_FILE   = os.path.join(INPUT_DIR, "july_correct_plan.xlsx")  # per-month demand workbook
+RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
+PLANT_HOLIDAYS = False                           # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+# auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
+RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
+PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
+
+
+# Non-secret defaults only. Host/user/password/database must come from .env or
+# the process environment — there are intentionally no credential fallbacks.
+_DEFAULTS = {
+    "JKT_DB_PORT": "3306",
+    "JKT_DB_DATABASE": "jkplanningV1",
+}
+
+# Keys that must be present (no default) — accessing them when unset raises.
+_REQUIRED = ("JKT_DB_HOST", "JKT_DB_USER", "JKT_DB_PASSWORD")
+
+
+def _load_env_file(path: str = ENV_PATH) -> dict:
+    vals = dict(_DEFAULTS)
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+    # Process env overrides the file; the file overrides the defaults.
+    #
+    # IMPORTANT: we must also pick up keys that exist ONLY in the environment.
+    # In Docker there is no .env inside the image (secrets are injected with
+    # -e / --env-file), so iterating just the already-known keys would silently
+    # drop JKT_DB_HOST/USER/PASSWORD and the app would fail to boot with
+    # "Missing required config".
+    env_keys = {k for k in os.environ if k.startswith("JKT_") or k == "MES_API_KEY"}
+    for k in set(vals) | set(_REQUIRED) | env_keys:
+        v = os.environ.get(k)
+        if v:
+            vals[k] = v
+    return vals
+
+
+ENV = _load_env_file()
+
+
+def require(key: str) -> str:
+    """Return a required env value, raising a clear error if it is unset."""
+    val = ENV.get(key)
+    if not val:
+        raise RuntimeError(
+            f"Missing required config '{key}'. Set it in {ENV_PATH} "
+            f"(key=value) or as an environment variable.")
+    return val
+
+
+def db_config() -> dict:
+    """Return {host, port, user, password, database} for the planning DB."""
+    for k in _REQUIRED:
+        require(k)
+    return {
+        "host": ENV["JKT_DB_HOST"],
+        "port": int(ENV.get("JKT_DB_PORT", 3306)),
+        "user": ENV["JKT_DB_USER"],
+        "password": ENV["JKT_DB_PASSWORD"],
+        "database": ENV["JKT_DB_DATABASE"],
+    }
+
+
+def mes_api_key() -> str:
+    """MES export API key for data_fetch.py — required, no fallback."""
+    return require("MES_API_KEY")
+
+
+def db_url() -> str:
+    """SQLAlchemy URL for mysql+pymysql."""
+    c = db_config()
+    return (f"mysql+pymysql://{c['user']}:{c['password']}"
+            f"@{c['host']}:{c['port']}/{c['database']}")
+
+
+def make_engine(connect_timeout: int = 15):
+    from sqlalchemy import create_engine
+    # pool_pre_ping  → test (and transparently replace) a connection before use,
+    #                  so a dropped/stale connection reconnects instead of raising
+    #                  "Can't reconnect until invalid transaction is rolled back".
+    # pool_recycle   → recycle connections older than this (sec) before the
+    #                  remote MySQL's idle wait_timeout can kill them — important
+    #                  because the engine sits idle through the long build phase.
+    return create_engine(
+        db_url(),
+        connect_args={"connect_timeout": connect_timeout},
+        pool_pre_ping=True,
+        pool_recycle=280,
+    )
+
+
+def in_path(name: str) -> str:
+    return os.path.join(INPUT_DIR, name)
+
+
+def out_path(name: str) -> str:
+    return os.path.join(OUTPUT_DIR, name)
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ FEATURE TOGGLE — DELIVERY-DATE / PRIORITY-FLAG COMMITTED-DELIVERY SKUs ★
@@ -51,8 +171,8 @@ RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 31                                # number of days in plan horizon (July = 31)
+# PLAN_START — moved to the RUN PARAMETERS block at the top of this file
+# PLANNING_DAYS — moved to the RUN PARAMETERS block at the top of this file
 
 # ── Plant holidays — NON-working days (no building, no curing) ─────────────────
 # List of holiday dates as "YYYY-MM-DD" strings inside the plan horizon. Empty =
@@ -61,7 +181,7 @@ PLANNING_DAYS = 31                                # number of days in plan horiz
 # Aging stays CALENDAR-based (GT 3-day / carcass 1-day still age across a holiday);
 # in-flight changeovers/cleans complete during the idle day (setup crew). Env
 # PLANT_HOLIDAYS="2026-07-15,2026-07-16" overrides; cloud reads jkt_plan_params.
-PLANT_HOLIDAYS = False
+# PLANT_HOLIDAYS — moved to the RUN PARAMETERS block at the top of this file
 #   e.g. PLANT_HOLIDAYS = ["2026-07-15", "2026-07-16"]   (edit here or set the env var)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -71,7 +191,7 @@ PLANT_HOLIDAYS = False
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
+# DEMAND_FILE — moved to the RUN PARAMETERS block at the top of this file
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
@@ -86,7 +206,7 @@ BLD_CT_FILE_ENABLED = True
 # CORRECT building-CT source (per-(SKU,machine) sec/unit). Loader reads .xlsx or .csv by
 # extension (b2c_pipeline._load_bld_ct_file). The old *_Cycle_time_Building.csv variants are
 # retired — this xlsx is the single authoritative CT file.
-BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.xlsx")
+BLD_CT_FILE = os.path.join(INPUT_DIR, "Cycle_time_Building.xlsx")
 
 # ── Per-machine dominant-inch ranking file (inch-locking source) ─────────────
 # When DOMINANT_INCH_FILE_ENABLED, each building machine's dominant inch AND its
@@ -98,7 +218,7 @@ BLD_CT_FILE = os.path.join(cbc_env.INPUT_DIR, "Cycle_time_Building.xlsx")
 # OFF (default) or a missing file keeps the hardcoded dominant-inch map →
 # bit-for-bit baseline. Env DOMINANT_INCH_FILE=0 also disables.
 DOMINANT_INCH_FILE_ENABLED = True   # ADOPTED — 39-machine dominant-inch band + start-free anchor
-DOMINANT_INCH_FILE = os.path.join(cbc_env.HERE, "data", "analysis_aug",
+DOMINANT_INCH_FILE = os.path.join(HERE, "data", "analysis_aug",
                                   "machine_inch_dominant_aug.xlsx")
 
 # ── Historical inch-LOCK (INCH_HIST_LOCK) — replaces the anchor±2 band ────────
@@ -116,7 +236,7 @@ DOMINANT_INCH_FILE = os.path.join(cbc_env.HERE, "data", "analysis_aug",
 # OFF (env INCH_HIST_LOCK=0) or a missing file → current anchor±2 behaviour,
 # bit-for-bit. Overrides DOMINANT_INCH_FILE's dominant map when both are on.
 INCH_HIST_LOCK_ENABLED   = (os.environ.get("INCH_HIST_LOCK", "1") != "0")
-INCH_HIST_LOCK_FILE      = os.path.join(cbc_env.HERE, "data", "analysis_aug",
+INCH_HIST_LOCK_FILE      = os.path.join(HERE, "data", "analysis_aug",
                                         "machine_inch_dominant_4months_Apr-Jul.xlsx")
 INCH_HIST_LOCK_MIN_SHARE = float(os.environ.get("INCH_HIST_MIN_SHARE", "0.02"))
 INCH_HIST_LOCK_MAX_INCHES = int(os.environ.get("INCH_HIST_MAX_INCHES", "3"))
@@ -144,7 +264,7 @@ BLD_START_FREE_ENABLED = True
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
-# Every consumer (curing_consumption.py Phase 0, curing_b2c.py press state +
+# Every consumer (curing_consumption_dynamic.py Phase 0, curing_b2c.py press state +
 # mould tracker) imports this — never hardcode the table name anywhere else.
 # Change ONLY this line each planning cycle:
 #   august plan → "june_Daily_Running_Moulds"     (no July snapshot exists; user chose June)
@@ -153,7 +273,7 @@ BLD_START_FREE_ENABLED = True
 #   (live/rolling)                → "Daily_Running_Moulds"
 # The table lives in the DB given by JKT_DB_DATABASE (default jkplanningV1) and
 # must have columns: WCNAME, Sapcode, Mould life, Target life, Mould Fix_dt.
-RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
+# RUNNING_MOULDS_TABLE — moved to the RUN PARAMETERS block at the top of this file
 
 # ── Which month's snapshot to read from the consolidated Daily_Running_Moulds ──
 # All months now live in ONE table (Daily_Running_Moulds), discriminated by the
@@ -161,7 +281,7 @@ RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"
 # RUNNING_MOULDS_MONTH. Auto-derived from PLAN_START so it can never disagree with
 # the plan month; env RUNNING_MOULDS_MONTH overrides (e.g. to reuse a prior month's
 # snapshot). If a month ever has >1 snapshot, read the latest snapshot_date.
-RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
+# RUNNING_MOULDS_MONTH — moved to the RUN PARAMETERS block at the top of this file
 
 # ── Which month's opening inventory to read (gt_inventory_manual / carcass_inventory_manual) ──
 # Both inventory tables now hold all months in ONE table each, discriminated by the
@@ -169,7 +289,7 @@ RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strf
 # PLAN_MONTH. Auto-derived from PLAN_START (env PLAN_MONTH overrides); same value as
 # RUNNING_MOULDS_MONTH by default. Each month's snapshot is loaded from data/gt_carcass/
 # (aggregated per SKU by plcbomname). May has no data — no 2026-05 rows exist.
-PLAN_MONTH = os.environ.get("PLAN_MONTH") or PLAN_START.strftime("%Y-%m")
+# PLAN_MONTH — moved to the RUN PARAMETERS block at the top of this file
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. CURING PRESS CHANGEOVER  →  curing_consumption_dynamic.py
@@ -751,7 +871,7 @@ BUILDING_MACHINE_NAMES = {
 # 7. OUTPUT PATHS  —  derived automatically from PLAN_START
 # ══════════════════════════════════════════════════════════════════════════════
 
-_OUT      = cbc_env.OUTPUT_DIR
+_OUT      = OUTPUT_DIR
 _MAIN_OUT = os.path.join(_OUT, "main_output")
 os.makedirs(_MAIN_OUT, exist_ok=True)
 

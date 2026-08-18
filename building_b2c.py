@@ -50,7 +50,6 @@ import building as _bld
 from bc_config import PLAN_MONTH
 from building import (
     Config,
-    ETL,
     LPMinuteSolver,
     GeneticOptimiser,
     CampaignSequencer,
@@ -66,10 +65,10 @@ from building import (
     _shift_start,
 )
 
-import cbc_env
+import bc_config
 
 HERE    = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = cbc_env.OUTPUT_DIR
+OUT_DIR = bc_config.OUTPUT_DIR
 MAIN_OUT = os.path.join(OUT_DIR, "main_output")
 os.makedirs(MAIN_OUT, exist_ok=True)
 
@@ -84,42 +83,6 @@ Config.CURING_PLAN_FILE = None  # not used in B2C (we use consumption table)
 # B2C ETL  (extends building ETL with consumption table reader)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class B2C_ETL(ETL):
-    """B2C variant of the building ETL — replaces load_curing_schedule()."""
-
-    def load_consumption_table(self, path: str) -> pd.DataFrame:
-        """
-        Load the curing consumption table produced by curing_consumption.py.
-        Returns DataFrame: [SKUCode, Category, Running_Press_Count,
-                            Effective_CT_Min, Qty_Per_Press_Per_Shift,
-                            Total_GT_Per_Shift_Day0, Demand_Qty, Priority_Score]
-        """
-        xl = pd.ExcelFile(path)
-        sheet = "Consumption Summary" if "Consumption Summary" in xl.sheet_names else xl.sheet_names[0]
-        # Try multiple header rows in case a legend row is present
-        for hdr in (0, 1, 2):
-            try:
-                df = pd.read_excel(path, sheet_name=sheet, header=hdr)
-                if "SKUCode" in df.columns and "Category" in df.columns:
-                    break
-            except Exception:
-                continue
-        df["SKUCode"] = df["SKUCode"].astype(str).str.strip()
-        # Drop legend/summary rows that the Excel reader picks up as data
-        df = df[df["SKUCode"].notna() & (df["SKUCode"] != "") & (df["SKUCode"] != "nan")]
-        _valid_cats = {"Runner-In", "Non-Runner-In"}
-        if "Category" in df.columns:
-            df = df[df["Category"].isin(_valid_cats)]
-        df = df.reset_index(drop=True)
-        print(f"  [B2C ETL] Consumption table: {len(df)} rows from {os.path.basename(path)}")
-        return df
-
-    def load_gt_inventory_for_b2c(self) -> pd.DataFrame:
-        """Load REAL opening GT inventory (not zeroed out as in CBC cold-start)."""
-        return self._sql(
-            f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -381,7 +344,7 @@ class ChangeoverScheduler:
     def schedule(
         self,
         df_consumption: pd.DataFrame,
-        df_running_moulds_curing,   # from curing_consumption.py ETL
+        df_running_moulds_curing,   # from curing_consumption_dynamic.py ETL
         plan_start: datetime,
         planning_days: int,
         max_co_per_day: int = 8,
@@ -578,8 +541,9 @@ def run_from_database_b2c(
 
     Returns dict with same keys as building.run_from_database_hybrid().
     """
+    from connection import B2C_ETL  # ETL now lives in the DB layer (connection.py)
     import bc_config as _cfg
-    from cbc_env import make_engine as _mk
+    from bc_config import make_engine as _mk
 
     # Resolve defaults from bc_config (single source of truth)
     if max_changeovers_per_day is None:
@@ -824,7 +788,7 @@ def run_from_database_b2c(
 
     print("  [ETL] Loading running curing moulds (for changeover planning) …")
     try:
-        from curing_consumption import ConsumptionETL
+        from connection import ConsumptionETL
         cetl = ConsumptionETL(engine)
         df_running_curing = cetl.load_running_moulds()
     except Exception as exc:

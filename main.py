@@ -129,8 +129,8 @@ for _k, _v in CLOUD_CONFIG.items():
 # Import the engine ONLY AFTER the pin above, so every `from bc_config import X`
 # inside the engine binds to the pinned cloud value (not whatever is in the file).
 import b2c_pipeline
-import curing_consumption
-import cbc_env
+import curing_consumption_dynamic
+import bc_config
 from b2c_pipeline import run_rolling_pipeline
 import connection as conn
 
@@ -138,7 +138,7 @@ import connection as conn
 # download them. Identical format to the local run (same Excel writers).
 # In Docker set PLAN_OUTPUT_DIR=/app/output and mount a volume there.
 PLAN_OUTPUT_DIR = os.environ.get(
-    "PLAN_OUTPUT_DIR", os.path.join(cbc_env.OUTPUT_DIR, "main_output")
+    "PLAN_OUTPUT_DIR", os.path.join(bc_config.OUTPUT_DIR, "main_output")
 )
 
 
@@ -149,7 +149,7 @@ def _apply_run_cfg(run_cfg: dict) -> None:
     globals. mouldAvailability and the priority weightages are v1-dormant.
     """
     b2c_pipeline.MAX_CHANGEOVERS_PER_DAY = int(run_cfg["max_co_per_day"])
-    curing_consumption.ConsumptionConfig.PRESS_EFFICIENCY = float(run_cfg["press_efficiency"])
+    curing_consumption_dynamic.ConsumptionConfig.PRESS_EFFICIENCY = float(run_cfg["press_efficiency"])
     # Plant holidays (jkt_holiday_calendar) → the engine reads bc_config.PLANT_HOLIDAYS at
     # runtime; empty list = holiday-free run (bit-for-bit identical to no-holiday).
     _hols = list(run_cfg.get("holidays", []) or [])
@@ -165,7 +165,7 @@ def _set_running_moulds_table(name: str) -> None:
     the override exists for month-specific snapshots (e.g. parity testing).
     """
     setattr(_bc, "RUNNING_MOULDS_TABLE", name)
-    for _m in (b2c_pipeline, curing_consumption):
+    for _m in (b2c_pipeline, curing_consumption_dynamic, conn):
         if hasattr(_m, "RUNNING_MOULDS_TABLE"):
             setattr(_m, "RUNNING_MOULDS_TABLE", name)
     try:
@@ -200,7 +200,7 @@ def _set_plan_month(plan_start) -> None:
     # bc_config.PLAN_START is read directly by the holiday helpers (day-index anchor), so it
     # must reflect THIS run's start, not bc_config's file default.
     setattr(_bc, "PLAN_START", plan_start)
-    for _modname in ("curing_consumption", "curing_b2c", "curing_consumption_dynamic",
+    for _modname in ("curing_b2c", "curing_consumption_dynamic", "connection",
                      "building", "building_b2c", "b2c_pipeline"):
         try:
             _m = __import__(_modname)

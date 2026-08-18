@@ -299,13 +299,13 @@ def load_sources():
             from connection import get_engine
             return get_engine()
         except Exception:
-            from cbc_env import make_engine
+            from bc_config import make_engine
             return make_engine()
     _try("engine", _engine)
     eng = SRC.get("engine")
 
     if eng is not None:
-        from curing_consumption import ConsumptionETL
+        from connection import ConsumptionETL
         etl = ConsumptionETL(eng)
         SRC["etl"] = etl
 
@@ -372,7 +372,7 @@ def load_sources():
         _try("open_carc", _open_carc)
 
         def _bld_allow():
-            from building import ETL as BETL
+            from connection import ETL as BETL
             df = BETL(eng).load_machine_allowable()
             out: dict = {}
             for _, r in df.iterrows():

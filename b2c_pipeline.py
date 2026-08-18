@@ -50,13 +50,13 @@ _VERBOSE = (os.environ.get("VERBOSE", "0") != "0")
 
 import pandas as pd
 
-import cbc_env
+import bc_config
 from curing_consumption_dynamic import (
     run_dynamic_consumption, ConsumptionConfig, COScheduler, _SURPLUS_RELEASE_ENABLED,
 )
 from building_b2c import run_from_database_b2c
 from curing_b2c import run_curing_b2c
-from curing_consumption import ConsumptionETL
+from connection import ConsumptionETL
 
 # ── All params from bc_config (single source of truth) ────────────────────────
 from bc_config import (
@@ -675,6 +675,16 @@ _HOLIDAY_CO_DEFER = (os.environ.get("HOLIDAY_CO_DEFER", "1") != "0")
 #     writeoff ~0.9-1.4k, cured-neutral, feasibility-clean, and no-holiday runs stay bit-for-bit.
 _HOLIDAY_NO_PERISH = (os.environ.get("HOLIDAY_NO_PERISH_PREBUILD", "1") != "0")
 _HOLIDAY_BRIDGE    = (os.environ.get("HOLIDAY_BRIDGE_BUILD",       "0") != "0")
+
+# ── Holiday fix #7: pre-holiday Shift-C midnight cap. A plant holiday idles day D's own shifts,
+# but day D-1's Shift C (23:00→07:00) is a working-day shift whose 00:00→07:00 tail lands ON the
+# holiday — building would otherwise produce + start NEW COs after midnight. Cap that pre-holiday
+# Shift-C to the 23:00→00:00 window (=MIN_CAMPAIGN_MINS 60): the current SKU continues for ≤60 min,
+# ZERO new COs fire (60 - co_cost < 60 always skips), and nothing renders past 00:00. In-flight
+# curing COs (co_carry drain on the holiday) are untouched → they still complete. Default ON but
+# INERT without holidays (the (day+1) in _holiday_days guard is empty) → no-holiday bit-for-bit.
+_HOLIDAY_SHIFTC_CAP      = (os.environ.get("HOLIDAY_SHIFTC_CAP", "1") != "0")
+_HOLIDAY_SHIFTC_CAP_MINS = int(os.environ.get("HOLIDAY_SHIFTC_CAP_MINS", "60"))  # 23:00→00:00 pre-midnight window
 
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
@@ -1689,7 +1699,7 @@ def _compute_buildable_rate(engine, demand_path: str) -> dict:
     Stage-1 machines are excluded (carcass, not GT).
     """
     import ast
-    from building_b2c import B2C_ETL as _BETL
+    from connection import B2C_ETL as _BETL
     ddf  = pd.read_excel(demand_path)
     scol = next((c for c in ddf.columns if "SKU" in str(c)), ddf.columns[0])
     qcol = next((c for c in ddf.columns
@@ -1742,7 +1752,7 @@ def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int
     Reuses _greedy_inch_assignment + _bld_qty_per_shift. Independent of curing state (uses demand +
     allowable + sku_inch only), so it can run BEFORE the Phase-0 curing scheduler."""
     import ast
-    from building_b2c import B2C_ETL as _BETL
+    from connection import B2C_ETL as _BETL
     ddf  = pd.read_excel(demand_path)
     scol = next((c for c in ddf.columns if "SKU" in str(c)), ddf.columns[0])
     qcol = next((c for c in ddf.columns
@@ -3068,6 +3078,7 @@ def _assign_building_shift(
     writeoff_cum: dict | None = None,            # R8B: cumulative expired GT per SKU (cap tightener)
     fwd_work_shifts: int | None = None,          # #2 NO-PERISH: working shifts inside the GT shelf window (None → full 9)
     bridge_shifts: int = 0,                      # #3 BRIDGE: consecutive holiday shifts imminent (0 → no bridge)
+    shift_budget_mins: int | None = None,        # #7 HOLIDAY_SHIFTC_CAP: per-shift minute budget override (None → SHIFT_MINS)
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -3086,6 +3097,8 @@ def _assign_building_shift(
     # R8B cap tightener: demand-cap ceilings subtract cumulative expired GT so a SKU is
     # never rebuilt to replace written-off (wasted) GT → total built <= demand.
     _woc = writeoff_cum if writeoff_cum is not None else {}
+    # #7 HOLIDAY_SHIFTC_CAP: this shift's per-machine minute budget (None → full SHIFT_MINS).
+    _sbud = float(shift_budget_mins) if shift_budget_mins is not None else float(SHIFT_MINS)
     # Client inch-rule state (persisted across shifts by run_rolling_pipeline).
     machine_anchor_inch = machine_anchor_inch if machine_anchor_inch is not None else {}
     machine_used_inches = machine_used_inches if machine_used_inches is not None else {}
@@ -3393,7 +3406,7 @@ def _assign_building_shift(
         machines = [m for m in machine_skus if _MACHINE_GROUP.get(m, "") != "STAGE1"]
         stg = {
             m: {
-                "remaining": float(SHIFT_MINS), "co_count": 0, "max_cos": _max_cos(m),
+                "remaining": _sbud, "co_count": 0, "max_cos": _max_cos(m),
                 "cur_sku": machine_current_sku.get(m, ""),
                 "rate": _bld_qty_per_shift(m) / SHIFT_MINS,
                 "dom": _MACHINE_DOMINANT_INCH.get(
@@ -4198,7 +4211,7 @@ def _assign_building_shift(
         if not any(_deficit(s) > 0 for s in eligible):
             continue
 
-        remaining = SHIFT_MINS
+        remaining = _sbud
         co_count  = 0
         MAX_COS   = _max_cos(machine)
         cur_sku   = machine_current_sku.get(machine, "")
@@ -5924,7 +5937,7 @@ def run_rolling_pipeline(
     _buildable_rate = None
     if _SURPLUS_RELEASE_ENABLED:
         try:
-            from cbc_env import make_engine as _mk
+            from bc_config import make_engine as _mk
             _buildable_rate = _compute_buildable_rate(_mk(), demand_path)
             print(f"  [Rolling] Surplus-release ON — buildable_rate for "
                   f"{len(_buildable_rate)} SKUs (5b guard)")
@@ -5935,8 +5948,8 @@ def run_rolling_pipeline(
     _early_sku_inch = None
     if _CURING_INCH_ALIGN or _GROUP_INCH_POLICY:
         try:
-            from cbc_env import make_engine as _mk_si
-            from building_b2c import B2C_ETL as _BETL_si
+            from bc_config import make_engine as _mk_si
+            from connection import B2C_ETL as _BETL_si
             _etl_si = _BETL_si(_mk_si())
             _early_sku_inch = {str(k): str(v).strip().replace('"', "")
                                for k, v in _etl_si.load_sku_sizes().items()}
@@ -5955,7 +5968,7 @@ def run_rolling_pipeline(
     _feed_ctx: dict | None = None                   # PERSKU_FEED: lock-aware SKU->machines + GT/day
     if _GROUP_INCH_POLICY and _early_sku_inch:
         try:
-            from cbc_env import make_engine as _mk_cp
+            from bc_config import make_engine as _mk_cp
             _cp = _co_plan_supply(_mk_cp(), demand_path, _early_sku_inch, planning_days)
             _coplan_lock = _cp["bjus_lock"]
             _building_inch_capacity = _cp["building_inch_capacity"]
@@ -5994,7 +6007,7 @@ def run_rolling_pipeline(
         co_by_day = {}
 
     # ── B: Master data ────────────────────────────────────────────────────────
-    from cbc_env import make_engine
+    from bc_config import make_engine
     engine = make_engine()
 
     cetl = ConsumptionETL(engine)
@@ -6027,7 +6040,7 @@ def run_rolling_pipeline(
     # the STAGE1 skip below. Used only for Step 3b carcass-utilization simulation.
     sku_inch: dict[str, str] = {}
     try:
-        from building_b2c import B2C_ETL as _BETL
+        from connection import B2C_ETL as _BETL
         _etl = _BETL(engine)
         df_allow    = _etl.load_machine_allowable()
         sku_to_size = _etl.load_sku_sizes()
@@ -6364,7 +6377,7 @@ def run_rolling_pipeline(
 
     # ── D: Opening GT inventory ───────────────────────────────────────────────
     try:
-        from curing_b2c import _load_opening_gt
+        from connection import _load_opening_gt
         opening_gt = _load_opening_gt(engine)
     except Exception:
         opening_gt = {}
@@ -6431,7 +6444,7 @@ def run_rolling_pipeline(
     opening_carcass: dict[str, float] = {}
     if _CARCASS_INV_ENABLED:
         try:
-            from curing_b2c import _load_opening_carcass
+            from connection import _load_opening_carcass
             opening_carcass = _load_opening_carcass(engine)
         except Exception:
             opening_carcass = {}
@@ -6473,7 +6486,7 @@ def run_rolling_pipeline(
         demand_df.columns[1],
     )
     # Sum duplicate SKU rows (a SKU may appear on several demand line-items).
-    # MUST match curing_consumption.py's groupby-sum, otherwise the building
+    # MUST match curing_consumption_dynamic.py's groupby-sum, otherwise the building
     # demand universe silently diverges from curing's: a plain dict keyed by
     # SKUCode would keep only the LAST duplicate row and drop the rest (e.g.
     # LSTL0 71,000 + 20,680 → only 20,680 survives), capping building far below
@@ -6536,7 +6549,7 @@ def run_rolling_pipeline(
     # Priority score for dynamic CO target selection (higher = serve first).
     # ConsolidatedPriorityScore (v1) — min-max normalise the per-SKU requirement,
     # computed from demand_dict (already summed per SKU) so it matches
-    # curing_consumption.load_demand exactly and is identical whether the demand
+    # curing_consumption_dynamic.load_demand exactly and is identical whether the demand
     # came from a local Excel or the cloud DB `jkt_demand` table (no priority
     # column). v1 uses REQUIREMENT ONLY; any priority column in the file is ignored.
     #   score = (q - q_min) / (q_max - q_min)   (1.0 for all if q_max == q_min)
@@ -8082,6 +8095,13 @@ def run_rolling_pipeline(
                 # shelf guard: GT built now must survive to the first post-holiday shift (≤ 9 shifts ≈ 3 days)
                 if _bridge_shifts + (2 - _si_now) > GT_SHELF_LIFE_SHIFTS:
                     _bridge_shifts = 0
+            # #7 HOLIDAY_SHIFTC_CAP: cap day-D Shift C to the 23:00→00:00 pre-midnight window when
+            # day D+1 is a holiday, so no building production / new CO lands on the holiday.
+            _shift_budget = (
+                _HOLIDAY_SHIFTC_CAP_MINS
+                if (_HOLIDAY_SHIFTC_CAP and shift == "C"
+                    and (day + 1) <= planning_days and (day + 1) in _holiday_days)
+                else SHIFT_MINS)
             shift_plan = _assign_building_shift(
                 shift_cure_demand=dict(shift_cure_demand),
                 machine_skus=_ms_capped,
@@ -8097,6 +8117,7 @@ def run_rolling_pipeline(
                 days_left=_working_days_left(day),   # holiday-aware urgency horizon
                 fwd_work_shifts=_fwd_work_shifts,     # #2 NO-PERISH: shelf window capped to working shifts
                 bridge_shifts=_bridge_shifts,         # #3 BRIDGE: pre-build through an imminent holiday
+                shift_budget_mins=_shift_budget,      # #7 HOLIDAY_SHIFTC_CAP: cap pre-holiday Shift C at midnight
                 writeoff_cum=writeoff_cum,           # R8B: cap tightener (built <= demand)
                 demand_dict=demand_dict,
                 machine_total_demand=machine_total_demand,
@@ -8201,7 +8222,12 @@ def run_rolling_pipeline(
 
                 def _s1cap(_m):
                     if _m not in _gate_cap:
-                        _gate_cap[_m] = float(_bld_qty_per_shift(_m))
+                        # #7 HOLIDAY_SHIFTC_CAP: carcass PASS-2 pre-build uses the FULL-shift Stage-1
+                        # capacity, independent of the (now-capped) Stage-2 GT — so scale it by the
+                        # same shift-budget ratio, else day-D Shift C carcass renders past midnight.
+                        # Ratio is 1.0 on every non-capped shift → bit-for-bit.
+                        _gate_cap[_m] = (float(_bld_qty_per_shift(_m))
+                                         * (float(_shift_budget) / SHIFT_MINS))
                     return _gate_cap[_m]
 
                 def _bank_avail(_sku):

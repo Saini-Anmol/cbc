@@ -57,18 +57,11 @@ if (os.path.exists(_VENV_PY)
     os.environ["BC_REEXEC"] = "1"
     os.execv(_VENV_PY, [_VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
 
-import cbc_env
-from curing_consumption import (
-    ConsumptionConfig,
-    ConsumptionETL,
-    SKUClassifier,
-    CycleTimeResolver,
-    SKUEligibilityFilter,
-)
+import bc_config
 
 HERE    = os.path.dirname(os.path.abspath(__file__))
-IN_DIR  = cbc_env.INPUT_DIR
-OUT_DIR = cbc_env.OUTPUT_DIR
+IN_DIR  = bc_config.INPUT_DIR
+OUT_DIR = bc_config.OUTPUT_DIR
 
 
 # Now, this is the inpput and output sheet, i have production data and receipe master and i wants final output in the output. We have to take each unique value from the recipeID and then count how many times occuring in the production data sheet, and then search this recipeID in the receipe master "id" column, and then extract SKUCode from this. Then, i wants this SKUCode and Requirement as the total count. You can refer from the 2 output samples as well. I wants the python script as well as the complete output sheet within the excel file
@@ -89,6 +82,271 @@ from bc_config import (
     DYNAMIC_CC_OUTPUT,
 )
 import bc_config as _bc
+from bc_config import RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ETL + CONFIG (merged from the former curing_consumption.py — single source now)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConsumptionConfig:
+    # ── planning horizon ──────────────────────────────────────────────────────
+    PLANNING_DAYS      = 30
+    HOURS_PER_SHIFT    = 8
+    SHIFT_MINS         = 480        # minutes per shift
+
+    # ── press physics ─────────────────────────────────────────────────────────
+    CAVITIES_PER_MOULD    = 2
+    LOAD_UNLOAD_BUFFER_MIN = 0
+    PRESS_EFFICIENCY       = 0.94
+    # Default EFFECTIVE cycle time for SKUs missing from the CT master.
+    # Already includes buffer + efficiency — do NOT re-apply the formula.
+    DEFAULT_CYCLE_TIME_MIN = 17.0
+
+    # ── downtime (minutes) — used for press exclusion logic ───────────────────
+
+    # ── changeover cap ────────────────────────────────────────────────────────
+
+    # ── database ──────────────────────────────────────────────────────────────
+    DB_NAME = bc_config.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ETL  (adapted from curing_lp.ETL — loads the three DB tables we need)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SKU CLASSIFIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SKUClassifier:
+    """Classify demand SKUs into Runner-In and Non-Runner-In only."""
+
+    def classify(
+        self,
+        df_demand: pd.DataFrame,
+        df_running_moulds: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Returns DataFrame with columns:
+          [SKUCode, Category, RunningPressCount, MouldLife_min]
+
+        Only demand SKUs are classified — presses running non-demand SKUs
+        (Runner-Out) are excluded from the consumption table entirely.
+        """
+        demand_skus  = set(df_demand["SKUCode"].str.strip())
+        # Group running moulds by SKU to count active presses
+        press_count = (
+            df_running_moulds.groupby("SKUCode")
+            .agg(
+                RunningPressCount=("Machine", "count"),
+                MouldLife_min=("MouldLife_remaining", "min"),
+            )
+            .reset_index()
+        )
+        press_count["SKUCode"] = press_count["SKUCode"].str.strip()
+        running_skus = set(press_count["SKUCode"])
+
+        # Only iterate demand SKUs — Runner-Out (non-demand) are not included
+        rows = []
+        for sku in sorted(demand_skus):
+            is_running = sku in running_skus
+            cat = "Runner-In" if is_running else "Non-Runner-In"
+
+            pc_row = press_count[press_count["SKUCode"] == sku]
+            run_count  = int(pc_row["RunningPressCount"].values[0]) if len(pc_row) else 0
+            mould_life = int(pc_row["MouldLife_min"].values[0])     if len(pc_row) else 0
+            rows.append({
+                "SKUCode":           sku,
+                "Category":          cat,
+                "RunningPressCount": run_count,
+                "MouldLife_min":     mould_life,
+            })
+
+        return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CYCLE TIME RESOLVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CycleTimeResolver:
+    """Resolve effective cycle time per SKU; fall back to DEFAULT_CYCLE_TIME_MIN."""
+
+    def resolve(
+        self,
+        skus: list[str],
+        df_cycle_times: pd.DataFrame,
+    ) -> dict[str, float]:
+        """Returns {SKUCode: effective_CT_min}."""
+        ct_lookup = dict(zip(
+            df_cycle_times["SKUCode"].str.strip(),
+            df_cycle_times["CycleTime_min"].astype(float),
+        ))
+        result = {}
+        for sku in skus:
+            ct = ct_lookup.get(sku)
+            if ct is None or (isinstance(ct, float) and math.isnan(ct)) or ct <= 0:
+                ct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+            result[sku] = float(ct)
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSUMPTION CALCULATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConsumptionCalculator:
+    """Compute GT consumption per shift per SKU and build the planning-horizon table."""
+
+    def compute(
+        self,
+        df_classify: pd.DataFrame,
+        ct_map: dict[str, float],
+        df_demand: pd.DataFrame,
+        plan_start: datetime,
+        planning_days: int = 30,
+    ) -> pd.DataFrame:
+        """
+        Returns the full consumption DataFrame covering all planning shifts.
+
+        Columns:
+          SKUCode, Category, Running_Press_Count, Effective_CT_Min,
+          Qty_Per_Press_Per_Shift, Total_GT_Per_Shift_Day0,
+          Demand_Qty, Priority_Score
+        """
+        # Merge demand info
+        demand_lookup  = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Quantity"]))
+        priority_lookup = dict(zip(df_demand["SKUCode"].str.strip(), df_demand["Priority"]))
+
+        records = []
+        for _, row in df_classify.iterrows():
+            sku        = row["SKUCode"]
+            category   = row["Category"]
+            press_count = int(row["RunningPressCount"])
+
+            ct = ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
+            qty_per_press = math.floor(ConsumptionConfig.SHIFT_MINS / ct) \
+                            * ConsumptionConfig.CAVITIES_PER_MOULD
+            total_gt = press_count * qty_per_press
+
+            records.append({
+                "SKUCode":                  sku,
+                "Category":                 category,
+                "Running_Press_Count":       press_count,
+                "MouldLife_min":             int(row["MouldLife_min"]),
+                "Effective_CT_Min":          ct,
+                "Qty_Per_Press_Per_Shift":   qty_per_press,
+                "Total_GT_Per_Shift_Day0":   total_gt,
+                "Demand_Qty":                demand_lookup.get(sku, 0),
+                "Priority_Score":            priority_lookup.get(sku, 0),
+            })
+
+        df = pd.DataFrame(records)
+        # Sort: Runner-In first, then Runner-Out, then Non-Runner-In; within each by priority desc
+        cat_order = {"Runner-In": 0, "Runner-Out": 1, "Non-Runner-In": 2}
+        df["_cat_ord"] = df["Category"].map(cat_order)
+        df = df.sort_values(["_cat_ord", "Priority_Score"], ascending=[True, False]) \
+               .drop(columns=["_cat_ord"]) \
+               .reset_index(drop=True)
+        return df
+
+    def build_shift_index(
+        self,
+        plan_start: datetime,
+        planning_days: int,
+    ) -> list[tuple[datetime, str, int]]:
+        """
+        Returns list of (shift_start_dt, shift_label, shift_idx) for all planning shifts.
+        Shift labels: A (07-15), B (15-23), C (23-07+1).
+        """
+        shifts = []
+        shift_hours = [7, 15, 23]
+        shift_labels = ["A", "B", "C"]
+        # Start one shift before plan_start (building pre-start shift)
+        pre_start = plan_start - timedelta(hours=ConsumptionConfig.HOURS_PER_SHIFT)
+        for day_offset in range(-1, planning_days):  # -1 = pre-start day
+            base_date = plan_start.date() + timedelta(days=day_offset)
+            for sh, label in zip(shift_hours, shift_labels):
+                dt = datetime(base_date.year, base_date.month, base_date.day, sh, 0, 0)
+                if dt >= pre_start:
+                    shifts.append((dt, label, len(shifts)))
+        return shifts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SKU ELIGIBILITY FILTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SKUEligibilityFilter:
+    """
+    Checks each demand SKU against building and curing master + history data.
+
+    Eligibility rules:
+      - Building OK  : SKU in (Master_Building_Allowable OR Building_Stage1/2_History)
+      - Curing OK    : SKU in (Master_Curing_Allowable  OR testing_Daily_Running_Moulds history)
+      - BOTH must be OK; failing either → excluded with remark
+
+    CT missing is NOT an exclusion criterion — default CT = 17 min is used instead.
+    """
+
+    def filter(
+        self,
+        df_demand: pd.DataFrame,
+        bld_master_skus: set,
+        bld_history_skus: set,
+        cur_master_skus: set,
+        cur_history_skus: set,
+    ) -> tuple:
+        """
+        Returns (df_eligible, df_excluded).
+
+        df_excluded columns:
+          SKUCode, Demand_Qty, Priority_Score, Remark
+        """
+        bld_pool = {s.upper() for s in bld_master_skus}
+        cur_pool = {s.upper() for s in cur_master_skus}
+
+        eligible_rows: list[dict] = []
+        excluded_rows: list[dict] = []
+
+        for _, row in df_demand.iterrows():
+            sku    = str(row["SKUCode"]).strip()
+            sku_up = sku.upper()
+            in_bld = sku_up in bld_pool
+            in_cur = sku_up in cur_pool
+
+            if in_bld and in_cur:
+                eligible_rows.append(row.to_dict())
+            else:
+                missing = []
+                if not in_bld:
+                    missing.append("building machine")
+                if not in_cur:
+                    missing.append("curing mould")
+                excluded_rows.append({
+                    "SKUCode":        sku,
+                    "Demand_Qty":     float(row.get("Quantity", 0)),
+                    "Priority_Score": float(row.get("Priority", 0)),
+                    "Remark": f"No PDE & master data- {', '.join(missing)}",
+                })
+
+        df_eligible = (
+            pd.DataFrame(eligible_rows)
+            if eligible_rows
+            else df_demand.iloc[0:0].copy()
+        )
+        df_excluded = (
+            pd.DataFrame(excluded_rows)
+            if excluded_rows
+            else pd.DataFrame(
+                columns=["SKUCode", "Demand_Qty", "Priority_Score", "Remark"]
+            )
+        )
+        return df_eligible, df_excluded
+
 
 
 # ── Plant-holiday support: working-days-left urgency horizon ──────────────────
@@ -1904,6 +2162,7 @@ def run_dynamic_consumption(
     Returns dict with keys:
         daily_sheets, co_events, ct_map, df_day0
     """
+    from connection import ConsumptionETL  # ETL lives in the DB layer (connection.py)
     if demand_path is None:
         # Auto-detect demand file in input dir
         for fname in sorted(os.listdir(IN_DIR), reverse=True):
@@ -1927,7 +2186,7 @@ def run_dynamic_consumption(
     print(f"  Demand file : {os.path.basename(demand_path)}")
     print(f"  Plan start  : {plan_start.strftime('%d-%b-%Y')} | Days: {planning_days}")
 
-    engine = cbc_env.make_engine()
+    engine = bc_config.make_engine()
     etl = ConsumptionETL(engine)
 
     print("\n  [ETL] Loading demand …")
@@ -1972,7 +2231,6 @@ def run_dynamic_consumption(
     print(f"  [CT] {len(ct_map)} SKUs | {n_default} using default {ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN} min")
 
     # Build Day 0 consumption table (same as curing_consumption.py output)
-    from curing_consumption import ConsumptionCalculator
     calc = ConsumptionCalculator()
     df_day0 = calc.compute(df_classify, ct_map, df_demand, plan_start, planning_days)
     df_day0["Skip_Reason"] = ""   # eligible demand SKUs — no skip
