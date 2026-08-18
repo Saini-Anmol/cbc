@@ -194,15 +194,18 @@ def read_db(engine, plan_id: str):
     end = pd.to_datetime(_ed)
     planning_days = int((end.normalize() - start.normalize()).days) + 1
 
-    # ── plant holidays for THIS plan (jkt_holiday_calendar) ──────────────────────
-    # Full-day rows only (shift-level partial holidays are a later phase). Each active
-    # full-day row's [start_date, end_date] span is expanded to individual YYYY-MM-DD
-    # dates; multiple rows are unioned. Absent table / no rows → [] (holiday-free run).
+    # ── plant holidays (jkt_holiday_calendar) — FIXED, month-keyed, NOT per plan_id ──────
+    # Holidays are a fixed plant calendar with their OWN id (independent of plan_id). Rows are
+    # selected by plan_month = the plan's START month ("YYYY-MM", char(15)); the plan_start
+    # month drives the lookup. Full-day rows only (is_full_day = 1). Each row's
+    # [start_date, end_date] span is expanded to individual YYYY-MM-DD dates; multiple rows are
+    # unioned. Absent table / no rows → [] (holiday-free run, bit-for-bit no-holiday plan).
+    _pm = start.strftime("%Y-%m")
     def _read_holidays():
         try:
             hdf = pd.read_sql(text(
                 "SELECT start_date, end_date FROM jkt_holiday_calendar "
-                "WHERE plan_id = :p AND is_full_day = 1"), engine, params={"p": plan_id})
+                "WHERE plan_month = :pm AND is_full_day = 1"), engine, params={"pm": _pm})
         except Exception as _he:
             print(f"[read_db] holiday-calendar read skipped ({type(_he).__name__}: {_he})")
             return []
@@ -216,7 +219,7 @@ def read_db(engine, plan_id: str):
         return sorted(days)
     _holidays = _read_holidays()
     if _holidays:
-        print(f"[read_db] plant holidays for plan_id={plan_id}: {_holidays}")
+        print(f"[read_db] plant holidays for plan_month={_pm}: {_holidays}")
 
     run_cfg = {
         "plan_id":          plan_id,

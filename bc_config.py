@@ -51,7 +51,7 @@ RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
 #    Change PLAN_START and PLANNING_DAYS each month before running.
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                                # number of days in plan horizon (July = 31)
 
 # ── Plant holidays — NON-working days (no building, no curing) ─────────────────
@@ -71,7 +71,7 @@ PLANT_HOLIDAYS = False
 #                      ConsolidatedPriorityScore
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "july_correct_plan.xlsx")
+DEMAND_FILE = os.path.join(cbc_env.INPUT_DIR, "august_demand_tomerji.xlsx")
 
 # ── Per-(SKU × machine) building cycle-time file ─────────────────────────────
 # When BLD_CT_FILE_ENABLED, building CT (sec/unit) is looked up per (SKU, machine)
