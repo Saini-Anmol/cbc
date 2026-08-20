@@ -40,6 +40,7 @@ import os
 import math
 import sys
 import tempfile
+import hashlib
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 
@@ -2111,6 +2112,10 @@ def _fifo_reconcile_greedy(opening_carcass: dict, bld_shift_rows: list,
     for r in bld_shift_rows:
         if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
                 and (r.get("Qty", 0) or 0) > 0):
+            # NOTE (mid-month latent): this uses day-of-month; prod_log above uses loop-day. Only
+            # consistent for a 1st-of-month start. _CV2_A4 (the only caller) is default OFF, so it
+            # doesn't hit the mid-month path today; if enabled mid-month, thread plan_start in and
+            # make this plan-relative (see _planday in run_rolling_pipeline).
             _day = int(str(r["Date"]).split("-")[-1])
             s2_rows[(str(r["SKUCode"]), (_day - 1) * 3 + sord.get(r.get("Shift"), 0))].append(r)
     demand: dict = defaultdict(float)        # (sku,g) -> Stage-2 GT consumption
@@ -5861,6 +5866,139 @@ def _inject_label_columns(xlsx_path: str, sku_desc: dict,
         pass
 
 
+# ── Mid-month plan start: deduct already-completed production from demand ──────────────
+# Feature: a plan may start on any date. For a mid-month start we first run a full-month plan
+# (Run 1) to SIMULATE the production the plant already made on days 1..(start-1), deduct that
+# (per SKU) from the original demand, then run the ACTUAL plan (Run 2) for start..month-end on
+# the reduced demand. day==1 or toggle OFF → single run, bit-for-bit unchanged. Local-only for
+# now (wired in local_main.py); the cloud path (main.run_plan) will call this in a later step.
+_MIDMONTH_DEDUCT = os.environ.get("MIDMONTH_DEDUCT", "1") != "0"   # default ON; MIDMONTH_DEDUCT=0 disables
+# (inert for a 1st-of-month PLAN_START → single run, bit-for-bit; only local_main uses the 2pass wrapper)
+_MIDMONTH_SIM_LO = float(os.environ.get("MIDMONTH_SIM_LO", "0.90"))
+_MIDMONTH_SIM_HI = float(os.environ.get("MIDMONTH_SIM_HI", "1.05"))
+
+
+def _midmonth_sim_factor(sku: str) -> float:
+    """Deterministic per-SKU production-simulation factor in [LO, HI]. Uses hashlib (NOT random()
+    / builtin hash()) so it is identical across processes and PYTHONHASHSEED values — matching the
+    pipeline's reproducibility guarantee."""
+    _h = hashlib.md5(str(sku).encode("utf-8")).hexdigest()
+    _frac = int(_h[:8], 16) / 0xFFFFFFFF                      # deterministic [0,1]
+    return _MIDMONTH_SIM_LO + _frac * (_MIDMONTH_SIM_HI - _MIDMONTH_SIM_LO)
+
+
+def _extract_cured_through_day(curing_xlsx: str, run_start: datetime, k_days: int) -> dict:
+    """Per-SKU CURED qty over days 1..k_days of a completed run, read from its curing Shift
+    Schedule sheet (production rows = Qty>0; CO/clean rows are Qty 0)."""
+    cutoff = (run_start.date() + timedelta(days=k_days - 1))   # last produced day (inclusive)
+    df = pd.read_excel(curing_xlsx, sheet_name="Shift Schedule")
+    df["_d"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df["_q"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0.0)
+    m = (df["_d"].notna()) & (df["_d"] <= cutoff) & (df["_q"] > 0)
+    return df.loc[m].groupby("SKUCode")["_q"].sum().to_dict()
+
+
+def _write_deducted_demand(demand_path: str, produced: dict, out_path: str) -> dict:
+    """Write a demand workbook = original with each SKU's qty reduced by simulated production
+    (planned_cured × per-SKU factor), floored at 0. Scales every row of a SKU by the SKU's
+    updated/original ratio so multi-row files and all other columns (Priority Flag / Delivery
+    Date) are preserved. Returns the per-SKU simulated-production dict for reporting."""
+    df = pd.read_excel(demand_path)
+    sku_col = next((c for c in ("SKUCode", "skuCode", "sku_code", "Sapcode") if c in df.columns),
+                   df.columns[0])
+    qty_col = next((c for c in ("Quantity", "Updated_Requirement", "Requirement") if c in df.columns),
+                   None)
+    if qty_col is None:
+        raise ValueError(f"[midmonth] no qty column in {demand_path} (cols={list(df.columns)})")
+    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+    orig_tot = df.groupby(sku_col)[qty_col].sum().to_dict()
+    simulated = {s: float(q) * _midmonth_sim_factor(s) for s, q in produced.items()}
+    scale = {}
+    for s, o in orig_tot.items():
+        upd = max(0.0, o - simulated.get(s, 0.0))
+        scale[s] = (upd / o) if o > 0 else 0.0
+    df[qty_col] = df.apply(lambda r: r[qty_col] * scale.get(r[sku_col], 1.0), axis=1)
+    df.to_excel(out_path, index=False)
+    return simulated
+
+
+def run_rolling_pipeline_2pass(
+    demand_path:    str | None = None,
+    plan_start:     datetime | None = None,
+    planning_days:  int | None = None,
+    build_output:   str | None = None,
+    curing_output:  str | None = None,
+    sku_desc_map:   dict | None = None,
+    restrict_to_allowable_presses: bool = False,
+) -> dict:
+    """Mid-month wrapper around run_rolling_pipeline (see block comment above). When
+    _MIDMONTH_DEDUCT is ON and plan_start is not the 1st, runs Run 1 (full month, original demand)
+    to simulate days 1..(start-1) production, deducts it, then runs + returns Run 2 (start..end,
+    reduced demand). Otherwise a single normal run (bit-for-bit)."""
+    demand_path   = demand_path   or DEMAND_FILE
+    plan_start    = plan_start    or PLAN_START
+    planning_days = planning_days or PLANNING_DAYS
+    if (not _MIDMONTH_DEDUCT) or plan_start.day == 1:
+        return run_rolling_pipeline(demand_path, plan_start, planning_days,
+                                    build_output, curing_output, sku_desc_map,
+                                    restrict_to_allowable_presses)
+    k_days = plan_start.day - 1                                   # already-produced days 1..k
+    run1_start = plan_start.replace(day=1)
+    run1_days = k_days + planning_days                            # 1st .. same end date
+    _tmp = tempfile.mkdtemp(prefix="midmonth_")
+    r1_bld = os.path.join(_tmp, "run1_bld.xlsx")
+    r1_cur = os.path.join(_tmp, "run1_cur.xlsx")
+    print(f"[midmonth] mid-month start day={plan_start.day}: Run 1 full month "
+          f"({run1_start.date()} +{run1_days}d), snapshot state at day {plan_start.day} (07:00)")
+    res1 = run_rolling_pipeline(demand_path, run1_start, run1_days, r1_bld, r1_cur,
+                                sku_desc_map, restrict_to_allowable_presses,
+                                snapshot_at_day=plan_start.day)
+    snap = res1.get("state_snapshot")
+    if snap is None:
+        raise RuntimeError("[midmonth] Run 1 returned no state_snapshot (snapshot_at_day missed)")
+    # Cured on days 1..k (finished tyres already produced) = original demand − demand still
+    # remaining at the snapshot. This is what gets simulated (×factor) and deducted.
+    _dd, _drem = snap["demand_dict"], snap["demand_remaining"]
+    produced = {s: max(0.0, _dd.get(s, 0.0) - _drem.get(s, 0.0)) for s in _dd}
+    produced = {s: q for s, q in produced.items() if q > 0}
+    upd_path = os.path.join(_tmp, "updated_demand.xlsx")
+    simulated = _write_deducted_demand(demand_path, produced, upd_path)
+    print(f"[midmonth] cured 1..{k_days} = {sum(produced.values()):,.0f}; simulated (×0.90-1.05) "
+          f"= {sum(simulated.values()):,.0f} tyres over {len(simulated)} SKUs deducted → "
+          f"Run 2 ({plan_start.date()} +{planning_days}d) seeded from day-{plan_start.day} state")
+    res = run_rolling_pipeline(upd_path, plan_start, planning_days,
+                              build_output, curing_output, sku_desc_map,
+                              restrict_to_allowable_presses, initial_state=snap)
+    res["midmonth"] = {"k_days": k_days, "run1_start": run1_start, "run1_days": run1_days,
+                       "sku_count": len(simulated),
+                       "cured_prior": sum(produced.values()),
+                       "simulated_total": sum(simulated.values())}
+    # Export the day-start opening (aged GT lots + carcass totals) so the feasibility auditor can
+    # seed from the ACTUAL Run-2 opening (--midmonth-opening) instead of the 1st-of-month DB.
+    # age_days = snap_day − build_day (GT lot age at the start date); auditor seeds each as (−age).
+    try:
+        import json as _json
+        _snap_day = int(snap["_snap_day"])
+        _mm_open = {"snap_day": _snap_day, "plan_start": str(plan_start.date()),
+                    "gt_lots": {}, "carcass": {}}
+        for _s, _lots in snap["gt_lots"].items():
+            _ls = [[max(0, _snap_day - int(_bd)), float(_q)] for _bd, _q in _lots if _q > 0]
+            if _ls:
+                _mm_open["gt_lots"][str(_s)] = _ls
+        for _s, _b in snap["carcass_bank"].items():
+            _tot = float(sum(_q for _a, _q in _b))
+            if _tot > 0:
+                _mm_open["carcass"][str(_s)] = _tot
+        _open_json = os.path.splitext(build_output or BUILD_OUTPUT)[0] + "_midmonth_opening.json"
+        with open(_open_json, "w") as _f:
+            _json.dump(_mm_open, _f)
+        res["midmonth_opening_file"] = _open_json
+        print(f"[midmonth] day-{plan_start.day} opening exported for audit → {_open_json}")
+    except Exception as _e:
+        print(f"[midmonth] opening export failed ({_e})")
+    return res
+
+
 def run_rolling_pipeline(
     demand_path:    str | None = None,
     plan_start:     datetime | None = None,
@@ -5869,6 +6007,8 @@ def run_rolling_pipeline(
     curing_output:  str | None = None,
     sku_desc_map:   dict | None = None,
     restrict_to_allowable_presses: bool = False,
+    snapshot_at_day: int | None = None,
+    initial_state:   dict | None = None,
 ) -> dict:
     """
     Rolling day-by-day B2C pipeline.
@@ -5988,6 +6128,13 @@ def run_rolling_pipeline(
         feed_ctx=_feed_ctx,
         priority_deadline_map=(priority_deadline_map if _prio_active else None),
         reactive_only=_REACTIVE_ONLY,   # Part B: skip planned schedule + CC workbook
+        # STAGE 3 (mid-month): seed the CO planner from the carried day-K press positions (same as
+        # the day-loop injection) so plan and execution agree. None on a normal run → Day-0 snapshot.
+        initial_press_state=({
+            "press_to_sku": {p: v["sku"] for p, v in initial_state["press_state"].items()},
+            "mould_life": initial_state.get("mould_life", {}),
+            "press_moulds": {p: list(m) for p, m in initial_state.get("press_moulds", {}).items()},
+        } if initial_state is not None else None),
     )
     co_events = cc_result["co_events"]
     df_day0   = cc_result["df_day0"]
@@ -6125,7 +6272,8 @@ def run_rolling_pipeline(
                 # The planning assumption: Stage-1 always has capacity to supply
                 # whatever Stage-2 needs (validated: Stage-1 util ≈ 33% by design).
                 if _MACHINE_GROUP.get(m_str, "") == "STAGE1":
-                    s1_sku_to_machines[sku].add(m_str)
+                    if m_str != "6801":          # 6801 is plant-RETIRED — not an eligible carcass
+                        s1_sku_to_machines[sku].add(m_str)   # machine (R14 expects the 14 live S1)
                     continue
                 machine_skus[m_str].add(sku)
                 sku_machine_map[sku].add(m_str)
@@ -7688,11 +7836,77 @@ def run_rolling_pipeline(
                 _freed += 1
         return _n_free_for(target, press) >= 2
 
+    _captured_state: dict | None = None            # mid-month: full state at snapshot_at_day start
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
+        # MID-MONTH snapshot: at the START of snapshot_at_day (before any mutation today), deep-copy
+        # the full physical state so a second run can continue from here (see run_rolling_pipeline_2pass).
+        if snapshot_at_day is not None and day == snapshot_at_day and _captured_state is None:
+            _captured_state = {
+                "_snap_day": day,
+                "gt_inventory": dict(gt_inventory),
+                "gt_lots": {s: [list(l) for l in lots] for s, lots in gt_lots.items()},
+                "carcass_bank": {s: [list(l) for l in b] for s, b in _carcass_bank.items()},
+                "press_state": {p: dict(v) for p, v in press_state.items()},
+                "press_count": dict(press_count),
+                "mould_life": dict(mould_life),
+                "clean_carry": dict(clean_carry),
+                "co_carry": dict(co_carry),
+                "mould_owner": dict(_mould_owner),
+                "press_moulds": {p: set(m) for p, m in _press_moulds.items()},
+                "sku_moulds": {s: set(m) for s, m in _sku_moulds.items()},
+                "mould_skus": {m: set(s) for m, s in _mould_skus.items()},
+                "machine_current_sku": dict(machine_current_sku),
+                "machine_minutes_on_sku": dict(machine_minutes_on_sku),
+                "last_build_day": dict(last_build_day),
+                "ps_built_sofar": dict(_ps_built_sofar),
+                "demand_remaining": dict(demand_remaining),
+                "demand_dict": dict(demand_dict),
+            }
+        # MID-MONTH injection: at the START of day 1, overwrite the 1st-of-month DB seeds with a
+        # prior run's carried physical state (Run 1 at this run's start date). GT-lot build-days and
+        # last_build_day are RE-BASED from Run-1 numbering to Run-2 (day1 = plan start) so the 3-day
+        # GT shelf expires exactly what Run 1 would have. Demand/waste/CO trackers are NOT carried
+        # (Run 2 re-plans the remaining period on its own reduced demand from a clean slate).
+        if initial_state is not None and day == 1:
+            _rb = int(initial_state.get("_snap_day", 1)) - 1        # Run-1 day → Run-2 day offset
+            gt_inventory.clear(); gt_inventory.update(initial_state["gt_inventory"])
+            gt_lots.clear()
+            for _s, _lots in initial_state["gt_lots"].items():
+                gt_lots[_s] = [[_bd - _rb, _q] for _bd, _q in _lots]
+            _carcass_bank.clear()
+            for _s, _b in initial_state["carcass_bank"].items():
+                _carcass_bank[_s] = [list(_l) for _l in _b]
+            press_state.clear()
+            press_state.update({p: dict(v) for p, v in initial_state["press_state"].items()})
+            press_count.clear(); press_count.update(initial_state["press_count"])
+            mould_life.clear(); mould_life.update(initial_state["mould_life"])
+            clean_carry.clear(); clean_carry.update(initial_state["clean_carry"])
+            co_carry.clear(); co_carry.update(initial_state["co_carry"])
+            _mould_owner.clear(); _mould_owner.update(initial_state["mould_owner"])
+            _press_moulds.clear()
+            _press_moulds.update({p: set(m) for p, m in initial_state["press_moulds"].items()})
+            _sku_moulds.clear()
+            _sku_moulds.update({s: set(m) for s, m in initial_state["sku_moulds"].items()})
+            _mould_skus.clear()
+            _mould_skus.update({m: set(s) for m, s in initial_state["mould_skus"].items()})
+            machine_current_sku.clear(); machine_current_sku.update(initial_state["machine_current_sku"])
+            machine_minutes_on_sku.clear()
+            machine_minutes_on_sku.update(initial_state["machine_minutes_on_sku"])
+            last_build_day.clear()
+            last_build_day.update({s: d - _rb for s, d in initial_state["last_build_day"].items()})
+            _ps_built_sofar.clear(); _ps_built_sofar.update(initial_state["ps_built_sofar"])
+            # curing_allowable was built at :6494 from the DAY-0 press_state; resync it to the
+            # carried day-K positions so a SKU cured by a carried press isn't falsely flagged
+            # "missing curing allowable machine" (Eligible_Machines=0) in the Demand-Fulfillment sheet.
+            for _p, _v in press_state.items():
+                if _p not in curing_allowable[_v["sku"]]:
+                    curing_allowable[_v["sku"]].append(_p)
+            print(f"  [midmonth] injected carried state: {len(press_state)} presses, "
+                  f"{sum(gt_inventory.values()):,.0f} GT on hand, {len(gt_lots)} GT-lot SKUs")
         # GT per-lot FIFO expiry at DAY START: drop lots older than the 3-day shelf as WASTE
         # BEFORE any curing today, so expired GT can never be cured (strict FIFO). Feeds
         # writeoff_cum (demand-cap fix) + the expired-GT waste column + expired_GT Shift rows.
@@ -9524,12 +9738,18 @@ def run_rolling_pipeline(
         _s2_gt_per_sku: dict = defaultdict(float)
         _s2_gt_consume: dict = defaultdict(list)     # per-SKU (day, shift_ord, qty) for the FIFO match
         _SORD_C = {"A": 0, "B": 1, "C": 2}
+        # Stage-2 GT-consume day must be PLAN-RELATIVE (1 = plan_start), so it shares an origin with
+        # the Stage-1 prod_log's loop-day. Using the raw day-of-month broke every mid-month run
+        # (plan_start.day≠1): supply cidx [0..N] never matched demand cidx [60..92] → 0 carcass.
+        def _planday(_dstr):
+            return (datetime.strptime(str(_dstr)[:10], "%Y-%m-%d")
+                    - datetime(plan_start.year, plan_start.month, plan_start.day)).days + 1
         for r in bld_shift_rows:
             if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
                     and (r.get("Qty", 0) or 0) > 0):
                 _s = str(r["SKUCode"])
                 _s2_gt_per_sku[_s] += r["Qty"]
-                _day = int(str(r["Date"]).split("-")[-1])
+                _day = _planday(r["Date"])
                 _s2_gt_consume[_s].append((_day, _SORD_C.get(r.get("Shift"), 0), float(r["Qty"])))
         # A4: global per-SKU carcass->Stage-2 FIFO reconcile (1 calendar-day aging). Caps
         # Stage-2 GT carcass can't back + drops aged carcass, then cascades to cured. Only
@@ -9544,7 +9764,7 @@ def run_rolling_pipeline(
                     if (r.get("Machine_Group") == "TBM STAGE2" and str(r.get("SKUCode")) != "CHANGEOVER"
                             and (r.get("Qty", 0) or 0) > 0):
                         _s = str(r["SKUCode"]); _s2_gt_per_sku[_s] += r["Qty"]
-                        _day = int(str(r["Date"]).split("-")[-1])
+                        _day = _planday(r["Date"])   # plan-relative (see _planday above)
                         _s2_gt_consume[_s].append((_day, _SORD_C.get(r.get("Shift"), 0), float(r["Qty"])))
                 _cured_cut_day: dict = defaultdict(float)
                 for _s in sorted(_a4_red_sku):
@@ -9720,6 +9940,8 @@ def run_rolling_pipeline(
             cure_shift_rows, bld_shift_rows, press_stats, planning_days),
         # DELIVERY_PRIORITY committed-delivery fulfillment (empty when inert).
         "priority_report":   priority_report,
+        # MID-MONTH: full physical state captured at the start of snapshot_at_day (None if unused).
+        "state_snapshot":    _captured_state,
     }
 
 

@@ -179,6 +179,10 @@ _ap.add_argument("--out", default=CONFIG["out"], help="Excel report path")
 _ap.add_argument("--max-rows", type=int, default=CONFIG["max_rows"], help="max sample violation rows printed per rule")
 _ap.add_argument("--ct-tol", type=float, default=CONFIG["ct_tol"], help="minute tolerance for CT match")
 _ap.add_argument("--qty-tol", type=float, default=CONFIG["qty_tol"], help="unit tolerance for demand-cap / reconciliation")
+_ap.add_argument("--midmonth-opening", default=None,
+                 help="JSON of the plan's day-start opening (aged GT lots + carcass totals) written by "
+                      "run_rolling_pipeline_2pass; seeds R9G/R9C/R5 from the Run-2 start-date inventory "
+                      "instead of the 1st-of-month DB. Omit for a normal 1st-of-month audit.")
 ARGS = _ap.parse_args()
 
 # plan_month must be set in the env BEFORE bc_config / the ETLs import (imported by value)
@@ -370,6 +374,19 @@ def load_sources():
             m = _load_opening_carcass(eng)
             return {str(k): float(v) for k, v in dict(m).items()}
         _try("open_carc", _open_carc)
+
+        # MID-MONTH: seed opening GT (aged lots) + carcass from the plan's day-start snapshot so
+        # R9G/R9C/R5 audit the Run-2 start-date inventory, not the 1st-of-month DB. R6 keeps the DB
+        # opening (unchanged). age_days per lot → the FIFO seeds it at (−age) inside _fifo_expiry.
+        if getattr(ARGS, "midmonth_opening", None):
+            import json as _json
+            with open(ARGS.midmonth_opening) as _f:
+                _mm = _json.load(_f)
+            SRC["mm_gt_lots"] = {str(s): [(int(a), float(q)) for a, q in lots]
+                                 for s, lots in _mm.get("gt_lots", {}).items()}
+            SRC["mm_carc"] = {str(s): float(v) for s, v in _mm.get("carcass", {}).items()}
+            print(f"  [midmonth-audit] opening seeded from {ARGS.midmonth_opening}: "
+                  f"{len(SRC['mm_gt_lots'])} GT-lot SKUs, {len(SRC['mm_carc'])} carcass SKUs")
 
         def _bld_allow():
             from connection import ETL as BETL
@@ -1086,9 +1103,13 @@ def r6_opening(cur_path):
     rule_result("R6", "Opening GT from DB per plan_month matches sheet", n)
 
 
-def _fifo_expiry(built_by_day, consumed_by_day, opening, all_days, shelf):
+def _fifo_expiry(built_by_day, consumed_by_day, opening, all_days, shelf, opening_lots=None):
     lot = deque()
-    if opening and opening > 0:
+    if opening_lots:                                 # MID-MONTH: aged opening lots (age_days, qty)
+        for _age, _q in opening_lots:                # seed each at index (−age) so its remaining
+            if _q > 0:                               # shelf equals shelf−age (day-start carry).
+                lot.append((-int(_age), float(_q)))
+    elif opening and opening > 0:
         lot.append((0, float(opening)))
     exp = []
     for i, d in enumerate(all_days):
@@ -1108,7 +1129,8 @@ def _fifo_expiry(built_by_day, consumed_by_day, opening, all_days, shelf):
         keep = deque()
         for ld, lq in lot:
             if (i - ld) > shelf and lq > 1e-6:
-                exp.append((all_days[ld], all_days[i], lq))
+                _bd = all_days[ld] if ld >= 0 else "opening"   # aged opening lot has ld<0
+                exp.append((_bd, all_days[i], lq))
             else:
                 keep.append((ld, lq))
         lot = keep
@@ -1123,6 +1145,8 @@ def r9_aging(bld, cur, hz):
         return
     og = SRC.get("open_gt") or {}
     oc = SRC.get("open_carc") or {}
+    _mm_gt = SRC.get("mm_gt_lots")      # MID-MONTH: aged GT opening lots (else None → DB scalar)
+    _mm_carc = SRC.get("mm_carc")       # MID-MONTH: carcass opening totals (else None → DB scalar)
     # GT: built by GT machines (production) vs cured
     gt_built = defaultdict(lambda: defaultdict(float))
     gt_cured = defaultdict(lambda: defaultdict(float))
@@ -1139,18 +1163,21 @@ def r9_aging(bld, cur, hz):
         if r["is_prod"]:
             gt_cured[r["sku"]][r["date"]] += r["qty"]
     # GT aging = 3 days
-    gt_skus = set(gt_built) | set(gt_cured) | set(og)
+    gt_skus = set(gt_built) | set(gt_cured) | set(og) | set(_mm_gt or {})
     for sku in gt_skus:
-        exp = _fifo_expiry(gt_built[sku], gt_cured[sku], og.get(sku, 0.0), all_days, SRC["GT_AGE_DAYS"])
+        exp = _fifo_expiry(gt_built[sku], gt_cured[sku], og.get(sku, 0.0), all_days,
+                           SRC["GT_AGE_DAYS"], opening_lots=(_mm_gt or {}).get(sku) if _mm_gt else None)
         for built_d, exp_d, q in exp:
             add("R9G", f"GT expired: built {built_d}, not cured within {SRC['GT_AGE_DAYS']} days",
                 date=exp_d, sku=sku, qty=round(q, 1), expected=f"cure by +{SRC['GT_AGE_DAYS']}d",
                 actual=f"expired {exp_d}")
     rule_result("R9G", "GT aging <= 3 days (strict FIFO per SKU)", len(gt_skus))
-    # Carcass aging = 1 day
-    carc_skus = set(carc_built) | set(carc_used) | set(oc)
+    # Carcass aging = 1 day. Mid-month: seed the carried carcass total as opening (age-0; the 1-day
+    # shelf makes lot-age immaterial vs the DB scalar it replaces).
+    _oc_use = _mm_carc if _mm_carc is not None else oc
+    carc_skus = set(carc_built) | set(carc_used) | set(_oc_use)
     for sku in carc_skus:
-        exp = _fifo_expiry(carc_built[sku], carc_used[sku], oc.get(sku, 0.0), all_days, SRC["CARC_AGE_DAYS"])
+        exp = _fifo_expiry(carc_built[sku], carc_used[sku], _oc_use.get(sku, 0.0), all_days, SRC["CARC_AGE_DAYS"])
         for built_d, exp_d, q in exp:
             add("R9C", f"carcass expired: built {built_d}, not used within {SRC['CARC_AGE_DAYS']} day",
                 date=exp_d, sku=sku, qty=round(q, 1), expected=f"use by +{SRC['CARC_AGE_DAYS']}d",
@@ -1163,7 +1190,8 @@ def r5_stage2_vs_stage1(bld, hz):
     if not all_days:
         rule_result("R5", "Stage-2 <= available Stage-1 carcass", 0, skipped_reason="no horizon")
         return
-    oc = SRC.get("open_carc") or {}
+    oc = SRC.get("mm_carc")                 # MID-MONTH day-start carcass, else DB 1st-of-month
+    oc = oc if oc is not None else (SRC.get("open_carc") or {})
     carc_built = defaultdict(lambda: defaultdict(float))
     s2 = defaultdict(lambda: defaultdict(float))
     for r in bld:

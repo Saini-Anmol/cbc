@@ -116,6 +116,16 @@ CLOUD_CONFIG: dict = {
 #   • Hybrid curing-CO items 1+2: `_PERSKU_FEED_V2=True` (curing_consumption_dynamic, deficit-first
 #     building-feed) + `_HYBRID_CO_DEFER=True` (defer a fulfillable/needed SKU's CO). Both hardcoded ON.
 #     `_REACTIVE_ONLY` env-default "0" (hybrid) → cloud runs hybrid like local_main.
+#   • Curing press HOLD: `_PRESS_STABLE` (curing_consumption_dynamic) env-default "1" = ON. A curing
+#     press stays on its SKU until that SKU's demand is met (no mid-life press-count churn). Cloud
+#     inherits ON; `PRESS_STABLE=0` reverts bit-for-bit. Sub-experiments PRESS_RELEASE_DAYS / PRESS_VALVE
+#     / PRESS_RATCHET are default OFF (measured worse). Cured −2,118 / COs −126 / starvation −916 vs pre-hold.
+#   • Mid-month start / production deduction: `_MIDMONTH_DEDUCT` (b2c_pipeline) env-default "1" = ON.
+#     Cloud calls `run_rolling_pipeline_2pass` (above): a planStartDate day>1 → Run 1 (full month)
+#     simulates days 1..(start-1) production (×0.90-1.05, deterministic), deducts it from demand, then
+#     Run 2 replans start→end seeded from the day-(start) GT/carcass/press snapshot (CO planner too).
+#     A 1st-of-month start → single run, bit-for-bit. `MIDMONTH_DEDUCT=0` disables. Uses the same
+#     1st-of-month DB opening-GT/running-moulds snapshot for both runs (v1); no DB writes.
 #   • Holiday fixes: `_HOLIDAY_CO_DEFER` (no new CO on a holiday → next working day) + `_HOLIDAY_NO_PERISH`
 #     (don't pre-build perishable stock into a holiday) default ON; `_HOLIDAY_BRIDGE` default OFF
 #     (measured no-op). The holiday INPUT is DB-driven: jkt_holiday_calendar → connection.read_db
@@ -131,7 +141,7 @@ for _k, _v in CLOUD_CONFIG.items():
 import b2c_pipeline
 import curing_consumption_dynamic
 import bc_config
-from b2c_pipeline import run_rolling_pipeline
+from b2c_pipeline import run_rolling_pipeline_2pass
 import connection as conn
 
 # Where the per-run building/curing workbooks are written and KEPT so a user can
@@ -244,8 +254,11 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
     curing_out = os.path.join(PLAN_OUTPUT_DIR, f"bc_curing_b2c_{plan_id}_{ds}.xlsx")
 
     # ── inject per-run config + run the engine ────────────────────────────
+    # 2pass wrapper: for a MID-MONTH planStartDate (day > 1) it runs a full-month simulation first,
+    # deducts already-produced tyres from demand, then plans the remaining period seeded from the
+    # start-date state (same as local_main). A 1st-of-month start → single run, bit-for-bit unchanged.
     _apply_run_cfg(run_cfg)
-    result = run_rolling_pipeline(
+    result = run_rolling_pipeline_2pass(
         demand_path=demand_path,
         plan_start=run_cfg["plan_start"],
         planning_days=run_cfg["planning_days"],

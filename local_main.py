@@ -29,7 +29,7 @@ _os.environ.setdefault("HYBRID_CO_DEFER", "1")   # item 2 — defer a fulfillabl
 _os.environ.setdefault("PERSKU_FEED_V2", "1")    # item 1 — deficit-first per-SKU building supply
 
 import bc_config
-from b2c_pipeline import run_rolling_pipeline
+from b2c_pipeline import run_rolling_pipeline_2pass
 
 
 def main() -> dict:
@@ -37,7 +37,10 @@ def main() -> dict:
     # bc_config.RESTRICT_PRESSES_TO_ALLOWABLE is ON, only the 170 presses in the
     # allowable matrix are used; extra running-moulds presses are dropped. The
     # cloud path (main.py) never passes this, so cloud is unaffected.
-    result = run_rolling_pipeline(  # bc_config defaults (demand, plan_start, days)
+    # 2pass wrapper: for a mid-month PLAN_START (day != 1) with MIDMONTH_DEDUCT=1 it runs a
+    # full-month simulation first, deducts already-produced tyres from demand, then plans the
+    # remaining period. day==1 or toggle OFF → single run, identical to before.
+    result = run_rolling_pipeline_2pass(  # bc_config defaults (demand, plan_start, days)
         restrict_to_allowable_presses=bc_config.RESTRICT_PRESSES_TO_ALLOWABLE,
     )
     print("\n" + "=" * 60)

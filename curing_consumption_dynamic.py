@@ -433,6 +433,49 @@ _SURPLUS_HYST        = os.environ.get("SURPLUS_HYST", "0") != "0"
 _SURPLUS_P1_MIN_DAYS = int(os.environ.get("SURPLUS_P1_DAYS", "2"))
 _SURPLUS_P2_MARGIN   = float(os.environ.get("SURPLUS_P2_MARGIN", "0.15"))
 
+# Press-stability guard (PRESS_STABLE, ADOPTED — default ON; PRESS_STABLE=0 reverts bit-for-bit).
+# Fixes the day-to-day curing press-count churn (e.g. 1225170015010LSTL0 swinging 2→10→2→6→2). Root
+# cause: the memoryless daily "surplus" arithmetic (presses_needed = ceil(rem/(rate·horizon_left)))
+# wobbles as horizon and rem shrink, so a press is RELEASED off a live-demand SKU one day and
+# RE-ACQUIRED the next — each round-trip = 2 curing COs = 2×480 min + 2 mould resets, and the
+# mid-life dip starves the SKU. ON = "hold": presses are NOT voluntarily released for surplus; they
+# free only via demand_done_free (SKU demand met) + RO, and the pairing loop's n-1 protection already
+# prevents stripping the last covering press. Ramp-up is unchanged (a fresh 0/low-press or starving
+# target is hungriest → still acquires presses as they free). Delivers points 1 (memory-aware, no
+# mid-life dip), 2 (release only when demand done) and 3 (smooth demand-done drain) of the churn fix.
+# Measured 3-month vs baseline: curing COs 846→720 (−126), starvation 8,814→7,898 (−916), press-count
+# churn −57%; cost cured 1,984,410→1,982,292 (−2,118, the price of a stable plan on press-tight months).
+# Feasibility clean (demand-cap R8, mould R17, CO-cap R10 all PASS). The near-done release
+# (PRESS_RELEASE_DAYS) and the starvation valve (PRESS_VALVE) were both measured WORSE and left OFF.
+_PRESS_STABLE = os.environ.get("PRESS_STABLE", "1") != "0"
+# Rule 2(b) near-done early-release window (days). Under PRESS_STABLE a held press MAY be released
+# early once its SKU is winding down (remaining demand clearable by n-1 presses within this window).
+# Default 0 = pure hold: sweeping 3 REGRESSED all 3 months (reintroduced churn + starvation, July
+# −7,434) because near-done releases cascade into fresh disruption. Kept as a tunable for the record.
+_PRESS_RELEASE_DAYS = int(os.environ.get("PRESS_RELEASE_DAYS", "0"))
+# Monotone press-count ratchet (PRESS_RATCHET, default OFF — MEASURED REDUNDANT, kept for record).
+# Idea: once an SKU sheds a press, cap it at that reduced count so it can't re-acquire (forbid the
+# up-leg of the ping-pong). Implemented in the SOFT form the user asked for (yield the cap to a
+# genuine re-ramp, not a marginal top-up) it is a NO-OP: the only targets it would block are already
+# on-track, which the pairing loop rejects upstream → byte-identical to baseline on all 3 months.
+# The STRICT form (block Class-A re-acquire too) does bind but over-constrains legitimate re-ramp.
+# Either way PRESS_STABLE subsumes it — hold prevents the mid-life SHED, so there is no down-leg to
+# ratchet (stable+ratchet == stable, byte-identical). Tracks _pc_ceiling[sku] = count at last decrease.
+_PRESS_RATCHET = os.environ.get("PRESS_RATCHET", "0") != "0"
+# Narrow starvation valve (PRESS_VALVE, default OFF — MEASURED WORSE THAN PURE HOLD, kept for record).
+# Idea: pure hold never redistributes, so scarce-inch SKUs starve on tight months (Aug −5,700); the
+# valve releases a held press ONLY to feed a SEVERELY-STARVED, SERVABLE target (≥2 free moulds) from a
+# donor over-supplied WITH MARGIN, capped by #starved targets + CO headroom, ≤1 press/donor-SKU/day.
+# Measured 3-month vs pure hold: June +524 / July −3,530 / Aug +1,568 = NET −1,438, and July churn
+# 72→114. It helps loose months but TANKS the tight one — on July there is no genuine surplus (donors
+# are themselves building-limited on the same scarce 15"/13" inches, so shedding them re-creates the
+# ping-pong). Same structural finding as the REJECTED global mould optimiser (−38k): July's gap is true
+# mould/press scarcity, not misallocation. Pure hold (PRESS_STABLE, valve OFF) is the adopted mechanism.
+_PRESS_VALVE        = os.environ.get("PRESS_VALVE", "0") != "0"
+_PRESS_VALVE_MARGIN = int(os.environ.get("PRESS_VALVE_MARGIN", "2"))  # donor surplus above n-1 need
+# MARGIN=2 (not 1): a shed donor keeps ONE press of genuine slack, so a building-limited donor
+# (scarce inch, produces below rate) won't immediately flip Class-A and re-acquire (the ping-pong).
+
 # Curing CO same-inch alignment (env CURING_INCH_ALIGN, default OFF). When on (and a sku_inch
 # map is supplied), a press changing over PREFERS a target SKU of the SAME inch as its current
 # SKU — a tiebreak placed AFTER urgency_class + constraint, so demand-critical (Class-A) and
@@ -920,6 +963,9 @@ class COScheduler:
         co_events: list[dict] = []
         daily_co_used: dict[int, int] = {}
         _hol = _holiday_day_index_set()   # plant holidays → working-day urgency horizon
+        # PRESS_RATCHET: per-SKU press-count ceiling — set to the count at the last DECREASE; the
+        # SKU may never re-acquire above it. inf until the SKU first sheds a press.
+        _pc_ceiling: dict[str, float] = {}
 
         # ── Day-by-day simulation ─────────────────────────────────────────────
         for day in range(1, planning_days + 1):
@@ -964,6 +1010,12 @@ class COScheduler:
             surplus_free: set[str] = set()
             # #3 P1: month-end guard — a surplus swap can't be amortized in the last few days.
             _surplus_ok = not (_SURPLUS_HYST and horizon_left <= _SURPLUS_P1_MIN_DAYS)
+            # PRESS_STABLE: hold presses on their SKU (rule 2a) — do NOT do the aggressive
+            # month-end surplus release that causes the ping-pong. Instead release ONLY near-done
+            # presses (rule 2b, below): the block still runs, but the release test is replaced.
+            _stable_hold = _PRESS_STABLE and _PRESS_RELEASE_DAYS <= 0   # pure hold if window=0
+            if _stable_hold:
+                _surplus_ok = False
             if _SURPLUS_RELEASE_ENABLED and horizon_left > 0 and _surplus_ok:
                 _sku_presses: dict[str, list] = {}
                 for p in sorted(demand_running_presses):
@@ -981,20 +1033,92 @@ class COScheduler:
                     if rate <= 0:
                         continue
                     rem = updated_demand.get(sku, 0.0)
-                    # #3 P2: size presses_needed against a slightly SHORTENED horizon so the SKU
-                    # keeps ~1 buffer press (dead-band) — avoids over-release + CO/re-acquire ping-pong.
-                    _hl = (horizon_left * (1.0 - _SURPLUS_P2_MARGIN)) if _SURPLUS_HYST else horizon_left
-                    presses_needed = max(1, math.ceil(rem / (rate * max(1e-9, _hl))))
-                    surplus = n - presses_needed
-                    if surplus <= 0:
-                        continue
-                    # Uncapped: pool the TRUE surplus (may be all-but-one of the
-                    # SKU's presses). The global pairing + n-1 RI-protection decide
-                    # how many actually move — no arbitrary per-SKU-per-day throttle.
-                    release = min(surplus, len(_sku_presses[sku]))
+                    if _PRESS_STABLE:
+                        # Rule 2(b): release ONLY if the SKU is near-done — its remaining demand
+                        # can be cleared by n-1 presses within _PRESS_RELEASE_DAYS. Winding-down
+                        # SKUs won't re-demand the press → redistribution without the ping-pong.
+                        # Shed at most ONE press/SKU/day (gentle, monotone down-ramp).
+                        if rem > (n - 1) * rate * _PRESS_RELEASE_DAYS:
+                            continue
+                        release = 1
+                    else:
+                        # #3 P2: size presses_needed against a slightly SHORTENED horizon so the SKU
+                        # keeps ~1 buffer press (dead-band) — avoids over-release + CO/re-acquire ping-pong.
+                        _hl = (horizon_left * (1.0 - _SURPLUS_P2_MARGIN)) if _SURPLUS_HYST else horizon_left
+                        presses_needed = max(1, math.ceil(rem / (rate * max(1e-9, _hl))))
+                        surplus = n - presses_needed
+                        if surplus <= 0:
+                            continue
+                        # Uncapped: pool the TRUE surplus (may be all-but-one of the
+                        # SKU's presses). The global pairing + n-1 RI-protection decide
+                        # how many actually move — no arbitrary per-SKU-per-day throttle.
+                        release = min(surplus, len(_sku_presses[sku]))
                     for p in _sku_presses[sku][:release]:
                         newly_free.append(p)
                         surplus_free.add(p)
+
+            # ── Narrow starvation valve (PRESS_VALVE, under PRESS_STABLE hold only) ──
+            # Inject a few held presses into the free pool ONLY when severe starvation exists,
+            # taken from the most-over-supplied donors (with margin so they won't re-acquire).
+            # The global pairing loop then routes them to the neediest (Class-A) targets. This
+            # recovers the coverage pure hold gives up, without the general surplus ping-pong.
+            if (_PRESS_STABLE and _PRESS_VALVE and _SURPLUS_RELEASE_ENABLED
+                    and horizon_left > 0):
+                _dctv = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+                _n_starved = 0
+                for t in all_demand_skus:
+                    rt = updated_demand.get(t, 0.0)
+                    if rt <= 0:
+                        continue
+                    ratet = _qty_per_press_per_day(ct_map.get(t, _dctv))
+                    if ratet <= 0:
+                        continue
+                    nt = press_count.get(t, 0)
+                    # severely starved: current presses can't clear demand by month-end (nt=0 ⇒ yes)
+                    if rt <= nt * ratet * horizon_left:
+                        continue
+                    # SERVABLE only: an extra press can help this target only if it has ≥2 FREE
+                    # eligible moulds. Counting mould-scarce/unservable targets (July's real gap)
+                    # would inflate the release cap → strip donors that can't be usefully placed.
+                    if _p0_gate:
+                        _fm = sum(1 for _m in _p0_sm.get(str(t), set())
+                                  if _p0_owner.get(_m) is None)
+                        if _fm < 2:
+                            continue
+                    _n_starved += 1
+                if _n_starved > 0:
+                    _cap = min(_n_starved, max_co_per_day - co_used)
+                    _donors = []
+                    for p in sorted(demand_running_presses):
+                        cs = press_to_sku.get(p)
+                        if (cs is None or cs not in ri_skus
+                                or updated_demand.get(cs, 0.0) <= 0
+                                or p in demand_done_free or p in surplus_free):
+                            continue
+                        n = press_count.get(cs, 0)
+                        if n <= 1:
+                            continue
+                        rate = _qty_per_press_per_day(ct_map.get(cs, _dctv))
+                        if rate <= 0:
+                            continue
+                        rem = updated_demand.get(cs, 0.0)
+                        need = math.ceil(rem / (rate * horizon_left))
+                        surplus = n - need
+                        if surplus >= _PRESS_VALVE_MARGIN:
+                            _donors.append((surplus, cs, p))
+                    # most-over-supplied first; ≤1 press per donor SKU per day (gentle)
+                    _donors.sort(key=lambda d: (-d[0], d[1], d[2]))
+                    _used_donor_sku: set = set()
+                    _rel = 0
+                    for surplus, cs, p in _donors:
+                        if _rel >= _cap:
+                            break
+                        if cs in _used_donor_sku:
+                            continue
+                        _used_donor_sku.add(cs)
+                        newly_free.append(p)
+                        surplus_free.add(p)
+                        _rel += 1
 
             # ── Size-balanced over-cap press MIGRATION (SIZE_BAL) ────────────────
             # SIZE_BAL blocks NEW over-cap changeovers, but presses INHERITED on an
@@ -1084,6 +1208,18 @@ class COScheduler:
                                 continue
                             n_t = press_count.get(target, 0)
                             rate_t = _qty_per_press_per_day(ct_map.get(target, _dct))
+                            # PRESS_RATCHET (soft): a target that already shed a press is capped at
+                            # its ceiling (count at the last decrease) — BUT the cap YIELDS to a
+                            # genuine re-ramp. Block re-acquire above the ceiling only when the
+                            # target's current presses can still clear its remaining demand by
+                            # month-end (a marginal Class-B top-up = the ping-pong). If the target
+                            # truly can't keep up (rem > n_t·rate·horizon_left → Class-A need) or has
+                            # 0 presses, the cap is overridden so real demand is still served.
+                            if (_PRESS_RATCHET and n_t > 0
+                                    and n_t >= _pc_ceiling.get(target, float("inf"))
+                                    and rate_t > 0
+                                    and rem <= n_t * rate_t * horizon_left):
+                                continue
                             is_nri = target in nri_skus
                             is_ri = target in ri_skus
                             if is_nri:
@@ -1184,6 +1320,8 @@ class COScheduler:
                         _p0_mount(p, new_sku)                  # #4: claim the target's 2 moulds
                     press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
                     press_count[new_sku] = press_count.get(new_sku, 0) + 1
+                    if _PRESS_RATCHET:      # lock old_sku's ceiling at its new (reduced) count
+                        _pc_ceiling[old_sku] = press_count[old_sku]
                     pending_ro_presses.discard(p)
                     demand_running_presses.add(p)
                     _assigned.add(p)
@@ -2155,6 +2293,7 @@ def run_dynamic_consumption(
     feed_ctx: dict | None = None,                # PERSKU_FEED: {sku_machines, machine_skus, machine_gtday}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
     reactive_only: bool = False,                 # Part B: skip planned schedule + CC workbook, keep ETL
+    initial_press_state: dict | None = None,     # MID-MONTH: {press_to_sku, mould_life, press_moulds}
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -2200,6 +2339,23 @@ def run_dynamic_consumption(
     print("  [ETL] Loading running moulds …")
     df_running = etl.load_running_moulds()
     print(f"        {len(df_running)} active press rows")
+    if initial_press_state is not None:
+        # STAGE 3 (mid-month): reseed the CO planner from a carried day-K press state instead of
+        # the Day-0 DB snapshot, so the plan is built against the SAME press positions the day-by-day
+        # simulation starts from. Overriding df_running here (its sole upstream source) propagates
+        # through classification, RI/RO/NRI, Running_Press_Count and the mould gate automatically.
+        _pts = initial_press_state.get("press_to_sku", {})
+        _mlf = initial_press_state.get("mould_life", {})
+        _pm  = initial_press_state.get("press_moulds", {})
+        _rows = []
+        for _p, _sku in _pts.items():
+            _mn = list(_pm.get(_p, []))
+            _rows.append({"Machine": str(_p), "SKUCode": str(_sku), "MouldNos": _mn,
+                          "MouldLife_remaining": int(_mlf.get(_p, 3000)), "Num_Moulds": len(_mn)})
+        df_running = pd.DataFrame(
+            _rows, columns=["Machine", "SKUCode", "MouldNos", "MouldLife_remaining", "Num_Moulds"])
+        print(f"        [midmonth] CO planner reseeded from carried day-K state: "
+              f"{len(df_running)} presses")
 
     print("  [ETL] Loading curing allowable machines …")
     df_allowable = etl.load_curing_allowable()
