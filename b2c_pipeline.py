@@ -1841,58 +1841,72 @@ def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict,
     """MouldInUse sheet — a FIXED daily grid: PLANNING_DAYS × #demand-SKUs rows.
 
     Exactly one row per (calendar day, demand SKU). For each such (day, SKU):
-        Mould in USE = the MAXIMUM across the day's 3 shifts (A/B/C) of that SKU's
-                       moulds mounted on presses RUNNING that SKU. A press that
-                       changes over mid-day is not RUNNING that shift, so its
-                       shift's count drops — taking the max keeps the day's PEAK
-                       (e.g. shift A=4 moulds, shift B=CO, shift C=2 → row shows 4).
+        Mould in USE = that SKU's moulds OCCUPIED that day = moulds mounted on presses
+                       COMMITTED to the SKU (holding its moulds). A press occupies the
+                       moulds from CO-IN to the SKU until it CO's to another SKU — so it
+                       is counted on EVERY held day, including dry / GT-starved / idle
+                       days when it produced 0 (building under-fed it). The count only
+                       drops when a press actually CO's AWAY — NOT when a press merely
+                       runs dry. (Previously this was moulds on presses PRODUCING that
+                       shift, so a starved day falsely read 0 — a representation bug.)
         Total Eligible Moulds = size of the SKU's eligible mould pool
                        (Master_Mapping_Mould_SKU) — CONSTANT per SKU, 0 if the SKU
                        has no eligible moulds. So Mould in USE ≤ Total Eligible always.
-    A day on which the SKU never runs → Mould in USE = 0 (row still present). The
-    SKU universe is EVERY SKU in the demand file, so the sheet is a complete
-    days×SKUs grid. Returns dicts: Date, SKU Code, Mould in USE, Total Eligible
-    Moulds (Description added by the sheet writer). Empty if no mould_info."""
+    A day on which no press holds the SKU → Mould in USE = 0 (row still present). The
+    SKU universe is EVERY SKU in the demand file, so the sheet is a complete days×SKUs
+    grid. Column names are unchanged. Empty if no mould_info."""
     if not mould_info:
         return []
     eligible = {str(s): set(ms) for s, ms in (mould_info.get("sku_moulds") or {}).items()}
-    # (press, sku) → moulds it mounts for that SKU-run (union over any re-mounts).
-    pm: dict = defaultdict(set)
-    for a in (mould_info.get("assignments") or []):
-        key = (str(a.get("press")), str(a.get("sku")))
-        for m in (a.get("moulds") or []):
-            pm[key].add(m)
 
-    # RUNNING (press, sku) grouped by (date, shift)
-    by_ds: dict = defaultdict(list)
-    for r in cure_shift_rows:
-        if str(r.get("_status", "RUNNING")) != "RUNNING":
-            continue
-        sku = str(r.get("SKUCode", "")).strip()
-        if not sku or sku in ("CHANGEOVER", "MOULD_CLEAN", ""):
-            continue
-        d = str(r.get("Date")); sh = str(r.get("Shift"))
-        by_ds[(d, sh)].append((str(r.get("Machine")), sku))
-
-    # per-(date,shift) in-use mould count per SKU
-    inuse: dict = {}
-    for (d, sh), runs in by_ds.items():
-        mbs: dict = defaultdict(set)
-        for press, sku in runs:
-            ms = pm.get((press, sku))
-            mbs[sku] |= ms if ms else {f"__{press}_a", f"__{press}_b"}
-        inuse[(d, sh)] = {sku: len(ms) for sku, ms in mbs.items()}
-
-    # Fixed grid: every (calendar day, demand SKU). Day count = PLANNING_DAYS, so
-    # dates come from plan_start (not just days that ran) → exact days×SKUs rows.
+    # OCCUPIED moulds per SKU per day. A press's 2 moulds are OCCUPIED by the SKU it is COMMITTED to
+    # (holds its moulds for) — from the moment it CO's IN to that SKU until it CO's to another SKU.
+    # This counts the press EVERY day it holds the moulds, including dry / GT-starved / idle days when
+    # it produced 0 (building under-fed it that day). So a SKU whose presses produce 0 GT on a day no
+    # longer falsely drops to 0 moulds — the count only falls when a press actually CO's AWAY. The
+    # press's held SKU per day = the SKU of its LAST shift-row that day (a CHANGEOVER → the NEW target
+    # it is mounting); days with no row are forward-filled from the last held SKU (moulds stay mounted
+    # on the press until the next CO). Value column stays "Mould in USE" (now = occupied, not producing).
     day_dates = [(plan_start + timedelta(days=i)).strftime("%Y-%m-%d")
                  for i in range(planning_days)]
+    _didx = {d: i for i, d in enumerate(day_dates)}
+    _press_day_sku: dict = defaultdict(dict)      # press -> {day_index: end-of-day held SKU}
+    for r in cure_shift_rows:                     # rows are chronological → last write = end of day
+        _di = _didx.get(str(r.get("Date")))
+        if _di is None:
+            continue
+        _st = str(r.get("_status", "RUNNING"))
+        sku = str(r.get("SKUCode", "")).strip()
+        if _st == "CHANGEOVER":                   # the press is mounting the NEW SKU's moulds
+            _rem = str(r.get("Remarks", ""))
+            sku = _rem.split("→")[-1].strip() if "→" in _rem else sku
+        elif _st not in ("RUNNING", "MOULD_CLEAN"):
+            continue
+        if not sku or sku in ("CHANGEOVER", "MOULD_CLEAN", ""):
+            continue
+        _press_day_sku[str(r.get("Machine"))][_di] = sku
+
+    # Forward-fill each press's held SKU across all days (moulds stay mounted until the next change),
+    # counting distinct COMMITTED PRESSES per (day, SKU).
+    inuse_day: dict = defaultdict(lambda: defaultdict(set))   # day_index -> sku -> set(presses)
+    for _press, _dmap in _press_day_sku.items():
+        _held = None
+        for _di in range(len(day_dates)):
+            if _di in _dmap:
+                _held = _dmap[_di]
+            if _held:
+                inuse_day[_di][_held].add(_press)
+
+    # A press occupies exactly 2 moulds (2 cavities), so Mould in USE = 2 × committed presses — always
+    # EVEN. (Counting the union of mould IDs went ODD when a mould was re-mounted / moved between
+    # presses over the month and got deduplicated, e.g. STMX0 = 7 for 3 presses instead of 6.)
     skus = sorted({str(s).strip() for s in demand_skus if str(s).strip()})
     rows = []
-    for d in day_dates:                       # date-major (day 1 all SKUs, then day 2…)
+    for _di, d in enumerate(day_dates):           # date-major (day 1 all SKUs, then day 2…)
+        _occ = inuse_day.get(_di, {})
         for sku in skus:
-            day_max = max(inuse.get((d, sh), {}).get(sku, 0) for sh in ("A", "B", "C"))
-            rows.append({"Date": d, "SKU Code": sku, "Mould in USE": day_max,
+            rows.append({"Date": d, "SKU Code": sku,
+                         "Mould in USE": 2 * len(_occ.get(sku, set())),
                          "Total Eligible Moulds": len(eligible.get(sku, set()))})
     return rows
 
@@ -5446,10 +5460,11 @@ def _write_rolling_curing_excel(
 
     # ── Sheet 4c: MouldInUse ──────────────────────────────────────────────────
     # Fixed daily grid: one row per (calendar day, demand SKU) = PLANNING_DAYS ×
-    # #demand-SKUs rows. "Mould in USE" = the MAX across that day's 3 shifts of the
-    # SKU's moulds mounted on running presses (a mid-day curing CO drops a shift's
-    # count, so the peak shift wins). "Total Eligible Moulds" = the SKU's eligible
-    # pool size, constant (0 if none). Days with no run → 0. See _mould_in_use_rows.
+    # #demand-SKUs rows. "Mould in USE" = the SKU's moulds OCCUPIED that day = moulds on
+    # presses COMMITTED to the SKU (holding its moulds), counted on every held day incl.
+    # dry / GT-starved / idle days; the count drops only when a press CO's AWAY, not when
+    # it runs dry. "Total Eligible Moulds" = the SKU's eligible pool size, constant (0 if
+    # none). Days with no press holding the SKU → 0. See _mould_in_use_rows.
     ws = wb.create_sheet("MouldInUse")
     miu_cols = ["Date", "SKU Code", "Description",
                 "Mould in USE", "Total Eligible Moulds"]
@@ -5459,9 +5474,10 @@ def _write_rolling_curing_excel(
     ws.cell(row=1, column=1, value=(
         f"Daily mould occupancy per SKU (grid: {planning_days} days × "
         f"{len(demand_dict)} demand SKUs = {len(_miu)} rows)  |  "
-        "Mould in USE = MAX over the day's 3 shifts of the SKU's moulds mounted on "
-        "running presses; Total Eligible Moulds = size of the SKU's eligible mould "
-        "pool (Master_Mapping_Mould_SKU), constant per SKU."
+        "Mould in USE = the SKU's moulds OCCUPIED that day = moulds on presses committed to the SKU "
+        "(holding its moulds) — counted on every held day incl. dry/GT-starved/idle days; the count "
+        "drops only when a press CO's AWAY, not when it runs dry. Total Eligible Moulds = size of the "
+        "SKU's eligible mould pool (Master_Mapping_Mould_SKU), constant per SKU."
         if _miu else
         "Mould gate OFF — no mould state to report (run with MOULD_GATE=1)."
     )).font = _bold(10)

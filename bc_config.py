@@ -35,8 +35,8 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 7, 21, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 11                              # days in the plan horizon (30 June / 31 Jul/Aug)
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
 DEMAND_FILE   = os.path.join(INPUT_DIR, "july_correct_plan.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
 PLANT_HOLIDAYS = False                           # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar

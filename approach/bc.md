@@ -10,13 +10,20 @@
 > 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 8k GT cap). **Inputs:** per-month
 > `*_tomerji.xlsx`; ONE `Daily_Running_Moulds` table keyed by `plan_month`; single
 > `gt_inventory_manual`; building start-free (no building-running-machines).
-> Config: `MAX_CHANGEOVERS_PER_DAY=12`, `MAX_ENDOFDAY_GT_INVENTORY=8000` (env `GT_CAP_MAX`; cloud
-> aligned — `main.CLOUD_CONFIG` pins 8000 too, so local↔cloud byte-parity; see §8),
-> `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
+> Config: `MAX_CHANGEOVERS_PER_DAY=17` (this cycle; was 12), `MAX_ENDOFDAY_GT_INVENTORY=8000`
+> (env `GT_CAP_MAX`; cloud aligned — `main.CLOUD_CONFIG` pins 8000 too, so local↔cloud byte-parity;
+> see §8), `MIN_INCH_DWELL_DAYS=5`, `MAX_BUILDING_SKUS_PER_DAY=4`.
 > **Adopted LOCAL KPIs (hybrid CO items 1+2 §5.4, no holiday, mould-audit PASS, cap 0-over,
 > deterministic, per-month opening GT, local==cloud byte-parity):** June 650,381/92.36% · July
 > 685,342/94.17% · Aug 648,687/94.07% = **1,984,410 cured**. The rules are physical restrictions that
 > make the plan floor-realistic (KPI below the mould-blind baseline by design).
+>
+> ⚠️ **ABSOLUTE KPIs DRIFT DAY-TO-DAY — treat every number here as AS-OF-DATE.** `Daily_Running_Moulds`
+> is a **LIVE, daily-refreshed** table (the Day-0 snapshot changes every calendar day), so the SAME code
+> on the SAME demand produces a **different absolute KPI on a different day** — July-full drifted
+> 685,342 → 675,817 → 689,837 → 688,984 over consecutive days. **Compare runs only WITHIN the same
+> day**; the figures above were measured at CO=12 on one snapshot and are illustrative of the
+> mechanism/approach, not a fixed target. Document toggles and deltas, not absolute totals.
 
 **Building-to-Curing (B2C):** the building schedule is the **primary output**; the
 curing schedule is **fully derived** from it. Building runs first; curing consumes
@@ -161,6 +168,21 @@ new month never overwrites the previous.
 `SKUCode` · `Category` (RI/RO/NRI) · `Running_Press_Count` (0 for NRI) · `Allowable_Moulds_Count`
 · `Effective_CT_Min` · `Qty_Per_Press_Per_Shift` (`floor(480/CT)×2`) · `Total_GT_Per_Shift`
 · `Demand_Qty` (`Requirement`) · `Priority_Score` (`ConsolidatedPriorityScore`).
+
+### 3.6 Curing press HOLD — `_PRESS_STABLE` (ADOPTED, default ON)
+
+`curing_consumption_dynamic.py`. A curing press **stays on its SKU until that SKU's demand is met** —
+**no mid-life voluntary surplus release**. This removes the day-to-day curing press-count churn (the
+release→re-acquire ping-pong where a press was freed as "surplus" one day and re-acquired the next).
+A press frees **only** the two honest ways: its demand is done (→ Runner-Out) — with **n−1
+protection** guarding the last press still covering a live SKU. `PRESS_STABLE=0` reverts bit-for-bit;
+**cloud inherits** (module-level env-default ON).
+
+At adoption (as-of-snapshot): curing COs **−126**, starvation **−916**, press-count churn **−57%**,
+cured **−2,118 net** (June +5,850 / July −2,268 / Aug −5,700) — a deliberate churn-for-stability trade
+the client wanted (a stable, floor-releasable press plan). **REJECTED sub-experiments** (all default
+OFF, code kept): `PRESS_RELEASE_DAYS` (near-done early release), `PRESS_VALVE` / `PRESS_VALVE_MARGIN`
+(starvation valve — net worse than the plain hold), `PRESS_RATCHET` (monotone press-count cap — no-op).
 
 ---
 
@@ -434,6 +456,10 @@ for Day D in 1..31:
       (proportional to capacity) via s1_sku_to_machines; record CO_Type="carcass" for
       utilization tracking. Does NOT touch gt_inventory. Stage-1 machines certified for no
       current Stage-2 SKU show 0% util — correct.
+      RETIRED 6801 EXCLUDED: 6801 is plant-retired (14 live Stage-1 machines, §4.1) but was
+      occasionally getting carcass in s1_sku_to_machines → the 38-live-machine feasibility rule
+      R14 failed. It is now stripped from s1_sku_to_machines, so R14 passes and its carcass share
+      redistributes across the 14 live Stage-1 machines.
 
     Step 4 — Curing simulation (same shift S)
       for each press:
@@ -720,7 +746,7 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 | Parameter | Value | Controls |
 |-----------|-------|----------|
 | `SHIFT_DURATION_MIN` / `SHIFTS_PER_DAY` | 480 / 3 | Shift length; A/B/C |
-| `MAX_CHANGEOVERS_PER_DAY` | **12** | Curing CO cap/day (was 18; set 12 for surplus-release). Building COs uncapped by day. |
+| `MAX_CHANGEOVERS_PER_DAY` | **17** | Curing CO cap/day (this cycle; was 12). Building COs uncapped by day. Cloud per-run cap comes from `jkt_plan_params.noOfChangeOver`, NOT this constant (§19.2). |
 | `CO_CLASS_B_THRESHOLD` | 0.8 | Class A fires if `current_days > H × 0.8` |
 | `MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT` | 2 | Building COs/machine/shift (4 for flex machines) |
 | `MIN_CAMPAIGN_MINS` | 60 | Shortest production run (was 120 — blocked ≤2-press SKUs) |
@@ -754,8 +780,9 @@ projected_gt)`) plus the forward-buffer hard clamp — simpler and tighter (near
 `_GLOBAL_CONSTRAINT_MODE="below"`, `_ROUND_TRIP_BUFFER_ENABLED`, `_BUILDING_RATIO_ENABLED`,
 `_INCH_FLEX_ENABLED`, `_ENDOFDAY_GT_CAP_ENABLED`, `_FORWARD_BUFFER_ENABLED`, `_FWD_RISK_SHIFTS=1.0`,
 `_MOULD_CLEAN_ENABLED` (§5.1), `_CO_SHIFT_SPREAD_ENABLED` (hardcoded `True`, §5.3),
-`_HYBRID_CO_DEFER` (hardcoded `True`, §5.4) — all ON by default. `_CURING_RATIO_ENABLED` and
-`_PERSKU_FEED_V2` (hardcoded `True`, §5.4) in `curing_consumption_dynamic.py`.
+`_HYBRID_CO_DEFER` (hardcoded `True`, §5.4), `_MIDMONTH_DEDUCT` (§21, default ON) — all ON by default.
+`_CURING_RATIO_ENABLED`, `_PERSKU_FEED_V2` (hardcoded `True`, §5.4) and `_PRESS_STABLE` (§3.6,
+default ON) in `curing_consumption_dynamic.py`.
 
 ---
 
@@ -803,6 +830,7 @@ Fixed in `b2c_pipeline.py`.
 | `1325218614088TVECE` partial | BJ oversubscription | **Fixed** — FULLY MET; BJ still structurally tight |
 | Curing press IDs short by 30 | used `wcID` not `WCNAME_clean` | **Fixed** |
 | BJ ~20k gap | Structurally oversubscribed | **Reframed** — dominant residual gap is curing-press-limited, not building. Fix = curing CO to add presses. |
+| Feasibility R14 fail (39 machines) | Retired 6801 got Stage-1 carcass in `s1_sku_to_machines` | **Fixed** — 6801 stripped; carcass redistributes to the 14 live Stage-1 machines; R14 passes (§6 Step 3b) |
 
 **Structural note superseded — see §16.** The old "~3% residual gap is curing-press /
 15"-tooling limited" claim is now largely **incorrect**; the forward buffer proved most of it was
@@ -813,8 +841,9 @@ building-side starvation.
 ## 16. Current KPIs (ADOPTED approach 2026-08 — historical inch-lock + Lever A)
 
 Committed default: **historical inch-lock (INCH_HIST_LOCK, 27 fixed / 12 flexible, ±2 band OFF) +
-Lever A (FLEX_SCARCE_INCH)**, `MAX_CHANGEOVERS_PER_DAY = 12`, **8k GT cap** + dynamic buffer (β=2),
-forward buffer + IUkeep ON, mould-clean ON, carcass lead 2, `FIXED_ESCAPE` OFF. Inputs: per-month
+Lever A (FLEX_SCARCE_INCH)**, `MAX_CHANGEOVERS_PER_DAY = 17` (config now; the table below was measured
+at 12), **8k GT cap** + dynamic buffer (β=2), forward buffer + IUkeep ON, curing press HOLD
+(`_PRESS_STABLE`, §3.6) ON, mould-clean ON, carcass lead 2, `FIXED_ESCAPE` OFF. Inputs: per-month
 `*_tomerji.xlsx`, month-keyed `Daily_Running_Moulds` (`plan_month`), single `gt_inventory_manual`,
 building start-free. Fully deterministic; mould-audit PASS; demand-cap 0-over on all 3 months.
 
@@ -822,6 +851,12 @@ building start-free. Fully deterministic; mould-audit PASS; demand-cap 0-over on
 > is INERT with no priority data). With `impPriorityFlag = 1` on committed-delivery inputs (§8.3) the
 > effect is **June inert (634,086 ON==OFF) / July −1,372 / Aug −10,740** — accepted, since meeting the
 > committed date outranks overall KPI.
+
+> ⚠️ **AS-OF-DATE — these absolute totals DRIFT.** `Daily_Running_Moulds` is refreshed daily, so the
+> same code + demand yields different totals on different days (July-full observed 685,342 → 675,817 →
+> 689,837 → 688,984 over consecutive days). The table below was measured at `MAX_CHANGEOVERS_PER_DAY =
+> 12` on one snapshot; the **committed config is now 17** (§12). **Compare only within one day** and read
+> the deltas/mechanism below, not the absolute numbers (see the drift caveat in the header banner).
 
 Now measured with the **hybrid curing-CO stack (items 1+2, §5.4)** ON and the **new demand files**
 (§2.3). These SUPERSEDE the older pre-hybrid-CO numbers in earlier revisions (different CO stack + inputs):
@@ -964,6 +999,15 @@ the `DEFAULT_CURING_CT = 17` default (no real data). (For May demand all 85 SKUs
 - **Starvation event** = a RUNNING curing press with demand remaining but zero GT that shift.
   Distinct from IDLE (demand met). Curing output "Remarks" distinguishes `STARVED (no GT)` vs
   `IDLE (demand met)`; the sheet's STARVED count reconciles with the printed KPI.
+  **Exact definition (CONFIRMED — the client's intended metric, unchanged).** Counted per
+  **(press × shift)**: an event iff **RUNNING AND `GT_Inventory == 0` AND `Qty == 0` AND
+  `_demand_left > 0`** (the CURRENT SKU's remaining demand). It **excludes** CO shifts, mould-clean
+  shifts, and demand-done idle presses. **RCA of the curing press-count dips:** ~**72% is
+  building-supply GT-starvation** (the press stays committed — it did NOT CO away — but building
+  fed it ~0 GT that day) and ~**28% is real month-end press-churn**. Tail-churn root cause =
+  the month-end demand-done reassignment cascade + a small `horizon_left`: a mass Class-A flip plus
+  an inflated `presses_needed = ceil(rem / (rate · horizon_left))` as `horizon_left → 1`. A
+  **tail-churn damper is PROPOSED, not built.**
 - **Expired GT / carcass** (`gt_writeoff` / `carcass_writeoff`) = stock that **aged out** before use
   (GT > 3 days, carcass > 1 day). WASTE — EXCLUDED from GT cured, coverage, and usable-built; counted
   only in the gross "Total GT built". See §17.2 for the sheet columns and semantics.
@@ -987,8 +1031,7 @@ the `DEFAULT_CURING_CT = 17` default (no real data). (For May demand all 85 SKUs
 |------|------|
 | `bc_config.py` | **SINGLE SOURCE OF TRUTH for all parameters.** Edit only this file. |
 | `b2c_pipeline.py` | **ENTRY POINT** — `python b2c_pipeline.py`. Rolling pipeline; `_assign_building_shift`. |
-| `curing_consumption_dynamic.py` | Phase 0 — 31-day CO schedule (COScheduler/DaySimulator); reused by rolling loop. |
-| `curing_consumption.py` | Phase 0 — Day-0 snapshot + eligibility filter. |
+| `curing_consumption_dynamic.py` | Phase 0 — Day-0 snapshot + eligibility filter + 31-day CO schedule (COScheduler/DaySimulator); reused by rolling loop. **The old `curing_consumption.py` was MERGED into this file and DELETED** — Phase-0 lives here now. |
 | `curing_b2c.py` | Curing GT-balance simulation (legacy path); press IDs = `WCNAME_clean`. |
 | `building_b2c.py` / `building.py` | Legacy LP building scheduler (`--legacy` only). |
 | `approach/bc.md` | This file — architecture spec. |
@@ -1060,8 +1103,19 @@ already in progress) / 422 / 500. One run at a time (`_RUN_LOCK`); re-running a
 ### 19.4 Output tables (5, all stamped `plan_id`, timestamps IST)
 
 `jkt_plan_building` · `jkt_plan_curing` · `jkt_plan_Infeasibility` · `jkt_plan_kpis` ·
-`jkt_plan_capacityUtilisation` · `jkt_plan_moulds` (daily MouldInUse per SKU: `mouldsInUse`
-= MAX over the day's 3 shifts, `totalEligibleMoulds` = SKU's eligible pool, PK `plan_id+Date+SKUCode`).
+`jkt_plan_capacityUtilisation` · `jkt_plan_moulds` (daily MouldInUse per SKU, `totalEligibleMoulds`
+= SKU's eligible pool, PK `plan_id+Date+SKUCode`).
+
+**MouldInUse = OCCUPIED moulds (redefined, `_mould_in_use_rows`).** `mouldsInUse` now =
+**2 × committed presses** = the moulds **mounted on presses committed to the SKU** (presses HOLDING
+its moulds), counted on **every held day** — including dry / GT-starved / idle days
+(**forward-filled** across a hold). It **drops only when a press CO's AWAY**, not when the press
+merely runs dry. It also counts **mould-clean** shifts (for the SKU) and **CO** shifts (credited to
+the NEW SKU). Consequences: the value is **always EVEN** (2 cavities/press) and **≤ Total Eligible**.
+Column names are **unchanged**; **display-only, no KPI change**. This fixes the frontend misread where
+a starved-but-still-committed press looked CO'd-away (dropped 4→0 on a dry day even though it still
+held its moulds). Previously `mouldsInUse` was the MAX over the day's 3 shifts of actively-running
+moulds — that under-counted a committed press on a starved day.
 
 * **`jkt_plan_kpis`** — **single row/plan, 15 metrics:** `demandFulfillment`,
   `capacityUtilisation` (curing), `building_`/`building_s2_`/`stage1_`/`vmi_`/`bj_`/`uniNarrow_capacityUtilisation`,
@@ -1080,3 +1134,59 @@ already in progress) / 422 / 500. One run at a time (`_RUN_LOCK`); re-running a
   opening GT is labelled PARTIAL and would otherwise escape the report.
 * Both workbooks are written to `PLAN_OUTPUT_DIR` (`/app/output` in Docker) and
   **kept** for download — mount a volume there or they vanish on image upgrade.
+
+---
+
+## 21. Mid-month plan start & production deduction — `_MIDMONTH_DEDUCT` (ADOPTED, default ON)
+
+A plan may now start on **any calendar date**, not just the 1st. Implemented as a **two-pass wrapper**
+`run_rolling_pipeline_2pass` in `b2c_pipeline.py` (toggle `_MIDMONTH_DEDUCT`, default ON). For a start
+day == 1 it collapses to a **single run, bit-for-bit** identical to before.
+
+### 21.1 The two passes (start day > 1)
+
+1. **Run 1 — full month, ORIGINAL demand.** Simulate the whole month exactly as today.
+2. **Deduct already-done production.** Take days `1 .. (start−1)` from Run 1 and estimate what the
+   plant CURED in that window = **planned cured × a deterministic per-SKU factor ∈ [0.90, 1.05]**. The
+   factor is **hashlib-derived** (NOT `random()` / `hash()` — those are non-deterministic across
+   processes), so the deduction is reproducible. Subtract it from each SKU's demand (floored at **≥ 0**).
+3. **Run 2 — replan `start → month-end` on the REDUCED demand**, **SEEDED from the day-start state**
+   (start date, 07:00), so the plan Run 2 produces and the state it executes from AGREE:
+   - **GT** carried as **dated lots** with **re-based ages** (a lot built on day K enters Run 2 with
+     the age it actually has at the start boundary, so shelf-life/expiry stays correct);
+   - **carcass** bank carried;
+   - **press → SKU + running counts + mould life / mounts** carried, injected into the day-loop **and**
+     into the **Phase-0 CO planner** via a new `initial_press_state` arg to `run_dynamic_consumption`
+     (so the CO schedule starts from the real day-K press configuration, not a cold Day-0 snapshot).
+
+**In-memory only** — no intermediate DB writes. **v1 uses the 1st-of-month DB opening snapshot for BOTH
+runs** (running-moulds + opening GT); it does not re-pull a mid-month DB snapshot. Fully deterministic.
+
+### 21.2 Both entry points call the wrapper (no API change)
+
+**LOCAL** (`local_main.py`) and **CLOUD** (`main.run_plan`) both call `run_rolling_pipeline_2pass` with
+the **same signature** — no API change. **local == cloud byte-identical** verified for full-month AND
+mid-month, all 3 months. To run mid-month **locally**: set `bc_config.PLAN_START` to the start date and
+`PLANNING_DAYS = (month-end − start + 1)`.
+
+### 21.3 Two bug fixes shipped with it
+
+- **(a) `curing_allowable` resync.** After the day-K press state is injected into Run 2, the curing
+  allowable-machine map is **re-synced from the carried press state** — otherwise carried SKUs (running
+  on a press but not in the fresh allowable map) were falsely flagged **"missing curing allowable
+  machine."**
+- **(b) Stage-1 carcass renderer made PLAN-RELATIVE.** The Stage-1 carcass renderer's "which day does
+  Stage-2 consume" was a **day-of-month** value while the loop counts **plan-relative** days; the mismatch
+  rendered **0 Stage-1 carcass for ANY mid-month start**. Fixed to use `_planday` (plan-relative). The
+  full-month path is **bit-for-bit** unchanged.
+
+A **sibling default-OFF** site — `_CV2_A4` / `_fifo_reconcile_greedy` (an alternate FIFO GT-lot
+reconciliation) — is **flagged in-code** as the related seam, left OFF.
+
+### 21.4 Feasibility auditor is mid-month-aware — `feasibility_test.py --midmonth-opening <file>`
+
+The 2pass wrapper writes `<building_output>_midmonth_opening.json` (day-start **aged GT lots** +
+**carcass totals**). Pass it to the auditor with `--midmonth-opening <file>` so R5 / R9C / R9G seed from
+the **start-date inventory**, not the 1st-of-month DB snapshot. **Finding:** R5 / R9C / R9G mostly
+reflect the plan's **real GT / carcass write-off** (they fail in the FULL-month run too), not a
+mid-month opening artifact — the flag rules out the artifact, it does not paper over genuine waste.
