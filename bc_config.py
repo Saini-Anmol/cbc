@@ -35,14 +35,20 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "july_correct_plan.xlsx")  # per-month demand workbook
+DEMAND_FILE   = os.path.join(INPUT_DIR, "august_demand_tomerji.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
 PLANT_HOLIDAYS = False                           # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
+# EXACT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
+# tables now carry a `date` column, so state is read for the plan's START DATE (a month can hold
+# several daily snapshots, e.g. 2026-08-01 AND 2026-08-21 → plan_month alone is ambiguous). Env
+# overridable; harnesses/main set it alongside PLAN_MONTH. For a mid-month "generate from today" run,
+# PLAN_START = today, so PLAN_DATE = today and the ETL seeds from today's real running-moulds/GT/carcass.
+PLAN_DATE            = os.environ.get("PLAN_DATE")            or PLAN_START.strftime("%Y-%m-%d")
 
 
 # Non-secret defaults only. Host/user/password/database must come from .env or
@@ -480,7 +486,7 @@ BUILDING_CO_DIFF_SIZE = {
     # machine group  →  diff_size_CO duration (min)
     "STAGE2":   88,   # acceptable if no VMI alternative (88 min)
     "BJ":       90,   # 7101–7106, 7201
-    "VMI":      120,  # 6001–6004, 7001–7004
+    "VMI":      40,   # 6001–6004, 7001–7004 — plant-confirmed (was wrongly 120); cheap inch change
     "STAGE1":   180,  # 37.5% of one shift — avoid unless critical demand
     "MID":      180,
     "UNISTAGE": 180,  # 7501–7503 — same as Stage-1

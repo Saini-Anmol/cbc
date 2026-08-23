@@ -37,7 +37,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from bc_config import make_engine, ENV
-from bc_config import RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH
+from bc_config import RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH, PLAN_DATE
 from curing_consumption_dynamic import ConsumptionConfig  # config class (stays with the scheduling logic)
 from building import Config, _ps_dedicated_skus  # building config + PS-dedication helper (building.py stays the leaf)
 
@@ -343,7 +343,7 @@ class ConsumptionETL:
         """Load opening GT inventory from DB. Returns [SKUCode, GT_Inventory]."""
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory"
-            f" FROM {self.db}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
+            f" FROM {self.db}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
         )
 
     # -- adapted from curing_lp.ETL.load_running_moulds (lines 368-400) -------
@@ -356,7 +356,7 @@ class ConsumptionETL:
         wc_master = self._sql(f"SELECT * FROM {self.db}.Master_WC_Master")
         wc_master = wc_master[["wcID", "WCNAME"]]
 
-        df = self._sql(f"SELECT * FROM {self.db}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
+        df = self._sql(f"SELECT * FROM {self.db}.{RUNNING_MOULDS_TABLE} WHERE date = '{PLAN_DATE}'")
         if "updatedAt" in df.columns:
             df = df.drop(columns=["updatedAt"])
 
@@ -505,7 +505,7 @@ class ConsumptionETL:
                 f"SELECT DISTINCT Sapcode AS SKUCode "
                 f"FROM {self.db}.{RUNNING_MOULDS_TABLE} "
                 f"WHERE Sapcode IS NOT NULL AND Sapcode != '' "
-                f"AND plan_month = '{RUNNING_MOULDS_MONTH}'"
+                f"AND date = '{PLAN_DATE}'"
             )
             raw = set(df["SKUCode"].astype(str).str.strip())
             return {s for s in raw if s.upper() not in _sentinels}
@@ -604,14 +604,14 @@ class ETL:
         # return df
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
+            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
         )
 
     def load_carcass_inventory(self):
         try:
             return self._sql(
                 f"SELECT sizeCode AS SKUCode, CarcassInv AS Carcass_Inventory "
-                f"FROM {Config.DB_NAME}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
+                f"FROM {Config.DB_NAME}.carcass_inventory_manual WHERE date = '{PLAN_DATE}'"
             )
         except Exception:
             return pd.DataFrame(columns=["SKUCode","Carcass_Inventory"])
@@ -787,7 +787,7 @@ class B2C_ETL(ETL):
         """Load REAL opening GT inventory (not zeroed out as in CBC cold-start)."""
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
-            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'"
+            f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
         )
 
 
@@ -813,7 +813,7 @@ def _load_opening_gt(engine) -> dict:
     try:
         df = _sql(engine,
             f"SELECT sizeCode AS sku, gtInventory AS qty "
-            f"FROM {DB}.gt_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
+            f"FROM {DB}.gt_inventory_manual WHERE date = '{PLAN_DATE}'")
         df["sku"] = df["sku"].astype(str).str.strip()
         df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
         return {r["sku"]: float(r["qty"]) for _, r in df.iterrows()}
@@ -829,7 +829,7 @@ def _load_opening_carcass(engine) -> dict:
     try:
         df = _sql(engine,
             f"SELECT sizeCode AS sku, CarcassInv AS qty "
-            f"FROM {DB}.carcass_inventory_manual WHERE plan_month = '{PLAN_MONTH}'")
+            f"FROM {DB}.carcass_inventory_manual WHERE date = '{PLAN_DATE}'")
         df["sku"] = df["sku"].astype(str).str.strip()
         df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
         return {r["sku"]: float(r["qty"]) for _, r in df.iterrows() if float(r["qty"]) > 0}
@@ -846,7 +846,7 @@ def _load_press_state(engine) -> pd.DataFrame:
     matches CO event press IDs and silently breaks all CO transitions.
     """
     try:
-        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
+        rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE date = '{PLAN_DATE}'")
         if "updatedAt" in rm.columns:
             rm = rm.drop(columns=["updatedAt"])
 
@@ -871,7 +871,7 @@ def _load_press_state(engine) -> pd.DataFrame:
 
 def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
-        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE plan_month = '{RUNNING_MOULDS_MONTH}'")
+        rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE date = '{PLAN_DATE}'")
         # Schema-adaptive (the mapping table has flipped naming across cycles):
         # current/original `Mould`/`Matl.Code`/`Active Flag`=1, or prior `Mold_Name`/`Item_Code`.
         _mcols = set(_sql(engine, f"SHOW COLUMNS FROM {DB}.Master_Mapping_Mould_SKU")["Field"].astype(str))

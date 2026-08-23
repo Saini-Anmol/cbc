@@ -511,6 +511,97 @@ _SIZE_BAL_MIGRATE = os.environ.get("SIZE_BAL_MIGRATE", "0") != "0"
 _SAME_INCH_FIRST = os.environ.get("SAME_INCH_FIRST", "0") != "0"
 _SAME_INCH_RANK  = os.environ.get("SAME_INCH_RANK", "safe")   # "safe" | "top"
 
+# ── Press-swap DWELL / anti-boomerang (PRESS_DWELL, default OFF = bit-for-bit) ──────────
+# RCA (July): 68% of curing COs are BOOMERANG (a SKU loses AND regains presses) and 64% are
+# cross-inch — the Phase-0 pairing loop is memoryless per-day, so a press CO's away from an SKU
+# one day and (a different) press CO's back the next. That thrash (a) manufactures ~half the
+# starvation (a cross-inch press ARRIVES on an SKU whose GT building hasn't pre-fed → runs dry),
+# (b) wastes 480 min + a mould reset per CO, and (c) produces the [2,8,4,0,0,6,2] press-count
+# jaggedness the plant rejects (wants gradual [2,4,6,4,2,1]). Three coupled rate-limits smooth it:
+#   • GAIN cap  — an SKU may ACQUIRE ≤ PRESS_MAX_GAIN_PER_DAY presses/day (kills the +6 spikes).
+#   • SHED cap  — an SKU may LOSE   ≤ PRESS_MAX_SHED_PER_DAY presses/day (gradual down-ramp, no 3→0).
+#   • COOLDOWN  — after an SKU loses a press, no press may CO back onto it for PRESS_BOOMERANG_COOLDOWN
+#                 days (kills the re-acquire leg of the boomerang; the SKU it was starving on is
+#                 building-limited anyway, so re-adding a press just starves it → coverage-neutral).
+# All three yield to genuine INFEASIBLE need is NOT applied — the caps are hard (stability first,
+# per plant-expert guidance: killing churn frees the wasted CO/starved-shift capacity → KPI up).
+_PRESS_DWELL = os.environ.get("PRESS_DWELL", "0") != "0"
+_PRESS_MAX_GAIN_PER_DAY = int(os.environ.get("PRESS_MAX_GAIN_PER_DAY", "2"))
+_PRESS_MAX_SHED_PER_DAY = int(os.environ.get("PRESS_MAX_SHED_PER_DAY", "2"))
+_PRESS_BOOMERANG_COOLDOWN = int(os.environ.get("PRESS_BOOMERANG_COOLDOWN", "3"))
+
+# ── Month-end tail damper (TAIL_NO_COLD, default OFF = bit-for-bit) ─────────────────────
+# RCA (July): unique curing SKUs/day rises 47→68 across the month while building SKUs/day FALLS
+# 44→20; starvation tracks this (corr +0.69) and spikes to 20-33% on days 22-31. Mechanism: as
+# SKUs finish demand, their freed presses CO onto ever-MORE different SKUs, but building has wound
+# down and can only feed ~20 of them → the rest run dry. Fix: in the last TAIL_NO_COLD_DAYS working
+# days, DON'T let a freed press start a COLD sku (press_count==0) — building won't ramp a fresh SKU
+# that late, so the press would only starve. Keeps the press on its current SKU or idle instead of
+# spreading curing thinner than building can feed. Bounded to the tail so early campaigns are intact.
+_TAIL_NO_COLD = os.environ.get("TAIL_NO_COLD", "0") != "0"
+_TAIL_NO_COLD_DAYS = int(os.environ.get("TAIL_NO_COLD_DAYS", "6"))
+
+# ── Anti-boomerang levers (the ONLY true monotonic-rule violations, ~7-13/month) ────────
+# RCA (July): the visible press-count jaggedness is ~93% GT-STARVATION representation (a press
+# stays COMMITTED but produces 0 when building under-feeds), NOT CO churn. The genuine monotonic
+# violation is small: a committed-press count that sheds then RE-GAINS. Two targeted, KPI-neutral
+# levers remove it; both default OFF = bit-for-bit. Both act TARGET-side only (never touch the n-1
+# donor guard, CO-cap, or mould gate) and EXEMPT delivery-priority + fully-abandoned (0-press) SKUs
+# so no covering path is ever removed.
+# L2 — PRESS_RETURN_BLOCK: a specific press never CO's back to a SKU it already left (same-press
+#   round-trip). A DIFFERENT eligible press serves that SKU instead → coverage unchanged.
+_PRESS_RETURN_BLOCK = os.environ.get("PRESS_RETURN_BLOCK", "1") != "0"
+# L2_STRICT: also block a return to a FULLY-ABANDONED target (0 presses). Off by default because
+# such a return is a demand-driven RESTART — blocking it can strand the SKU (coverage loss). A/B only.
+_L2_STRICT = os.environ.get("L2_STRICT", "0") != "0"
+# L1 — TAIL_DAMP: in the last TD_TAIL_DAYS working days, block a MARGINAL warm re-acquire (target
+#   already has >=1 press AND its residual demand < TD_MIN_RESID_DAYS press-days) — the month-end
+#   cascade top-up that just re-adds a press onto a nearly-done SKU (starves anyway on the tight
+#   inches). Cold starts (0-press) are handled by TAIL_NO_COLD, not here.
+_TAIL_DAMP = os.environ.get("TAIL_DAMP", "0") != "0"
+_TD_TAIL_DAYS = int(os.environ.get("TD_TAIL_DAYS", "3"))
+_TD_MIN_RESID_DAYS = float(os.environ.get("TD_MIN_RESID_DAYS", "1.0"))
+
+# ── Supply-aware curing draw (SUPPLY_ALIGN, default OFF = bit-for-bit) ─────────────────
+# RCA: idle building (Stage-2/VMI) + unmet demand coexist because building only builds what
+# curing DRAWS (no-waste-GT). A freed press that CO's onto an SKU whose building is ALREADY
+# fully drawn just starves; a press CO'd onto an SKU with idle building capacity (e.g. HTORE:
+# 6001 idle, free moulds, demand, 0 presses) ACTIVATES that idle building → real coverage.
+# This ranks CO targets by per-SKU building HEADROOM (buildable_rate − current draw) right after
+# urgency: presses are pulled toward SKUs idle building can supply, breaking the NRI-bootstrap
+# deadlock and cutting starvation coverage-POSITIVELY (unlike inch-freedom, which regressed 7×).
+_SUPPLY_ALIGN = os.environ.get("SUPPLY_ALIGN", "0") != "0"
+# how many presses' worth building supply must fall SHORT of a SKU's draw before we donate its
+# marginal (starving) press to a supply-rich SKU. 1.0 = donate only when ≥1 full press is unfed.
+_SUPPLY_OVERFEED_MARGIN = float(os.environ.get("SUPPLY_OVERFEED_MARGIN", "1.0"))
+
+# ── STATEFUL / horizon press planner (#10, env STATEFUL_PLAN, default OFF = memoryless bit-for-bit) ──
+# The memoryless pairing loop re-decides press moves every day → boomerang (68%), 278 COs, churn that
+# propagates to building. v1 replaces the daily `presses_needed = ceil(rem/(rate·horizon_left))` wobble
+# with an UPFRONT per-SKU press TARGET (demand-sized, capped by the SKU's eligible presses/moulds) and
+# a MONOTONE rule: a SKU ramps UP toward its target, then once it sheds ANY press it may never re-gain
+# (unimodal ramp up→peak→down). No boomerang and no CO-to-undo by construction. STATEFUL_PLAN=0 → the
+# current memoryless behaviour bit-for-bit.
+_STATEFUL_PLAN = os.environ.get("STATEFUL_PLAN", "0") != "0"
+_SP_FILL = float(os.environ.get("SP_FILL", "0.85"))   # steady-fill factor sizing the peak vs a flat month
+_SP_MONOTONE = os.environ.get("SP_MONOTONE", "1") != "0"   # unimodal ramp (no re-gain after a shed)
+_SP_CAP = os.environ.get("SP_CAP", "1") != "0"             # enforce the per-SKU target peak cap
+_SP_V2 = os.environ.get("SP_V2", "0") != "0"               # v2 supply-cap+per-inch norm: MEASURED WORSE (off)
+_SP_WARM_FIRST = os.environ.get("SP_WARM_FIRST", "1") != "0"  # v3: fill warm SKUs before opening cold ones
+
+# ── v4 CAMPAIGN / active-set planner (env CAMPAIGN_PLAN, default OFF) ──────────────────
+# Phase 1 = build the abstract per-SKU-per-day campaign target (Stage 1) + LOG diagnostics only
+# (co_events unchanged). Packs each SKU as ONE contiguous campaign into a per-inch × per-day grid
+# bounded by building supply (concentrate, not spread). Wiring to co_events is Phase 2.
+_CAMPAIGN_PLAN = os.environ.get("CAMPAIGN_PLAN", "0") != "0"
+_CAMPAIGN_DEBUG = os.environ.get("CAMPAIGN_DEBUG", "0") != "0"
+# EFF = fraction of theoretical building_inch_capacity that is really achievable (COs/idle) — tightens
+# the per-inch press slots to what building ACTUALLY feeds. WINDOW = max campaign length (days): smaller
+# → bigger P per SKU → fewer concurrent SKUs (concentrate) → later SKUs stagger into freed slots.
+_CAMPAIGN_EFF = float(os.environ.get("CAMPAIGN_EFF", "0.8"))
+_CAMPAIGN_WINDOW = int(os.environ.get("CAMPAIGN_WINDOW", "10"))
+_CAMPAIGN_FRONTLOAD = os.environ.get("CAMPAIGN_FRONTLOAD", "0") != "0"  # Step 1: grab spare slots early
+
 # Per-SKU shared-capacity feed filter (env PERSKU_FEED, default OFF). The 5b guard blocks
 # CO'ing another press onto a target only when (n+1)·draw > buildable_rate[target]. Today
 # buildable_rate is the FULL un-apportioned sum of the target's eligible in-inch machines'
@@ -966,6 +1057,157 @@ class COScheduler:
         # PRESS_RATCHET: per-SKU press-count ceiling — set to the count at the last DECREASE; the
         # SKU may never re-acquire above it. inf until the SKU first sheds a press.
         _pc_ceiling: dict[str, float] = {}
+        # PRESS_DWELL: last day a press CO'd AWAY from each SKU (anti-boomerang cooldown key).
+        _sku_lost_day: dict[str, int] = {}
+        # PRESS_RETURN_BLOCK (L2): per-press set of SKUs this press has CO'd AWAY from — it may not
+        # return to any of them (no same-press round-trip). Empty at run start (Day-0 carried SKU is
+        # not "left", so returning to it after an excursion is not blocked); reset per Run in 2pass.
+        _press_left: dict[str, set] = {}
+
+        # ── STATEFUL_PLAN (#10): upfront per-SKU press TARGET + monotone tracker ───
+        # target_peak = presses to meet the SKU's whole-month demand at steady rate (÷ _SP_FILL to
+        # allow ramp/downtime), capped by the SKU's eligible-press count (physical bound). _peaked =
+        # SKUs that have shed a press → may not re-gain (unimodal ramp). Computed once; no per-day wobble.
+        _target_peak: dict[str, int] = {}
+        _peaked: set[str] = set()
+        if _STATEFUL_PLAN:
+            _spdays = max(1, planning_days)
+            _rate_of: dict[str, float] = {}
+            for _s in all_demand_skus:
+                _dem = float(demand_map.get(_s, 0) or 0)
+                _rt = _qty_per_press_per_day(ct_map.get(_s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                _rate_of[_s] = _rt
+                if _dem <= 0 or _rt <= 0:
+                    _target_peak[_s] = 0
+                    continue
+                _need = math.ceil(_dem / (_rt * _spdays * _SP_FILL))       # presses to meet demand
+                _capp = len(sku_to_presses.get(_s, ())) or 10**6          # eligible-press physical cap
+                if _SP_V2 and buildable_rate is not None:
+                    # v2: never target more presses than BUILDING can feed this SKU (supply cap) —
+                    # the press-cap done at plan time, so the ramp never over-provisions into starvation.
+                    _sup = _perSKU_feed(_s, 0, _rt)
+                    if _sup is not None and _sup > 0:
+                        _capp = min(_capp, max(1, math.floor(_sup / _rt)))
+                _target_peak[_s] = max(1, min(_need, _capp))
+            if _SP_V2 and _bic:
+                # v2 per-INCH supply normalisation: scale each inch's SKU targets so the planned
+                # per-inch DRAW never exceeds building_inch_capacity (SIZE_BAL at plan time). Removes
+                # the flat-`fill` fragility — the plan matches curing draw to building supply per inch.
+                _inch_draw: dict[str, float] = {}
+                _inch_skus: dict[str, list] = {}
+                for _s, _tp in _target_peak.items():
+                    if _tp <= 0:
+                        continue
+                    _i = _sku_inch.get(str(_s), "")
+                    if not _i:
+                        continue
+                    _inch_draw[_i] = _inch_draw.get(_i, 0.0) + _tp * _rate_of.get(_s, 0.0)
+                    _inch_skus.setdefault(_i, []).append(_s)
+                for _i, _draw in _inch_draw.items():
+                    _cap_i = _bic.get(_i, 0.0)
+                    if _cap_i > 0 and _draw > _cap_i:
+                        _scale = _cap_i / _draw
+                        for _s in _inch_skus[_i]:
+                            _target_peak[_s] = max(1, math.floor(_target_peak[_s] * _scale))
+
+        # ── v4 CAMPAIGN PLAN (Stage 1): abstract per-SKU-per-day press target ──────
+        # Packs each SKU as ONE contiguous campaign into a per-inch × per-day capacity grid bounded
+        # by building supply (building_inch_capacity). CONCENTRATE (full-size campaigns, sequential)
+        # not SPREAD (v2 scaled peaks down → cureRUN up). Pure/deterministic. Phase 1 = build + LOG.
+        _campaign_target: dict[str, dict[int, int]] = {}
+        if _CAMPAIGN_PLAN and _bic:
+            _rate_c: dict[str, float] = {
+                _s: _qty_per_press_per_day(ct_map.get(_s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                for _s in all_demand_skus}
+            _work_days = [d for d in range(1, planning_days + 1) if d not in _hol]
+            # per-inch concurrent-press capacity = building GT/day ÷ a typical SKU rate on that inch
+            _inch_slots: dict[str, int] = {}
+            for _i, _cap in _bic.items():
+                _rs = sorted(_rate_c[_s] for _s in all_demand_skus
+                             if _sku_inch.get(str(_s), "") == _i
+                             and demand_map.get(_s, 0) > 0 and _rate_c[_s] > 0)
+                _typ = _rs[len(_rs) // 2] if _rs else 0.0            # median rate on the inch
+                # tighten to REAL achievable building throughput (EFF), not theoretical capacity
+                _inch_slots[_i] = max(0, math.floor(_cap * _CAMPAIGN_EFF / _typ)) if _typ > 0 else 0
+            _used: dict[str, dict[int, int]] = {}                    # inch -> day -> slots used
+            def _cap_free(_i, _d, _p):
+                return _used.get(_i, {}).get(_d, 0) + _p <= _inch_slots.get(_i, 0)
+            # order: Day-0 running-in SKUs first (continuity), then EDF, then biggest demand
+            _plan_skus = sorted(
+                (_s for _s in all_demand_skus if demand_map.get(_s, 0) > 0 and _rate_c[_s] > 0
+                 and _sku_inch.get(str(_s), "") in _inch_slots),
+                key=lambda _s: (0 if (_s in ri_skus and press_count.get(_s, 0) > 0) else 1,
+                                _pdm.get(_s, planning_days + 1), -float(demand_map[_s]), str(_s)))
+            _deferred: list[str] = []
+            for _s in _plan_skus:
+                _i = _sku_inch.get(str(_s), "")
+                _rate = _rate_c[_s]
+                _slots_i = _inch_slots.get(_i, 0)
+                if _slots_i <= 0:
+                    _deferred.append(_s); continue
+                _dl = _pdm.get(_s, planning_days)
+                _elig = [d for d in _work_days if d <= _dl]           # the SKU's servable window
+                if not _elig:
+                    _deferred.append(_s); continue
+                _press_days = demand_map[_s] / _rate
+                _mcap = (len(sku_moulds.get(_s, ())) // 2) if sku_moulds else len(sku_to_presses.get(_s, ()))
+                if _CAMPAIGN_FRONTLOAD:
+                    # FRONT-LOADED trapezoid: from its earliest day, grab as many presses as the inch
+                    # has FREE that day (up to mould-cap), day by day, until demand is cleared → high P
+                    # early, ramps down as slots fill/demand depletes. Fills spare-inch slots that flat-P
+                    # leaves empty (more cured on building-sufficient inches).
+                    _P_peak = max(1, min(_mcap or 10**6, _slots_i))
+                    _rem = _press_days
+                    _tgt: dict = {}
+                    for d in _elig:
+                        if _rem <= 0:
+                            break
+                        _free_amt = _slots_i - _used.get(_i, {}).get(d, 0)
+                        _p = min(_P_peak, _free_amt, max(1, math.ceil(_rem)))
+                        if _p < 1:
+                            continue
+                        _tgt[d] = _p
+                        _used.setdefault(_i, {})[d] = _used.get(_i, {}).get(d, 0) + _p
+                        _rem -= _p
+                    if not _tgt:
+                        _deferred.append(_s); continue
+                    _campaign_target[_s] = _tgt
+                    continue
+                # P = presses to clear demand within a CAMPAIGN_WINDOW-day campaign → CONCENTRATE on
+                # fewer SKUs at higher P (vs steady/whole-month spread). Capped by mould-pairs + inch
+                # slots. Shorter window ⇒ bigger P ⇒ later SKUs stagger into freed slots (rotation).
+                _wmax = min(len(_elig), max(1, _CAMPAIGN_WINDOW))
+                _P = max(1, min(_mcap or 10**6, _slots_i,
+                                math.ceil(_press_days / _wmax)))
+                _D = min(len(_elig), max(1, math.ceil(_press_days / _P)))   # days needed at P presses
+                # earliest contiguous window of _D working days ending <= deadline with free capacity
+                _win = None
+                for _k in range(0, len(_elig) - _D + 1):
+                    _cand = _elig[_k:_k + _D]
+                    if all(_cap_free(_i, d, _P) for d in _cand):
+                        _win = _cand; break
+                if _win is None:                                     # best-effort: any free days (may under-serve)
+                    _free = [d for d in _elig if _cap_free(_i, d, _P)]
+                    if _free:
+                        _win = _free[:_D]
+                    else:
+                        _deferred.append(_s); continue
+                _campaign_target[_s] = {}
+                for d in _win:
+                    _campaign_target[_s][d] = _P
+                    _used.setdefault(_i, {})[d] = _used.get(_i, {}).get(d, 0) + _P
+            # diagnostics
+            _act_per_day = {d: sum(1 for _s in _campaign_target if d in _campaign_target[_s])
+                            for d in range(1, planning_days + 1)}
+            _avg_act = sum(_act_per_day.values()) / max(1, len(_act_per_day))
+            _over = sum(1 for _i in _used for d in _used[_i] if _used[_i][d] > _inch_slots.get(_i, 0))
+            print(f"  [CAMPAIGN] planned {len(_campaign_target)}/{len(_plan_skus)} SKUs, "
+                  f"deferred {len(_deferred)} | avg active SKUs/day = {_avg_act:.0f} "
+                  f"(target ~building) | per-inch over-capacity days = {_over}")
+            if _CAMPAIGN_DEBUG:
+                print(f"  [CAMPAIGN] inch_slots={dict(sorted(_inch_slots.items()))}")
+                print(f"  [CAMPAIGN] active/day={[_act_per_day[d] for d in range(1, planning_days+1)]}")
+                print(f"  [CAMPAIGN] deferred eg={[str(s)[-8:] for s in _deferred[:10]]}")
 
         # ── Day-by-day simulation ─────────────────────────────────────────────
         for day in range(1, planning_days + 1):
@@ -999,6 +1241,74 @@ class COScheduler:
                 if current_sku and updated_demand.get(current_sku, 0) <= 0:
                     newly_free.append(p)
                     demand_done_free.add(p)
+
+            # ── CAMPAIGN ramp-down: free presses on SKUs now OVER their per-day campaign target
+            # (window ending / declining ramp). The freed press flows to an active-campaign SKU or
+            # idles. Keeps per-inch draw ≤ building supply as campaigns wind down. Monotone-safe
+            # (a shed SKU is _peaked → can't re-gain). Deterministic (sorted).
+            campaign_free: set[str] = set()
+            if _CAMPAIGN_PLAN:
+                _by_sku: dict[str, list] = {}
+                for p in sorted(demand_running_presses):
+                    if p in demand_done_free:
+                        continue
+                    s = press_to_sku.get(p)
+                    if s:
+                        _by_sku.setdefault(s, []).append(p)
+                for s, ps in _by_sku.items():
+                    _tgt = _campaign_target.get(s, {}).get(day, 0)
+                    _excess = len(ps) - _tgt
+                    for p in sorted(ps)[:max(0, _excess)]:           # shed the over-target presses
+                        if p not in newly_free:
+                            newly_free.append(p)
+                            campaign_free.add(p)
+
+            # ── SUPPLY-DONATION (SUPPLY_ALIGN) ────────────────────────────────
+            # RCA: 51 SKUs/day have demand + free moulds + IDLE building that could supply them,
+            # but get 0 curing presses — no free press is curing-allowable for them, and under the
+            # press-HOLD no press leaves a demand SKU. Meanwhile OVER-fed SKUs run more presses than
+            # building can supply (the marginal press just STARVES). Fix: free that starving marginal
+            # press so the pairing loop can route it (headroom-first) to a supply-rich SKU, activating
+            # idle building. Coverage-POSITIVE: the donor loses a press building couldn't feed anyway.
+            supply_free: set[str] = set()
+            if _SUPPLY_ALIGN and horizon_left > 0:
+                _presses_on: dict[str, list] = {}
+                for _p in demand_running_presses:
+                    _s = press_to_sku.get(_p)
+                    if _s and _p not in demand_done_free:
+                        _presses_on.setdefault(_s, []).append(_p)
+                # supply-rich UNDER-SERVED targets: 0-press SKUs with demand + idle-building capacity.
+                _rich: set[str] = set()
+                for _t in all_demand_skus:
+                    if press_count.get(_t, 0) == 0 and updated_demand.get(_t, 0) > 50:
+                        _rt = _qty_per_press_per_day(ct_map.get(_t, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                        _bt = _perSKU_feed(_t, 0, _rt) if buildable_rate is not None else None
+                        if _bt is not None and _bt >= _rt and _n_free_for(_t, "") >= 0:
+                            _rich.add(_t)
+                for _s, _ps in _presses_on.items():
+                    n_s = len(_ps)
+                    if n_s < 2 or updated_demand.get(_s, 0) <= 0:
+                        continue                       # keep ≥1 covering press
+                    rate_s = _qty_per_press_per_day(ct_map.get(_s, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
+                    if rate_s <= 0:
+                        continue
+                    # DEMAND-SURPLUS donor: _s runs more presses than it needs to meet its own demand
+                    # by the horizon → a press is spare. (Phase-0 has demand, not actual building.)
+                    # SA_RELAX=1 drops the surplus gate (n≥2 + reachable-rich) to test reachability.
+                    if os.environ.get("SA_RELAX") != "1":
+                        _need_s = math.ceil(updated_demand[_s] / (rate_s * max(1e-9, horizon_left)))
+                        if n_s <= _need_s:
+                            continue
+                    # donate the press of _s that CAN reach a supply-rich under-served SKU with 2 free
+                    # moulds (else the move is pointless churn). Pick the specific rich-allowable press.
+                    for _don in sorted(_ps):
+                        if _don in newly_free:
+                            continue
+                        if any((_t in _rich and (not _p0_gate or _n_free_for(_t, _don) >= 2))
+                               for _t in press_to_demand_targets.get(_don, [])):
+                            newly_free.append(_don)
+                            supply_free.add(_don)
+                            break
 
             # ── Surplus RI-press early-release (spread across days) ───────────
             # An RI SKU running more presses than it needs to meet demand by the
@@ -1184,6 +1494,11 @@ class COScheduler:
                 _dct = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
                 _pool = list(dict.fromkeys(newly_free))
                 _assigned: set = set()
+                # PRESS_DWELL per-day rate-limit counters (reset each day): how many presses each
+                # SKU has GAINED / SHED so far today, capping the daily press-count change so the
+                # per-SKU series ramps gradually instead of spiking.
+                _gain_today: dict[str, int] = {}
+                _shed_today: dict[str, int] = {}
                 while co_used < max_co_per_day:
                     _pairs: list = []
                     _flex_p: dict = {}
@@ -1192,6 +1507,11 @@ class COScheduler:
                         if p in _assigned:
                             continue
                         old_sku = press_to_sku.get(p, "")
+                        # PRESS_DWELL shed cap: this SKU already shed its daily quota → don't move
+                        # another of its presses today (gradual down-ramp, no 3→0 cliff).
+                        if (_PRESS_DWELL and old_sku
+                                and _shed_today.get(old_sku, 0) >= _PRESS_MAX_SHED_PER_DAY):
+                            continue
                         # DELIVERY_PRIORITY reservation: a press running a committed SKU is
                         # NEVER CO'd away while that SKU still has demand and its deadline has
                         # not passed — the committed SKU's GT feed must not wobble. Stricter
@@ -1203,11 +1523,65 @@ class COScheduler:
                         for target in press_to_demand_targets.get(p, []):
                             if target == old_sku:
                                 continue
+                            # L2 PRESS_RETURN_BLOCK: this press already CO'd AWAY from `target` — don't
+                            # let it boomerang back (same-press round-trip). A DIFFERENT eligible press
+                            # serves `target`. EXEMPT a fully-abandoned target (0 presses → must be able
+                            # to restart) and a delivery-priority target that still wants it (deadline).
+                            if (_PRESS_RETURN_BLOCK and target in _press_left.get(p, ())
+                                    and (_L2_STRICT or press_count.get(target, 0) > 0)
+                                    and not (_prio_acq and _prio_wants(target, day))):
+                                continue
                             rem = updated_demand.get(target, 0)
                             if rem <= 0:
                                 continue
+                            # TAIL damper: in the last few working days, don't START a cold SKU
+                            # (no presses on it) — building has wound down and can't ramp a fresh
+                            # SKU that late, so the press would just starve. Keeps curing SKUs/day
+                            # aligned to what building actually feeds. (Warm SKUs still gain presses.)
+                            if (_TAIL_NO_COLD and horizon_left <= _TAIL_NO_COLD_DAYS
+                                    and press_count.get(target, 0) == 0):
+                                continue
+                            # CAMPAIGN_PLAN: a SKU may gain presses only up to TODAY's campaign target
+                            # (0 outside its window → cold/deferred/finished SKUs get no press). This is
+                            # the per-day generalization of _target_peak, sized to per-inch building supply.
+                            if _CAMPAIGN_PLAN and (
+                                    target in _peaked
+                                    or press_count.get(target, 0)
+                                    >= _campaign_target.get(target, {}).get(day, 0)):
+                                continue
+                            # STATEFUL_PLAN: unimodal ramp — a SKU may gain presses only up to its
+                            # planned target and only while it has NOT started shedding (no re-gain
+                            # after a decrease → no boomerang, smooth up→peak→down).
+                            if _STATEFUL_PLAN and (
+                                    (_SP_MONOTONE and target in _peaked)
+                                    or (_SP_CAP and press_count.get(target, 0)
+                                        >= _target_peak.get(target, 10**6))):
+                                continue
+                            if _PRESS_DWELL:
+                                # GAIN cap: target already took its daily quota of new presses.
+                                if _gain_today.get(target, 0) >= _PRESS_MAX_GAIN_PER_DAY:
+                                    continue
+                                # Anti-boomerang COOLDOWN: this target lost a press within the last
+                                # PRESS_BOOMERANG_COOLDOWN days → don't bring one back (the re-acquire
+                                # leg of the ping-pong). It is a building-limited inch anyway; a
+                                # re-added press just runs dry. EXEMPT a target at 0 presses (a
+                                # fully-abandoned SKU must be allowed to restart) so we never strand it.
+                                if (n_t := press_count.get(target, 0)) > 0 and (
+                                        day - _sku_lost_day.get(target, -10**9)
+                                        < _PRESS_BOOMERANG_COOLDOWN):
+                                    continue
                             n_t = press_count.get(target, 0)
                             rate_t = _qty_per_press_per_day(ct_map.get(target, _dct))
+                            # L1 TAIL_DAMP: in the last TD_TAIL_DAYS working days, block a MARGINAL
+                            # warm re-acquire — target already has presses AND < TD_MIN_RESID_DAYS
+                            # press-days of demand remain (the month-end cascade top-up that just
+                            # re-adds a press onto a nearly-done SKU, which starves anyway). Cold
+                            # (0-press) restarts are TAIL_NO_COLD's job; priority targets exempt.
+                            if (_TAIL_DAMP and horizon_left <= _TD_TAIL_DAYS
+                                    and n_t > 0 and rate_t > 0
+                                    and rem < rate_t * _TD_MIN_RESID_DAYS
+                                    and not (_prio_acq and _prio_wants(target, day))):
+                                continue
                             # PRESS_RATCHET (soft): a target that already shed a press is capped at
                             # its ceiling (count at the last decrease) — BUT the cap YIELDS to a
                             # genuine re-ramp. Block re-acquire above the ceiling only when the
@@ -1247,8 +1621,11 @@ class COScheduler:
                             # can't mount 2 eligible free moulds for (mould-feasible only).
                             if _p0_gate and _n_free_for(target, p) < 2:
                                 continue
-                            # n-1 RI-protection on the donor (if freeing an RI press)
-                            if old_sku in ri_skus:
+                            # n-1 RI-protection on the donor (if freeing an RI press).
+                            # SUPPLY_ALIGN donors are EXEMPT: they were selected precisely because
+                            # building can't supply their full draw (the freed press was starving),
+                            # so moving it to a supply-rich SKU never loses real coverage.
+                            if old_sku in ri_skus and p not in supply_free and p not in campaign_free:
                                 n_old = press_count.get(old_sku, 0) - 1
                                 rem_old = updated_demand.get(old_sku, 0)
                                 if rem_old > 0 and n_old > 0:
@@ -1287,14 +1664,37 @@ class COScheduler:
                             if not _cand:
                                 break
                     # Global key: urgency class → constraint → BUILDING SUPPLY → same-inch → need → ties
+                    def _supply_headroom_bucket(target: str) -> int:
+                        # 0 = idle building can supply the NEXT press for this SKU (buildable_rate −
+                        # current draw ≥ one press's rate) → CO here activates idle building; else 1.
+                        if buildable_rate is None:
+                            return 0
+                        _rt = _qty_per_press_per_day(ct_map.get(target, _dct))
+                        _nt = press_count.get(target, 0)
+                        _br = _perSKU_feed(target, _nt, _rt)
+                        if _br is None:
+                            return 0
+                        return 0 if (_br - _nt * _rt) >= _rt else 1
                     def _cokey(pr):
                         _cls = pr[3][0]                             # urgency_class (0=Class-A,1=Class-B)
                         _con = min(_flex_p[pr[0]], _flex_t[pr[1]])  # constraint
                         _sup = _supply_pref(pr[1], _cons_now)       # building supply headroom
                         _si  = _same_inch(pr[0], pr[1])             # 0 = same inch as press
+                        _hb  = _supply_headroom_bucket(pr[1]) if _SUPPLY_ALIGN else 0
+                        # v3 WARM-FIRST: within the same urgency class, fill a SKU that ALREADY has
+                        # presses (warm) before opening a COLD one — concentrates presses on fewer SKUs
+                        # so cureRUN stays close to what building feeds (fewer starved presses).
+                        _warm = (0 if press_count.get(pr[1], 0) > 0 else 1) if (
+                            _STATEFUL_PLAN and _SP_WARM_FIRST) else 0
                         _tail = (pr[3][1], pr[3][2],                # -priority, after_days
                                  ct_map.get(pr[1], _dct), pr[0], pr[1])
-                        if _SAME_INCH_FIRST and _SAME_INCH_RANK == "top":
+                        if _STATEFUL_PLAN and _SP_WARM_FIRST:
+                            _base = (_cls, _warm, _con, _sup, _si, *_tail)  # warm SKUs fill before cold
+                        elif _SUPPLY_ALIGN:
+                            # supply-headroom right after urgency: pull presses to SKUs idle
+                            # building can actually feed (activates idle Stage-2/VMI).
+                            _base = (_cls, _hb, _con, _sup, _si, *_tail)
+                        elif _SAME_INCH_FIRST and _SAME_INCH_RANK == "top":
                             _base = (_si, _cls, _con, _sup, *_tail)  # same-inch beats everything
                         elif _SAME_INCH_FIRST:
                             _base = (_cls, _si, _con, _sup, *_tail)  # "safe": Class-A first, then same-inch
@@ -1320,6 +1720,15 @@ class COScheduler:
                         _p0_mount(p, new_sku)                  # #4: claim the target's 2 moulds
                     press_count[old_sku] = max(0, press_count.get(old_sku, 0) - 1)
                     press_count[new_sku] = press_count.get(new_sku, 0) + 1
+                    if (_STATEFUL_PLAN or _CAMPAIGN_PLAN) and old_sku:
+                        _peaked.add(old_sku)   # any shed → SKU has peaked, may not re-gain (monotone)
+                    if _PRESS_RETURN_BLOCK and old_sku:
+                        _press_left.setdefault(p, set()).add(old_sku)  # L2: press p has left old_sku
+                    if _PRESS_DWELL:        # record the swap for the rate-limit + cooldown
+                        _gain_today[new_sku] = _gain_today.get(new_sku, 0) + 1
+                        if old_sku:
+                            _shed_today[old_sku] = _shed_today.get(old_sku, 0) + 1
+                            _sku_lost_day[old_sku] = day
                     if _PRESS_RATCHET:      # lock old_sku's ceiling at its new (reduced) count
                         _pc_ceiling[old_sku] = press_count[old_sku]
                     pending_ro_presses.discard(p)
@@ -1571,6 +1980,8 @@ class COScheduler:
                 print(f"    Press {p} ({press_to_sku.get(p,'?')}): "
                       f"{n_compat} compatible targets in allowable")
 
+        # expose the campaign plan so b2c can enforce the active-set (idle out-of-plan presses)
+        self.campaign_target = _campaign_target if _CAMPAIGN_PLAN else {}
         return co_events
 
 
@@ -2532,6 +2943,7 @@ def run_dynamic_consumption(
         "ct_map":       ct_map,
         "df_day0":      df_day0,
         "df_excluded":  df_excluded,
+        "campaign_target": getattr(scheduler, "campaign_target", {}),
     }
 
 

@@ -203,10 +203,13 @@ def _set_plan_month(plan_start) -> None:
     binds the value (both already-imported and lazily-imported later).
     """
     pm = plan_start.strftime("%Y-%m")
+    pd_ = plan_start.strftime("%Y-%m-%d")            # exact-date key for the `date`-column ETL
     os.environ["PLAN_MONTH"] = pm
     os.environ["RUNNING_MOULDS_MONTH"] = pm
+    os.environ["PLAN_DATE"] = pd_
     setattr(_bc, "PLAN_MONTH", pm)
     setattr(_bc, "RUNNING_MOULDS_MONTH", pm)
+    setattr(_bc, "PLAN_DATE", pd_)
     # bc_config.PLAN_START is read directly by the holiday helpers (day-index anchor), so it
     # must reflect THIS run's start, not bc_config's file default.
     setattr(_bc, "PLAN_START", plan_start)
@@ -216,9 +219,9 @@ def _set_plan_month(plan_start) -> None:
             _m = __import__(_modname)
         except Exception:  # pragma: no cover
             continue
-        for _attr in ("PLAN_MONTH", "RUNNING_MOULDS_MONTH"):
+        for _attr, _val in (("PLAN_MONTH", pm), ("RUNNING_MOULDS_MONTH", pm), ("PLAN_DATE", pd_)):
             if hasattr(_m, _attr):
-                setattr(_m, _attr, pm)
+                setattr(_m, _attr, _val)
 
 
 def run_plan(plan_id: str, created_by: str = "scheduler",

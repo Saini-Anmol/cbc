@@ -9,3 +9,5 @@ numpy==2.4.6
 scipy==1.17.1
 openpyxl==3.1.5
 ortools==9.15.6755    # CP-SAT global optimizer (GLOBAL_OPT); pinned for deterministic search order
+requests==2.34.2      # SAP actual-production fetch (api/sap_production_data.py)
+urllib3==2.7.0        # requests transport + InsecureRequestWarning suppression
