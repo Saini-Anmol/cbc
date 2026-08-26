@@ -562,6 +562,18 @@ _TAIL_DAMP = os.environ.get("TAIL_DAMP", "0") != "0"
 _TD_TAIL_DAYS = int(os.environ.get("TD_TAIL_DAYS", "3"))
 _TD_MIN_RESID_DAYS = float(os.environ.get("TD_MIN_RESID_DAYS", "1.0"))
 
+# ── 18-inch exception rule (env INCH18_RULE, default OFF = bit-for-bit) ────────────────────
+# Day-0-snapshot-driven, decided ONCE up front (the user's "superior" rule):
+#   • If the Day-0 running-moulds have STRICTLY < INCH18_MIN_PRESSES (5) presses on 18" →
+#     ABANDON 18": zero its demand so any Day-0 18" press is demand-done from day 1 (freed to CO to
+#     a feedable SKU immediately) AND no press ever ACQUIRES 18" (rem<=0 skip). Kills the ~22-day
+#     18" phantom starvation + frees the press; 18" demand goes unmet (accepted — too few presses to
+#     justify a machine for it). This is the branch ALL current months hit (June 4 / July 1 / Aug 0).
+#   • If >= 5 presses on 18" → BUILD+CURE 18" EARLY (<=6 days) on 7003, then 7003 → 15" (the
+#     INCH18_EXC building relax + an early-finish campaign). Not exercised on current snapshots.
+_INCH18_RULE = os.environ.get("INCH18_RULE", "0") != "0"    # superseded by INCH18_DEFER → default OFF
+_INCH18_MIN_PRESSES = int(os.environ.get("INCH18_MIN_PRESSES", "5"))
+
 # ── Supply-aware curing draw (SUPPLY_ALIGN, default OFF = bit-for-bit) ─────────────────
 # RCA: idle building (Stage-2/VMI) + unmet demand coexist because building only builds what
 # curing DRAWS (no-waste-GT). A freed press that CO's onto an SKU whose building is ALREADY
@@ -736,6 +748,7 @@ class COScheduler:
         feed_ctx: dict | None = None,            # PERSKU_FEED: {sku_machines, machine_skus, machine_gtday}
         sku_moulds: dict | None = None,          # #4: {sku: set(eligible mould IDs)} or None
         priority_deadline_map: dict | None = None,  # DELIVERY_PRIORITY: {sku: deadline_day} or None
+        switch_day18: int | None = None,         # INCH18_DEFER: no 18" acquisition before this day
     ) -> list[dict]:
         """Returns sorted list of CO events.
 
@@ -1040,6 +1053,27 @@ class COScheduler:
             sku: float(demand_map.get(sku, 0)) for sku in all_demand_skus
         }
 
+        # ── 18-inch exception rules ───────────────────────────────────────────────────────
+        def _inch18(_s):                                   # inch string, robust fallback
+            return _sku_inch.get(str(_s)) or (str(_s)[8:10] if len(str(_s)) >= 10 else "")
+        # INCH18_DEFER (superior rule): KEEP 18" demand; free the Day-0 18" press(es) so they CO to a
+        # feedable SKU early, and the day-gate below blocks 18" ACQUISITION until switch_day18 — so 18"
+        # is covered LATER (when 7003 builds it), not abandoned. Overrides INCH18_RULE.
+        _defer18_presses: set = set()
+        if switch_day18 is not None:
+            _defer18_presses = {p for p, s in press_to_sku.items() if _inch18(s) == "18"}
+            print(f"  [INCH18_DEFER] switch_day18={switch_day18}: free {len(_defer18_presses)} Day-0 "
+                  f"18\" press(es) early; block 18\" acquisition until day {switch_day18}")
+        elif _INCH18_RULE:
+            # <5 Day-0 presses on 18" → ABANDON 18": zero its demand (press freed, no acquisition).
+            _n18_press = sum(1 for _s in press_to_sku.values() if _inch18(_s) == "18")
+            if _n18_press < _INCH18_MIN_PRESSES:
+                _ab = [_s for _s in updated_demand if _inch18(_s) == "18"]
+                for _s in _ab:
+                    updated_demand[_s] = 0.0
+                print(f"  [INCH18_RULE] Day-0 18\" presses={_n18_press} (<{_INCH18_MIN_PRESSES}) "
+                      f"→ ABANDON 18\": zeroed {len(_ab)} SKU(s), presses freed, no 18\" acquisition")
+
         # ── Track eligible presses ────────────────────────────────────────────
         # pending_ro_presses: RO presses carried forward every day until they CO.
         # Fixes bug where RO presses were only offered on Day 1; any that didn't
@@ -1050,6 +1084,11 @@ class COScheduler:
         # demand_running_presses: presses running a demand SKU (RI + CO'd NRI/RO).
         # When their SKU's demand = 0, the press is freed for CO.
         demand_running_presses: set = {p for p, s in press_to_sku.items() if s in ri_skus}
+        # INCH18_DEFER: the Day-0 18" presses are offered for CO from day 1 (RO), not held on 18"
+        # (18" building is deferred to switch_day18, so staying would starve them).
+        if _defer18_presses:
+            pending_ro_presses |= _defer18_presses
+            demand_running_presses -= _defer18_presses
 
         co_events: list[dict] = []
         daily_co_used: dict[int, int] = {}
@@ -1534,6 +1573,10 @@ class COScheduler:
                             rem = updated_demand.get(target, 0)
                             if rem <= 0:
                                 continue
+                            # INCH18_DEFER: no 18" acquisition before switch_day18 (7003 builds 18"
+                            # only from switch_day18; acquiring 18" presses earlier just starves them).
+                            if switch_day18 and day < switch_day18 and _inch18(target) == "18":
+                                continue
                             # TAIL damper: in the last few working days, don't START a cold SKU
                             # (no presses on it) — building has wound down and can't ramp a fresh
                             # SKU that late, so the press would just starve. Keeps curing SKUs/day
@@ -1749,6 +1792,8 @@ class COScheduler:
                     rem = updated_demand.get(target, 0)
                     if rem <= 0:
                         continue               # demand already fulfilled
+                    if switch_day18 and day < switch_day18 and _inch18(target) == "18":
+                        continue               # INCH18_DEFER: no 18" acquisition before switch_day18
 
                     n_t  = press_count.get(target, 0)
                     ct_t = ct_map.get(target, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN)
@@ -2705,6 +2750,7 @@ def run_dynamic_consumption(
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
     reactive_only: bool = False,                 # Part B: skip planned schedule + CC workbook, keep ETL
     initial_press_state: dict | None = None,     # MID-MONTH: {press_to_sku, mould_life, press_moulds}
+    switch_day18: int | None = None,             # INCH18_DEFER: no 18" acquisition before this day
 ) -> dict:
     """
     Build the 31-day dynamic curing consumption file.
@@ -2901,6 +2947,7 @@ def run_dynamic_consumption(
         feed_ctx=feed_ctx,
         sku_moulds=_p0_sku_moulds,
         priority_deadline_map=priority_deadline_map,
+        switch_day18=switch_day18,
     )
 
     # Pass 2: 31-day simulation

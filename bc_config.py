@@ -35,20 +35,25 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 8, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "august_demand_tomerji.xlsx")  # per-month demand workbook
+PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
+DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_240826.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
-PLANT_HOLIDAYS = False                           # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+PLANT_HOLIDAYS = False                      # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
-# EXACT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
-# tables now carry a `date` column, so state is read for the plan's START DATE (a month can hold
-# several daily snapshots, e.g. 2026-08-01 AND 2026-08-21 → plan_month alone is ambiguous). Env
-# overridable; harnesses/main set it alongside PLAN_MONTH. For a mid-month "generate from today" run,
-# PLAN_START = today, so PLAN_DATE = today and the ETL seeds from today's real running-moulds/GT/carcass.
-PLAN_DATE            = os.environ.get("PLAN_DATE")            or PLAN_START.strftime("%Y-%m-%d")
+# SNAPSHOT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
+# tables carry a `date` column. The opening snapshot is ALWAYS taken from the START-OF-MONTH row
+# (f"{PLAN_MONTH}-01"), regardless of the actual plan-start day: e.g. a plan starting 2026-08-21 still
+# seeds from the 2026-08-01 snapshot (if the DB holds both 08-01 and 08-21 rows, the 08-01 one wins).
+# The real PLAN dates (PLAN_START / PLANNING_DAYS) are UNCHANGED — only the snapshot source is
+# start-of-month. Env overridable. A 1st-of-month start is already "-01", so local runs stay identical.
+PLAN_DATE            = os.environ.get("PLAN_DATE")            or f"{PLAN_MONTH}-01"
+# Fallback month for the opening snapshot: if the requested plan_month has NO running-moulds rows
+# for its "-01" date, running-moulds + opening GT + opening carcass ALL fall back to this month's
+# "-01" snapshot together (see connection._resolve_snapshot). The PLAN dates stay as entered.
+SNAPSHOT_FALLBACK_MONTH = os.environ.get("SNAPSHOT_FALLBACK_MONTH") or "2026-07"
 
 
 # Non-secret defaults only. Host/user/password/database must come from .env or
@@ -246,6 +251,57 @@ INCH_HIST_LOCK_FILE      = os.path.join(HERE, "data", "analysis_aug",
                                         "machine_inch_dominant_4months_Apr-Jul.xlsx")
 INCH_HIST_LOCK_MIN_SHARE = float(os.environ.get("INCH_HIST_MIN_SHARE", "0.02"))
 INCH_HIST_LOCK_MAX_INCHES = int(os.environ.get("INCH_HIST_MAX_INCHES", "3"))
+# ── HARDCODED historical inch-lock sets (single source of truth) ──────────────
+# These are the FINAL per-machine ranked allowed-inch lists (ranked[0] = dominant)
+# as produced from the 4-month plant report machine_inch_dominant_4months_Apr-Jul.xlsx
+# (sheet "Inch_Counts_Matrix") with the >=2% share / max-3 / BJ-no-+3 rules already
+# APPLIED. When this dict is non-empty, b2c_pipeline._load_inch_hist_lock() builds its
+# four maps DIRECTLY from it and SKIPS the Excel read + the per-2%/rank/BJ recomputation
+# (the values here are already final). To CHANGE the lock, edit THIS dict (do not touch
+# the retired Excel file). Set to {} (or delete) to fall back to the Excel path.
+INCH_HIST_LOCK_SETS = {
+    "6001": ["14"],
+    "6002": ["15"],
+    "6003": ["17"],
+    "6004": ["16"],
+    "6801": ["14"],
+    "6802": ["13"],
+    "6803": ["16", "15"],
+    "6909": ["12"],
+    "6911": ["15", "13"],
+    "7001": ["15"],                # ADOPTED VMI realloc: 15"-only (16"→6004, 18"→7003)
+    "7002": ["14", "16"],          # 14"→16" one-way (timing enforced in code, no 14↔16 churn)
+    "7003": ["16", "18"],          # ADOPTED: 16"(d1-20) → 18"(d21+); INCH18_DEFER timing in code
+    "7004": ["14"],
+    "7101": ["15"],
+    "7102": ["15"],
+    "7103": ["13", "15"],
+    "7104": ["15"],
+    "7105": ["13"],
+    "7106": ["13"],
+    "7201": ["16"],
+    "7301": ["15"],
+    "7501": ["12"],
+    "7502": ["13"],
+    "7503": ["13"],
+    "7601": ["15"],
+    "7701": ["15"],
+    "7801": ["12"],
+    "7802": ["12"],
+    "7803": ["15", "12"],
+    "7804": ["15", "16", "14"],
+    "8001": ["12"],
+    "8002": ["12"],
+    "8003": ["12"],
+    "8101": ["15"],
+    "8201": ["12"],
+    "8301": ["12", "15"],
+    "8302": ["12", "15", "13"],
+    "8501": ["13", "12"],          # point6: drop 15" → specialize 8501 to 12"/13" (kills its 15↔12 +3 COs)
+    "8502": ["16", "15", "14"],    # 8502 already builds those 15" SKUs (16.9 idle shifts) → absorbs them
+    "ps3": ["15"],
+    "ps4": ["16"],
+}
 # Apply the historical lock to Stage-1 carcass machines too? Default OFF: Stage-1 is
 # post-hoc (doesn't gate GT/cured) and _STAGE1_SINGLE_INCH already fixes each S1 machine
 # to ONE (demand-optimal, carcass-FEASIBLE) inch — that already satisfies "fixed = one
@@ -573,7 +629,7 @@ MAX_ENDOFDAY_GT_INVENTORY = int(os.environ.get("GT_CAP_MAX", "8000"))
 # this bounds that buffer so the plant never hoards carcass. Applied only when the
 # STAGE1_CO carcass-realism model is ON (bounds the gate's pre-build). HARD plant limit
 # 1200 (was 2000). Env CARCASS_EOD_CAP.
-MAX_ENDOFDAY_CARCASS_INVENTORY = int(os.environ.get("CARCASS_EOD_CAP", "1200"))
+MAX_ENDOFDAY_CARCASS_INVENTORY = int(os.environ.get("CARCASS_EOD_CAP", "500"))
 
 # ── Carcass build-to-consumption (CARCASS_NO_OVERBUILD) — ADOPTED, default ON ──
 # The Stage-1 carcass GATE used to size its per-shift pre-build to max(Stage-2 build rate,

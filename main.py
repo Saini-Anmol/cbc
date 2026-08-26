@@ -63,7 +63,7 @@ CLOUD_CONFIG: dict = {
     # limit). Verified July/Aug/June (mould-audit PASS, carcass=GT, EOD ≤2000 / 0 over).
     "STAGE2_CARCASS_GATE_ENABLED":            True,
     "STAGE1_CO_ENABLED":                      True,
-    "MAX_ENDOFDAY_CARCASS_INVENTORY":         1200,   # MUST equal bc_config (hard limit)
+    "MAX_ENDOFDAY_CARCASS_INVENTORY":         500,    # MUST equal bc_config (hard limit); was 1200 (local↔cloud parity fix)
     "GT_BUFFER_SHIFTS":                       2,
     "GT_BUFFER_SHIFTS_VMI":                   2,      # split buffer (VMI banks 2 shifts)
     "GT_BUFFER_SHIFTS_OTHER":                 1,      # BJ/UNI/STAGE bank 1
@@ -120,12 +120,12 @@ CLOUD_CONFIG: dict = {
 #     press stays on its SKU until that SKU's demand is met (no mid-life press-count churn). Cloud
 #     inherits ON; `PRESS_STABLE=0` reverts bit-for-bit. Sub-experiments PRESS_RELEASE_DAYS / PRESS_VALVE
 #     / PRESS_RATCHET are default OFF (measured worse). Cured −2,118 / COs −126 / starvation −916 vs pre-hold.
-#   • Mid-month start / production deduction: `_MIDMONTH_DEDUCT` (b2c_pipeline) env-default "1" = ON.
-#     Cloud calls `run_rolling_pipeline_2pass` (above): a planStartDate day>1 → Run 1 (full month)
-#     simulates days 1..(start-1) production (×0.90-1.05, deterministic), deducts it from demand, then
-#     Run 2 replans start→end seeded from the day-(start) GT/carcass/press snapshot (CO planner too).
-#     A 1st-of-month start → single run, bit-for-bit. `MIDMONTH_DEDUCT=0` disables. Uses the same
-#     1st-of-month DB opening-GT/running-moulds snapshot for both runs (v1); no DB writes.
+#   • Mid-month start / production deduction: `_MIDMONTH_DEDUCT`/`_ACTUAL_PROD`/`_TODAY_START`
+#     (b2c_pipeline) are env-default "0" = OFF, and are PINNED OFF on cloud (env block above). So
+#     cloud runs PURELY for the entered planStartDate..planEndDate — no SAP actual-production
+#     deduction, no generate-from-today clamp — using that month's DB opening-GT/running-moulds
+#     snapshot (plan_month = planStartDate's YYYY-MM). To re-enable the mid-month 2-pass deduction,
+#     set `MIDMONTH_DEDUCT=1` (then a start day>1 runs Run-1 sim → deduct → Run-2 replan).
 #   • Holiday fixes: `_HOLIDAY_CO_DEFER` (no new CO on a holiday → next working day) + `_HOLIDAY_NO_PERISH`
 #     (don't pre-build perishable stock into a holiday) default ON; `_HOLIDAY_BRIDGE` default OFF
 #     (measured no-op). The holiday INPUT is DB-driven: jkt_holiday_calendar → connection.read_db
@@ -135,6 +135,13 @@ CLOUD_CONFIG: dict = {
 
 for _k, _v in CLOUD_CONFIG.items():
     setattr(_bc, _k, _v)
+
+# Cloud runs PURELY for the entered planStartDate..planEndDate: NO SAP actual-production
+# deduction and NO generate-from-today clamp. These 3 engine toggles are ENV-read (not
+# bc_config attrs, so CLOUD_CONFIG can't pin them) — set them OFF here BEFORE the engine
+# import. They already default "0"; this guarantees it on the cloud path regardless of env.
+for _envk in ("MIDMONTH_DEDUCT", "ACTUAL_PROD", "TODAY_START"):
+    os.environ[_envk] = "0"
 
 # Import the engine ONLY AFTER the pin above, so every `from bc_config import X`
 # inside the engine binds to the pinned cloud value (not whatever is in the file).
@@ -203,7 +210,11 @@ def _set_plan_month(plan_start) -> None:
     binds the value (both already-imported and lazily-imported later).
     """
     pm = plan_start.strftime("%Y-%m")
-    pd_ = plan_start.strftime("%Y-%m-%d")            # exact-date key for the `date`-column ETL
+    pd_ = f"{pm}-01"                                 # START-OF-MONTH snapshot key for the `date`-column ETL
+    #   The opening snapshot (running-moulds + opening GT/carcass) is ALWAYS taken from the 1st of the
+    #   plan's month, regardless of the actual plan-start day (the real plan dates stay as entered).
+    #   A later _resolve_snapshot(engine) may redirect this to the fallback month if the requested
+    #   month has no running-moulds rows.
     os.environ["PLAN_MONTH"] = pm
     os.environ["RUNNING_MOULDS_MONTH"] = pm
     os.environ["PLAN_DATE"] = pd_
@@ -239,6 +250,9 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
     demand_df, run_cfg, sku_desc = conn.read_db(engine, plan_id)
     # Align plan_month to the run's actual month BEFORE the engine ETL reads Day-0 data.
     _set_plan_month(run_cfg["plan_start"])
+    # Resolve the opening-snapshot date centrally (start-of-month + July fallback) so running-moulds,
+    # opening GT and opening carcass all seed from the SAME effective date. Rebinds connection.PLAN_DATE.
+    conn._resolve_snapshot(engine)
     print(f"[main] plan_id={plan_id}  SKUs={len(demand_df)}  "
           f"start={run_cfg['plan_start'].date()}  days={run_cfg['planning_days']}  "
           f"max_co={run_cfg['max_co_per_day']}  eff={run_cfg['press_efficiency']}")

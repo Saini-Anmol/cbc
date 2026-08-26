@@ -37,7 +37,8 @@ import pandas as pd
 from sqlalchemy import text
 
 from bc_config import make_engine, ENV
-from bc_config import RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH, PLAN_DATE
+from bc_config import (RUNNING_MOULDS_TABLE, RUNNING_MOULDS_MONTH, PLAN_MONTH, PLAN_DATE,
+                       SNAPSHOT_FALLBACK_MONTH)
 from curing_consumption_dynamic import ConsumptionConfig  # config class (stays with the scheduling logic)
 from building import Config, _ps_dedicated_skus  # building config + PS-dedication helper (building.py stays the leaf)
 
@@ -310,6 +311,10 @@ class ConsumptionETL:
         df = (df.groupby("SKUCode")
                 .agg(Quantity=(qty_col, "sum"))
                 .reset_index())
+        if os.environ.get("DEMAND_INT_NORMALIZE", "1") != "0":
+            # Demand is physically integer; strip xlsx float dust (e.g. 13750.000000000002)
+            # so the curing-side Updated_Demand matches the DB-int path. Cloud reads int → no-op.
+            df["Quantity"] = df["Quantity"].round()
         df = df[df["Quantity"] > 0].copy()
 
         # ConsolidatedPriorityScore (v1) — computed HERE, the single source, so
@@ -341,6 +346,7 @@ class ConsumptionETL:
     # -- adapted from curing_lp.ETL.load_gt_inventory (lines 360-366) ---------
     def load_gt_inventory(self) -> pd.DataFrame:
         """Load opening GT inventory from DB. Returns [SKUCode, GT_Inventory]."""
+        _resolve_snapshot(self.engine)
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory"
             f" FROM {self.db}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
@@ -353,6 +359,7 @@ class ConsumptionETL:
         Returns [Machine, SKUCode, MouldNos, MouldLife_remaining, Num_Moulds].
         Excludes presses where SKUCode is blank/NULL (in changeover or idle).
         """
+        _resolve_snapshot(self.engine)
         wc_master = self._sql(f"SELECT * FROM {self.db}.Master_WC_Master")
         wc_master = wc_master[["wcID", "WCNAME"]]
 
@@ -501,6 +508,7 @@ class ConsumptionETL:
         """SKUs seen in RUNNING_MOULDS_TABLE (current/historical curing press state)."""
         _sentinels = {"CHANGEOVER", "MOULD_CLEAN", "MOULDCLEAN", "CO", "CLEAN", "NAN", ""}
         try:
+            _resolve_snapshot(self.engine)
             df = self._sql(
                 f"SELECT DISTINCT Sapcode AS SKUCode "
                 f"FROM {self.db}.{RUNNING_MOULDS_TABLE} "
@@ -602,6 +610,7 @@ class ETL:
         # df["StartTime"] = pd.to_datetime(df["StartTime"])
         # df["EndTime"]   = pd.to_datetime(df["EndTime"])
         # return df
+        _resolve_snapshot(self.engine)
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
             f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
@@ -609,6 +618,7 @@ class ETL:
 
     def load_carcass_inventory(self):
         try:
+            _resolve_snapshot(self.engine)
             return self._sql(
                 f"SELECT sizeCode AS SKUCode, CarcassInv AS Carcass_Inventory "
                 f"FROM {Config.DB_NAME}.carcass_inventory_manual WHERE date = '{PLAN_DATE}'"
@@ -785,6 +795,7 @@ class B2C_ETL(ETL):
 
     def load_gt_inventory_for_b2c(self) -> pd.DataFrame:
         """Load REAL opening GT inventory (not zeroed out as in CBC cold-start)."""
+        _resolve_snapshot(self.engine)
         return self._sql(
             f"SELECT sizeCode AS SKUCode, gtInventory AS GT_Inventory "
             f"FROM {Config.DB_NAME}.gt_inventory_manual WHERE date = '{PLAN_DATE}'"
@@ -795,6 +806,50 @@ class B2C_ETL(ETL):
 def _sql(engine, q: str) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql(q, conn)
+
+
+# ── opening-snapshot date resolver (start-of-month + fallback) ─────────────────────────
+# Decides ONE effective snapshot date used by ALL opening-state queries (running-moulds +
+# opening GT + opening carcass) so they seed from the SAME date and fall back TOGETHER.
+#   • Start-of-month: the snapshot is always taken from f"{PLAN_MONTH}-01", regardless of the
+#     actual plan-start day (the real plan dates PLAN_START/PLANNING_DAYS stay as entered; only
+#     the snapshot source is start-of-month).
+#   • Fallback: if Daily_Running_Moulds (RUNNING_MOULDS_TABLE) has NO rows for that "-01" date,
+#     running-moulds + GT + carcass ALL fall back to SNAPSHOT_FALLBACK_MONTH's "-01" snapshot.
+# It rebinds the module-global PLAN_DATE; every snapshot query below reads PLAN_DATE, so setting
+# it here steers all of them at once. The decision is cached (keyed on the UNMUTATED requested
+# PLAN_MONTH) so the DB COUNT runs once and re-entrant calls are free; a new run for a different
+# month (main._set_plan_month resets PLAN_MONTH) re-resolves.
+_SNAPSHOT_RESOLVED = None   # (requested_month, effective_date, effective_month) | None
+
+def _resolve_snapshot(engine):
+    """Resolve + cache the effective opening-snapshot date; rebind module-global PLAN_DATE.
+    Returns the effective 'YYYY-MM-01' date string."""
+    global _SNAPSHOT_RESOLVED, PLAN_DATE, RUNNING_MOULDS_MONTH
+    requested_month = PLAN_MONTH
+    if _SNAPSHOT_RESOLVED is not None and _SNAPSHOT_RESOLVED[0] == requested_month:
+        return _SNAPSHOT_RESOLVED[1]
+    req_date = f"{requested_month}-01"
+    eff_month, eff_date = requested_month, req_date
+    try:
+        n = int(_sql(engine,
+            f"SELECT COUNT(*) AS n FROM {DB}.{RUNNING_MOULDS_TABLE} "
+            f"WHERE date = '{req_date}'")["n"].iloc[0])
+    except Exception as exc:                                     # DB hiccup → don't fall back blindly
+        print(f"[snapshot] resolver COUNT failed ({exc}); using requested {req_date}")
+        n = 1
+    if n == 0:
+        eff_month = SNAPSHOT_FALLBACK_MONTH
+        eff_date  = f"{SNAPSHOT_FALLBACK_MONTH}-01"
+        print(f"[snapshot] plan_month {requested_month} has no running-moulds "
+              f"→ FALLBACK to {SNAPSHOT_FALLBACK_MONTH} snapshot ({eff_date})")
+    else:
+        print(f"[snapshot] plan_month {requested_month} → snapshot {eff_date} "
+              f"({n} running-moulds rows)")
+    PLAN_DATE = eff_date                    # steers all 9 snapshot queries (they read this global)
+    RUNNING_MOULDS_MONTH = eff_month        # effective plan_month (cosmetic; unused downstream)
+    _SNAPSHOT_RESOLVED = (requested_month, eff_date, eff_month)
+    return eff_date
 
 def _load_cycle_times(engine) -> dict:
     try:
@@ -811,6 +866,7 @@ def _load_cycle_times(engine) -> dict:
 
 def _load_opening_gt(engine) -> dict:
     try:
+        _resolve_snapshot(engine)
         df = _sql(engine,
             f"SELECT sizeCode AS sku, gtInventory AS qty "
             f"FROM {DB}.gt_inventory_manual WHERE date = '{PLAN_DATE}'")
@@ -827,6 +883,7 @@ def _load_opening_carcass(engine) -> dict:
     the exact analog of _load_opening_gt for carcass_inventory_manual. Consumed FIRST in the
     Stage-1 carcass schedule so the plant's on-hand carcass is not wasted."""
     try:
+        _resolve_snapshot(engine)
         df = _sql(engine,
             f"SELECT sizeCode AS sku, CarcassInv AS qty "
             f"FROM {DB}.carcass_inventory_manual WHERE date = '{PLAN_DATE}'")
@@ -846,6 +903,7 @@ def _load_press_state(engine) -> pd.DataFrame:
     matches CO event press IDs and silently breaks all CO transitions.
     """
     try:
+        _resolve_snapshot(engine)
         rm = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE date = '{PLAN_DATE}'")
         if "updatedAt" in rm.columns:
             rm = rm.drop(columns=["updatedAt"])
@@ -871,6 +929,7 @@ def _load_press_state(engine) -> pd.DataFrame:
 
 def _load_mould_tracker(engine) -> pd.DataFrame:
     try:
+        _resolve_snapshot(engine)
         rm  = _sql(engine, f"SELECT * FROM {DB}.{RUNNING_MOULDS_TABLE} WHERE date = '{PLAN_DATE}'")
         # Schema-adaptive (the mapping table has flipped naming across cycles):
         # current/original `Mould`/`Matl.Code`/`Active Flag`=1, or prior `Mold_Name`/`Item_Code`.

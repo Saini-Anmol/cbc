@@ -875,6 +875,27 @@ def _load_inch_hist_lock() -> None:
     No-op if the toggle is off or the file is missing (keeps ±2 bit-for-bit)."""
     if not _INCH_HIST_LOCK_ENABLED:
         return
+    # Preferred source: the hardcoded, already-final sets in bc_config. When present,
+    # these are the FINAL ranked allowed-inch lists (2%/max-3/BJ-no-+3 already applied),
+    # so build the four maps DIRECTLY and SKIP the Excel read + per-2%/rank/BJ logic.
+    _cfg_sets = getattr(_bc_cfg, "INCH_HIST_LOCK_SETS", None)
+    if isinstance(_cfg_sets, dict) and _cfg_sets:
+        _n = 0
+        for _m, _al in _cfg_sets.items():
+            _m = str(_m).strip()
+            _keep = [str(i).strip() for i in _al if str(i).strip()]
+            if not _m or not _keep:
+                continue
+            _MACHINE_ALLOWED_INCHES[_m] = list(_keep)
+            _MACHINE_ALLOWED_INCH_SET[_m] = set(_keep)
+            _MACHINE_DOMINANT_INCH[_m] = _keep[0]
+            _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_keep)
+            _n += 1
+        _nf = sum(1 for v in _MACHINE_ALLOWED_INCHES.values() if len(v) == 1)
+        print(f"  [INCH_HIST_LOCK] loaded allowed-inch sets for {_n} machines from "
+              f"bc_config.INCH_HIST_LOCK_SETS ({_nf} FIXED single-inch, "
+              f"{_n - _nf} FLEXIBLE); ±2 band discontinued")
+        return
     path = getattr(_bc_cfg, "INCH_HIST_LOCK_FILE", "")
     if not path or not os.path.exists(path):
         print(f"  [INCH_HIST_LOCK] file not found ({path}); ±2 band kept")
@@ -920,6 +941,44 @@ def _load_inch_hist_lock() -> None:
           f"±2 band discontinued")
 
 _load_inch_hist_lock()
+
+# ── 18-inch EXCEPTION (env INCH18_EXC, default OFF = bit-for-bit) ─────────────────────────
+# 18" SKUs are DB-allowable on all 4 VMI-Maxx machines (7001-7004) but the historical inch-lock
+# pins 18" to 7001 ONLY (7001 set = {15,16,18}). 7001 is 91% busy on 15"/16" until ~day 22, so the
+# Day-0 presses committed to 18" starve ~22 days before 7001 can build 18" GT (build↔cure misalign,
+# ~200 phantom starvation events). Fix by rebalancing the VMI-Maxx inch-locks so 18" lives on the
+# under-loaded 7003 and 7001 is freed for 15":
+#   7001 {15,16,18} → {15}   (15"-dedicated; its 16" work moves to 6004)
+#   7003 {15}       → {15,18} (FLEXIBLE; builds 18" FIRST when a press is drawing it — see §2 at _key)
+#   6004 {16}       → {16}    (unchanged; absorbs 7001's 16")
+# Building auto-follows curing draw (no-waste coupling) + Day-0 presses already draw 18" from day 1,
+# so relaxing 7003 + prioritizing 18"-when-drawn makes 18" GT arrive in time — the misalignment
+# self-heals; no Phase-0 change needed. DB-allowable only (no invented pairs). All edits ORDERING/gate.
+_INCH18_EXC = os.environ.get("INCH18_EXC", "0") != "0"
+# INCH18_DEFER (the "superior" coordinated rule): same inch-lock rebalance, BUT 7003 builds 15" ONLY
+# until a computed switch_day (option b: when the OTHER 15" machines can cover the remaining 15"),
+# then takes a direct 8h CO 15"→18" (never 16"), builds 18" the rest of the month, one-way (no revert).
+# Phase-0 curing defers 18" press acquisition to switch_day + frees the Day-0 18" press(es) early.
+_INCH18_DEFER = os.environ.get("INCH18_DEFER", "1") != "0"    # ADOPTED (default ON): VMI realloc —
+#   7001→15, 6004→16, 7003→16"(d1-20)→18"(d21+), 7002→14"→16" one-way (no churn). INCH18_DEFER=0 reverts.
+_INCH18_MACHINE = os.environ.get("INCH18_MACHINE", "7003")     # the machine 18" moves to
+if _INCH18_EXC or _INCH18_DEFER:
+    # Optimal VMI allocation (June+July analysis): 7001→15, 6004→16, 7003→16(early)+18(from day21),
+    # 7002→14(early)+16(one-way, kills its 14↔16 churn). Others keep historical (6001/7004→14, 6002→15,
+    # 6003→17). 16→18 and 14→16 are +2 jumps (normal diff-CO, not the 8h +3).
+    # NOTE: bc_config.INCH_HIST_LOCK_SETS now ALSO carries these adopted sets (7001→[15], 7003→[16,18],
+    # 7002→[14,16], 6004→[16]) so the config file reflects reality — this loop is idempotent belt-and-
+    # suspenders (re-asserts them when INCH18_DEFER on). The per-day timing (7003 16→18@d21, 7002 one-way)
+    # lives in the day loop; INCH18_DEFER=0 keeps the config sets but drops the timing.
+    _inch18_override = {"7001": ["15"], _INCH18_MACHINE: ["16", "18"], "6004": ["16"], "7002": ["14", "16"]}
+    for _m, _al in _inch18_override.items():
+        _MACHINE_ALLOWED_INCHES[_m] = list(_al)
+        _MACHINE_ALLOWED_INCH_SET[_m] = set(_al)
+        _MACHINE_DOMINANT_INCH[_m] = _al[0]                    # anchor = first (15" 7001, 16" 7003, 14" 7002)
+        _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_al)
+    print(f"  [INCH18_DEFER] VMI realloc — 7001→{{15}}, {_INCH18_MACHINE}→{{16,18}}, 6004→{{16}}, "
+          f"7002→{{14,16}} (DB-allowable, no invented pairs)")
+
 # Flexible machines under the historical lock (allowed-inch set >= 2) — the only
 # machines that can redirect between inches; fixed machines are single-inch.
 _FLEX_MACHS_HIST: frozenset = frozenset(
@@ -1844,6 +1903,13 @@ def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int
     inch_cap: dict[str, float] = defaultdict(float)
     for m, i in anchor.items():
         inch_cap[i] += cap_day.get(m, 0.0)
+    # §3 18-inch exception: the single-anchor grid gives each machine ONE inch, so the flexible
+    # 18"-machine (7003) contributes only to 15" — leaving building_inch_capacity["18"]=0, which
+    # makes the SIZE_BAL/_over_cap supply gates SUPPRESS all 18" building/draw (18" collapses to 0).
+    # 7003 genuinely flexes to 18" when drawn, so credit 18" with its day-capacity (kept in 15" too:
+    # 18" is small + draw-timed, so the slight double-count only stops the false 0-cap suppression).
+    if _INCH18_EXC and _INCH18_MACHINE in cap_day:
+        inch_cap["18"] += cap_day[_INCH18_MACHINE]
     # Only US (UNISTAGE) is HARD-locked (max 1 Day-1 setup CO). BJ is left flexible (soft, tight
     # JIT → 2-3 COs/month) so it keeps its ±2 band and the KPI recovers.
     bjus_lock = {m: anchor[m] for m in gt
@@ -1863,6 +1929,7 @@ def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int
             sku_machines.setdefault(str(s), []).append(m)
             machine_la_skus.setdefault(m, set()).add(str(s))
     return {"bjus_lock": bjus_lock, "building_inch_capacity": dict(inch_cap), "buildable": buildable,
+            "inch_dem": dict(inch_dem),      # per-inch total demand (INCH18_DEFER switch_day calc)
             "feed_ctx": {"sku_machines": sku_machines, "machine_skus": machine_la_skus,
                          "machine_gtday": machine_gtday}}
 
@@ -3867,6 +3934,14 @@ def _assign_building_shift(
                                          < _FLEX_MCV_COOLDOWN)
                             if (not _meaningful) or _cooldown:
                                 inch_penalty += _HYST_BIG
+                # §2 18-inch exception: on the 18"-machine (7003), build 18" FIRST whenever a
+                # curing press is drawing that 18" SKU now (shift_cure_demand>0) — feeds the
+                # already-committed Day-0 18" presses immediately (kills the ~22-day misalign).
+                # When 18" has NO live draw it is not a build candidate (no-waste coupling), so
+                # 7003 falls back to 15" automatically — no explicit "15"-first branch needed.
+                if (_INCH18_EXC and str(m) == _INCH18_MACHINE and to_inch == "18"
+                        and shift_cure_demand.get(sku, 0.0) > 0):
+                    inch_penalty = -1                          # strictly ahead of any 15" (rank >= 0)
                 constraint = min(flex_m[m], flex_s[sku])
                 if _BLD_SEC_ORDER != "baseline":
                     # Explicit four-factor ordering (same-size first, cost/m/sku tail).
@@ -3962,6 +4037,29 @@ def _assign_building_shift(
         # of exactly 3 (beyond the band) for the whole month, at an 8h building CO
         # (INCH_PLUS3_CO_MINS). Gated to real +3/-3 demand + enough days to amortise —
         # UNLESS its in-band demand is fully completed (take it immediately; idle is worse).
+        # ── INCH18_DEFER forced 15→18 switch (8h CO-only shift) ───────────────────────────
+        # 7003's per-day lock flips to {18} on switch_day; here we force the direct 8h CO
+        # (qty=0, 480 min, production next shift) that the normal Phase-B path skips ("no room to
+        # build same shift"). One-way: the lock={18} blocks any revert to 15".
+        if _INCH18_DEFER:
+            _m18 = _INCH18_MACHINE
+            _s18 = stg.get(_m18)
+            _cur18n = sku_inch.get(_s18["cur_sku"], "") if _s18 is not None else ""
+            # Only force the 8h CO-only shift for a +3 jump (e.g. 15→18); a +2 jump (16→18) is a
+            # normal ~120-min diff-CO that the Phase-B path builds same-shift → no forced block needed.
+            if (_s18 is not None and machine_locked_inches.get(_m18) == {"18"}
+                    and _cur18n.isdigit() and abs(int(_cur18n) - 18) == 3
+                    and not _s18["campaigns"] and _s18["remaining"] >= INCH_PLUS3_CO_MINS):
+                _b18 = _buf_of(_m18)
+                _c18 = [x for x in machine_skus.get(_m18, set())
+                        if sku_inch.get(x, "") == "18" and demand_remaining.get(x, 0.0) > 0]
+                if _c18:
+                    _best18 = max(_c18, key=lambda x: (_defc(x, _b18), x))
+                    _s18["campaigns"].append((_best18, 0, "plus3_CO"))   # 8h CO-only (480 min)
+                    _s18["remaining"] -= INCH_PLUS3_CO_MINS
+                    _s18["co_count"] += 1
+                    _s18["cur_sku"] = _best18
+
         if _INCH_PLUS3_ENABLED:
             for m in sorted(machines):
                 if m in machine_plus3_used:
@@ -6337,6 +6435,7 @@ def run_rolling_pipeline(
     _coplan_lock: dict = {}
     _building_inch_capacity: dict | None = None
     _feed_ctx: dict | None = None                   # PERSKU_FEED: lock-aware SKU->machines + GT/day
+    _coplan_inch_dem: dict = {}                      # INCH18_DEFER: per-inch total demand
     if _GROUP_INCH_POLICY and _early_sku_inch:
         try:
             from bc_config import make_engine as _mk_cp
@@ -6345,10 +6444,28 @@ def run_rolling_pipeline(
             _building_inch_capacity = _cp["building_inch_capacity"]
             _buildable_rate = _cp["buildable"]      # override with the LOCK-AWARE rate
             _feed_ctx = _cp.get("feed_ctx")
+            _coplan_inch_dem = _cp.get("inch_dem", {})
             print(f"  [Rolling] CO-PLAN: {len(_coplan_lock)} BJ/US locks; building_inch_capacity "
                   f"{ {k: round(v) for k, v in sorted(_building_inch_capacity.items())} }")
         except Exception as _e:
             print(f"  [Rolling] co-plan supply failed ({_e})")
+    # INCH18_DEFER: compute the 7003 15→18 switch day ONCE (option b — 7003 covers only the 15"
+    # SHORTFALL the OTHER 15" machines can't; then switches to 18"). Shared with curing so both agree.
+    switch_day18 = None
+    switch_day_7002 = None
+    if _INCH18_DEFER:
+        # 7003: 16" until switch_day18-1, then → 18" (one-way). Fixed day (user rule: 18" from day 21).
+        switch_day18 = min(planning_days, int(os.environ.get("INCH18_SWITCH_DAY", "21")))
+        # 7002: 14" until its 14" SHARE (the 14" demand 6001+7004 can't cover) is done, then → 16"
+        # (one-way, no revert). Demand-driven so it adapts (July: 14" ≈ covered by 6001+7004 → early 16").
+        _d14 = float(_coplan_inch_dem.get("14", 0.0))
+        _c14_other = (_bld_qty_per_shift("6001") + _bld_qty_per_shift("7004")) * 3.0
+        _r14_7002 = max(1.0, _bld_qty_per_shift("7002") * 3.0)
+        _short14 = max(0.0, _d14 - _c14_other * planning_days)
+        switch_day_7002 = min(planning_days, max(1, math.ceil(_short14 / _r14_7002) + 1))
+        print(f"  [INCH18_DEFER] 7003: 16\" → 18\" from day {switch_day18}; "
+              f"7002: 14\" until day {switch_day_7002 - 1} → 16\" one-way (14 shortfall={_short14:.0f})")
+
     cc_result = run_dynamic_consumption(
         demand_path=demand_path, output_path=CC_OUTPUT,
         plan_start=plan_start, planning_days=planning_days,
@@ -6359,6 +6476,7 @@ def run_rolling_pipeline(
         feed_ctx=_feed_ctx,
         priority_deadline_map=(priority_deadline_map if _prio_active else None),
         reactive_only=_REACTIVE_ONLY,   # Part B: skip planned schedule + CC workbook
+        switch_day18=(switch_day18 if _INCH18_DEFER else None),   # INCH18_DEFER: 18" acquisition gate
         # STAGE 3 (mid-month): seed the CO planner from the carried day-K press positions (same as
         # the day-loop injection) so plan and execution agree. None on a normal run → Day-0 snapshot.
         initial_press_state=({
@@ -6895,6 +7013,13 @@ def run_rolling_pipeline(
     _dq[qty_col] = pd.to_numeric(_dq[qty_col], errors="coerce")
     _dq = _dq.dropna(subset=[qty_col])
     demand_dict: dict[str, float] = _dq.groupby(sku_col)[qty_col].sum().to_dict()
+    if os.environ.get("DEMAND_INT_NORMALIZE", "1") != "0":
+        # Demand is physically integer. Strip float dust baked into some xlsx cells
+        # (e.g. 13750.000000000002) so demand_remaining drains to EXACTLY 0 and the
+        # `_demand_done` (<= 0) reactive-CO test fires identically to the DB-int path.
+        # LOCAL↔CLOUD parity: cloud reads jkt_demand.requirement (int) → round() is a no-op,
+        # so cloud output is byte-unchanged; local converges to cloud. DEMAND_INT_NORMALIZE=0 reverts.
+        demand_dict = {k: float(round(v)) for k, v in demand_dict.items()}
     _n_rows_raw = len(_dq)
     demand_remaining: dict[str, float] = dict(demand_dict)
     total_demand = sum(demand_dict.values())
@@ -8103,6 +8228,13 @@ def run_rolling_pipeline(
     _captured_state: dict | None = None            # mid-month: full state at snapshot_at_day start
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
+        # INCH18_DEFER: flip the locks one-way (the +2 CO fires via the normal Phase-B path).
+        #   7003: 16" before switch_day18, 18" from switch_day18.  7002: 14" before switch_day_7002,
+        #   16" from it. _inch_gate rejects any inch not in the set → never reverts.
+        if _INCH18_DEFER and switch_day18 is not None:
+            machine_locked_inches[_INCH18_MACHINE] = {"18"} if day >= switch_day18 else {"16"}
+            if switch_day_7002 is not None:
+                machine_locked_inches["7002"] = {"16"} if day >= switch_day_7002 else {"14"}
         _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
