@@ -1190,3 +1190,53 @@ The 2pass wrapper writes `<building_output>_midmonth_opening.json` (day-start **
 the **start-date inventory**, not the 1st-of-month DB snapshot. **Finding:** R5 / R9C / R9G mostly
 reflect the plan's **real GT / carcass write-off** (they fail in the FULL-month run too), not a
 mid-month opening artifact — the flag rules out the artifact, it does not paper over genuine waste.
+
+## 22. Local↔cloud parity, snapshot selection & September findings (ADOPTED 2026-08-25)
+
+`local_main.py` and cloud `main.run_plan` are **byte-identical** on every KPI (cured / built / coverage /
+curing-COs / starvation / write-off) for all months, full-month and with a holiday — after two parity fixes.
+Verify by staging a month's local demand Excel into a temp `jkt_demand` + `jkt_plan_params` row and running
+`main.run_plan` with `connection.write_db` monkeypatched to a no-op (the full cloud path minus the DB write),
+diffed against local `run_rolling_pipeline_2pass`.
+
+### 22.1 Carcass-cap parity fix
+`main.CLOUD_CONFIG["MAX_ENDOFDAY_CARCASS_INVENTORY"]` had drifted to **1200** while `bc_config` = **500**
+(the overnight carcass-buffer cap). The mismatch changed the plan (June +2,660 cured on cloud). **Fixed →
+500** (must equal `bc_config`). It was the SOLE KPI-affecting `CLOUD_CONFIG`-vs-`bc_config` diff; the two
+remaining diffs — `DELIVERY_PRIORITY_ENABLED` / `_UNDATED_TO_MONTHEND` (True on cloud, False local default)
+— are INERT when `impPriorityFlag=0` and are the intended client-feature master-gate (leave True on cloud).
+
+### 22.2 `DEMAND_INT_NORMALIZE` — xlsx float-dust fix (default ON, env `DEMAND_INT_NORMALIZE`)
+Some demand xlsx cells carry a 1-ULP float artifact (e.g. `13750.000000000002`). LOCAL reads the float, so
+`demand_remaining` never drains to EXACTLY 0 and the reactive-CO `_demand_done (<= 0)` test never fires,
+whereas CLOUD reads `jkt_demand.requirement` (an **int**) and drains to exact 0 → a reactive CO fires on
+cloud but not local (a 586-cured tail divergence on a September+holiday knife-edge). Fix: `round()` demand to
+integer at load — `b2c_pipeline.py` (~L7015, feeds `demand_remaining`) and `connection.py load_demand`
+(~L311, curing-side `Updated_Demand`). Tyre demand is physically integer; **cloud is already int → no-op →
+byte-unchanged; local converges.** `=0` reverts bit-for-bit.
+
+### 22.3 Snapshot selection — start-of-month + fallback (both paths)
+`connection._resolve_snapshot(engine)` (called inside every snapshot ETL loader, and explicitly by
+`main.run_plan`) rebinds module-global `connection.PLAN_DATE`. **(a)** The Day-0 opening snapshot (running
+moulds + opening GT + opening carcass) is **always taken from the 1st of the plan's month** (`{PLAN_MONTH}-01`),
+whatever the plan-start day; plan dates stay as entered. **(b)** If that month's `Daily_Running_Moulds` has 0
+rows it **falls back to `SNAPSHOT_FALLBACK_MONTH` (default 2026-07)** instead of failing. **(c)** Cloud pins
+env `MIDMONTH_DEDUCT/ACTUAL_PROD/TODAY_START=0` — no SAP-actual deduction, no today-clamp; cloud runs purely
+from `planStartDate`/`planEndDate`.
+
+### 22.4 September behaviour findings (RCA — not bugs)
+- **Holiday cost ∝ (1 − coverage headroom).** A holiday is a fully-idle day (§8.4). Slack month (July ~95%):
+  net cost ≈ 0.58 day (~13k, recovered on other days). Saturated month (September ~84%, tightest month):
+  ≈ 1.45 days (~32k) — the idle day is unrecoverable + month-end drops deferred COs.
+- **GT built > cured is legitimate under curing saturation.** `cured = opening + built − closing − expired`
+  holds EXACTLY every month (residual ≈ 0). Saturated September ends with more uncured GT (higher closing +
+  expiry) → built leads cured; other months consume opening stock → cured leads built by 1–4k. *(Read closing
+  GT from the last IN-MONTH date; the "Daily GT & Carcass" sheet appends a trailing next-month spillover row
+  with `EndDay_GT_Inventory=0`.)*
+- **Running-moulds snapshot data quality > mould-life.** A snapshot missing roster presses (or carrying press
+  labels absent from `Master_Curing_Allowable_Machines_source` → silently dropped) loses disproportionately on
+  a holiday (fewer presses can't clear the GT backlog). Proven NOT mould-life (disabling `MOULD_LIFE_DB` closed
+  only ~14% of an 18k gap). **Fix is in the DB snapshot data, not code** — load the full allowable roster.
+- **Spare-capacity report.** VMI 14/16/17″ + idle machines can produce ~20k more of under-served demand SKUs;
+  `INCH18_DEFER=0` (relaxing the adopted VMI inch realloc) recovers **+13,523 cured** on September. Client PDF:
+  `data/output/September_Spare_Capacity_Report.pdf`.

@@ -90,6 +90,7 @@ from bc_config import (
     BUILDING_MACHINE_NAMES,
     BUILDING_CO_SAME_SIZE,
     BUILDING_CO_DIFF_SIZE,
+    BJ_SAME_SIZE_CO_EXCEPTIONS,
     SHIFT_MINS,
     SHIFT_STARTS,
     POOL_SIZE,
@@ -697,6 +698,20 @@ _HOLIDAY_BRIDGE    = (os.environ.get("HOLIDAY_BRIDGE_BUILD",       "0") != "0")
 # INERT without holidays (the (day+1) in _holiday_days guard is empty) → no-holiday bit-for-bit.
 _HOLIDAY_SHIFTC_CAP      = (os.environ.get("HOLIDAY_SHIFTC_CAP", "1") != "0")
 _HOLIDAY_SHIFTC_CAP_MINS = int(os.environ.get("HOLIDAY_SHIFTC_CAP_MINS", "60"))  # 23:00→00:00 pre-midnight window
+
+# ── Shift-level Minimum Production Quantity (MPQ) — per (machine/press × SKU × shift) ──
+# A production block below the floor is not emitted: batched into a later same-machine/press+SKU
+# shift where possible, else DROPPED (unmet, never over-produced). 0 = disabled for that stage.
+# Env BUILDING_MPQ / CURING_MPQ override bc_config. Additional to MIN_CAMPAIGN_* (independent).
+_BUILDING_MPQ = int(os.environ.get("BUILDING_MPQ", getattr(_bc_cfg, "BUILDING_MPQ", 20)))
+_CURING_MPQ   = int(os.environ.get("CURING_MPQ",   getattr(_bc_cfg, "CURING_MPQ",   0)))
+_CARCASS_MPQ  = int(os.environ.get("CARCASS_MPQ",  getattr(_bc_cfg, "CARCASS_MPQ",  0)))
+
+# ── Shift-contained building CO (client hard rule) — a building CO must START and FINISH
+# within one shift (07:00-15:00 / 15:00-23:00 / 23:00-07:00); it may never cross a boundary.
+# ON (default): a CO that would cross is deferred to the next shift's start. OFF reverts
+# bit-for-bit (COs may cross, split for display). Env CO_SHIFT_CONTAINED=0 disables.
+_CO_SHIFT_CONTAINED = os.environ.get("CO_SHIFT_CONTAINED", "1") != "0"
 
 # ── Building machine CT (seconds/unit) ────────────────────────────────────────
 _BLD_CT_SEC: dict[str, float] = {
@@ -2218,6 +2233,11 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
         m = S1[mi]; dstr, sh = shifts[tau]
         cursor = _shift_start_dt(dstr, sh)
         for sku, q in sorted(items):
+            # MPQ (shift-level floor) for Stage-1 carcass: don't emit a sub-floor carcass block.
+            # This is a post-plan display render (carcass ≠ GT, not in gt_inventory), so a skip
+            # does NOT change cured output — it only removes tiny carcass rows from the schedule.
+            if _CARCASS_MPQ > 0 and 0 < int(round(q)) < _CARCASS_MPQ:
+                continue
             ct = _bld_ct_sec(m, sku)   # per-SKU CT (Stage-1 CT is constant per machine)
             _st = cursor
             cursor = cursor + timedelta(minutes=round(q) * ct / 60.0)
@@ -2446,17 +2466,44 @@ def _stage1_carcass_rows_co(prod_log: list, s2_gt_per_sku: dict, sku_inch: dict,
         for (day, so, date, shift, _m, s, q) in bym[m]:
             d = byds[(day, so, date, shift)]
             d[s] = d.get(s, 0.0) + q
-        for (day, so, date, shift) in sorted(byds):
+        _shift_keys = sorted(byds)
+        _defer: dict = {}     # {sku: qty} carried to the next shift when a CO would cross a boundary
+        for _ski, (day, so, date, shift) in enumerate(_shift_keys):
             cursor = _shift_start_dt(date, shift)
+            _shift_end = cursor + timedelta(minutes=SHIFT_MINS)
+            _has_next = _ski < len(_shift_keys) - 1
+            # SKUs carried from a previous shift's deferred CO are produced FIRST in this shift.
+            _bucket = dict(byds[(day, so, date, shift)])
+            for _ds, _dq in _defer.items():
+                _bucket[_ds] = _bucket.get(_ds, 0.0) + _dq
+            _defer = {}
             # continuing SKU (no CO) first, then by sku for determinism
-            order = sorted(byds[(day, so, date, shift)].items(),
+            order = sorted(_bucket.items(),
                            key=lambda t: (0 if t[0] == cur else 1, t[0]))
-            for s, q in order:
+            for _oi, (s, q) in enumerate(order):
                 q = int(round(q))
                 if q <= 0:
                     continue
+                # MPQ (shift-level floor) for Stage-1 carcass: skip a sub-floor carcass block
+                # (do NOT CO or emit it). Carcass is a post-plan display render (≠ GT, not in
+                # gt_inventory), so this does NOT change cured output — it only removes tiny
+                # carcass rows from the schedule. Set CARCASS_MPQ=0 to disable.
+                if _CARCASS_MPQ > 0 and q < _CARCASS_MPQ:
+                    continue
                 if cur not in ("", s):
                     comin = int(_co_cost(m, _si.get(cur, ""), _si.get(s, "")))
+                    # SHIFT-CONTAINMENT (client hard rule): a building CO must START and FINISH
+                    # within one shift. If this carcass CO would cross the shift boundary, DEFER it
+                    # (and every not-yet-produced SKU this shift, incl. this one) to the NEXT shift's
+                    # start — the rest of this shift is left idle and the CO runs cleanly at the
+                    # next boundary. Total carcass/SKU is preserved (re-timed within the ≤2-shift
+                    # pre-build lead, so it still precedes its Stage-2 draw). A deferred CO always
+                    # fits (it starts at the boundary; comin ≤ 180 < 480). On the LAST shift there
+                    # is no next shift to cross into, so the CO is kept.
+                    if _CO_SHIFT_CONTAINED and _has_next and cursor + timedelta(minutes=comin) > _shift_end:
+                        for _rs, _rq in order[_oi:]:
+                            _defer[_rs] = _defer.get(_rs, 0.0) + int(round(_rq))
+                        break
                     _cot = ("same_size_CO" if _si.get(cur, "") == _si.get(s, "")
                             else "diff_size_CO")
                     _co_start = cursor
@@ -2646,9 +2693,16 @@ def _cure_qty_per_shift(ct_min: float) -> int:
     return int(SHIFT_MINS / ct_min) * CURING_CAVITIES
 
 
-def _co_cost(machine: str, from_inch: str, to_inch: str) -> int:
+def _co_cost(machine: str, from_inch: str, to_inch: str,
+             from_sku: str = "", to_sku: str = "") -> int:
     mg = _MACHINE_GROUP.get(str(machine), "VMI")
     if from_inch == to_inch:
+        # BJ-only same-size CO exception for specific SKU pairs (direction-agnostic).
+        # Applies ONLY to BJ + same-inch + a listed pair; everything else unchanged.
+        if mg == "BJ" and from_sku and to_sku:
+            _ex = BJ_SAME_SIZE_CO_EXCEPTIONS.get(frozenset({str(from_sku), str(to_sku)}))
+            if _ex is not None:
+                return int(_ex)
         return BUILDING_CO_SAME_SIZE.get(mg, 60)
     # #2 optimizer-choice: a DIRECT +3/-3 (>2-inch jump) on a non-BJ/non-Stage-2 machine costs the
     # full 8h CO (INCH_PLUS3_CO_MINS) — so the scorer naturally prefers a cheaper TWO-HOP (two ≤2
@@ -3800,7 +3854,7 @@ def _assign_building_shift(
                             and to_inch != dom and not s["primary_done"]
                             and not _INCH_RULES_ENABLED):
                         continue
-                    cost = 0.0 if (_GLOBAL_SCORE_V2 and sku == cur) else _co_cost(m, cur_inch, to_inch)
+                    cost = 0.0 if (_GLOBAL_SCORE_V2 and sku == cur) else _co_cost(m, cur_inch, to_inch, from_sku=cur, to_sku=sku)
                     if s["remaining"] - cost < MIN_CAMPAIGN_MINS:
                         continue
                     is_urgent = (sku in co_target_skus and projected_gt.get(sku, 0.0) == 0
@@ -4619,7 +4673,7 @@ def _assign_building_shift(
                 if (machine in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
                         and to_inch != dom_inch and not primary_demand_done):
                     continue
-                cost = _co_cost(machine, cur_inch, to_inch)
+                cost = _co_cost(machine, cur_inch, to_inch, from_sku=cur_sku, to_sku=sku)
                 if remaining - cost < MIN_CAMPAIGN_MINS:
                     continue
                 # 30% cost guard normally blocks expensive COs. Bypass for urgent
@@ -4767,7 +4821,7 @@ def _bc_working_days_left(day, planning_days) -> int:
     return sum(1 for _d in range(day, planning_days + 1) if _d not in hol)
 
 
-def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False):
+def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0):
     """Split each row's [StartTime,EndTime] run at the plant shift boundaries
     (07:00 / 15:00 / 23:00) into one row per shift, and remove cross-shift OVERLAP by
     sequencing each machine/press's rows on a continuous wall-clock cursor.
@@ -4852,6 +4906,7 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False):
             _qa = _coa = _cla = 0.0
             _cum = 0.0
             _cyc_prev = 0
+            _pieces = []
             for _i, (ss, ee) in enumerate(segs):
                 last = (_i == len(segs) - 1)
                 seg_min = (ee - ss).total_seconds() / 60.0
@@ -4878,7 +4933,31 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False):
                 if "Mould_Clean_Mins" in r:
                     nr["Mould_Clean_Mins"] = round(clean - _cla, 1) if last else round(clean * frac, 1)
                     _cla += nr["Mould_Clean_Mins"]
-                out.append(nr)
+                _pieces.append(nr)
+            # MPQ (shift-level floor): a run split across a shift boundary can leave a sub-floor
+            # wall-clock fragment. Fold each <mpq fragment into the adjacent piece of the SAME run
+            # (total-preserving) so no sub-floor production block is EMITTED. (A whole run < mpq is
+            # already prevented by the campaign-level MPQ guard; only split fragments reach here.)
+            if mpq > 0 and qfloor > 0 and len(_pieces) > 1:
+                _guard = 0
+                while len(_pieces) > 1 and _guard < 64:
+                    _guard += 1
+                    _sm = min(range(len(_pieces)), key=lambda k: int(_pieces[k].get("Qty", 0) or 0))
+                    if int(_pieces[_sm].get("Qty", 0) or 0) >= mpq:
+                        break
+                    if _sm > 0 and _sm < len(_pieces) - 1:
+                        _nb = _sm - 1 if int(_pieces[_sm-1]["Qty"]) >= int(_pieces[_sm+1]["Qty"]) else _sm + 1
+                    else:
+                        _nb = _sm - 1 if _sm > 0 else _sm + 1
+                    _pieces[_nb]["Qty"] = int(_pieces[_nb]["Qty"]) + int(_pieces[_sm].get("Qty", 0) or 0)
+                    _pieces[_nb]["StartTime"] = min(_pieces[_nb]["StartTime"], _pieces[_sm]["StartTime"])
+                    _pieces[_nb]["EndTime"]   = max(_pieces[_nb]["EndTime"], _pieces[_sm]["EndTime"])
+                    for _mk in ("CO_Mins", "Mould_Clean_Mins"):
+                        if _mk in _pieces[_sm]:
+                            _pieces[_nb][_mk] = round(float(_pieces[_nb].get(_mk, 0) or 0)
+                                                      + float(_pieces[_sm].get(_mk, 0) or 0), 1)
+                    _pieces.pop(_sm)
+            out.extend(_pieces)
             cursor = e
     return sorted(out, key=lambda r: (str(r.get("StartTime", "")), str(r.get(mkey, ""))))
 
@@ -4939,7 +5018,7 @@ def _write_rolling_building_excel(
     # Machine Utilization) read the same shift-accurate rows. The split preserves per-
     # (machine,SKU) Qty/CO totals exactly, so per-SKU / per-machine sums and the KPIs are
     # unchanged; only cross-midnight rows attribute their tail to the correct calendar day.
-    bld_shift_rows = _split_rows_at_shift_boundaries(bld_shift_rows, "Machine")
+    bld_shift_rows = _split_rows_at_shift_boundaries(bld_shift_rows, "Machine", mpq=_BUILDING_MPQ)
 
     _SENTINEL = {"CHANGEOVER", "MOULD_CLEAN", "C/O", "CO"}
 
@@ -4956,25 +5035,23 @@ def _write_rolling_building_excel(
     bld_cols = ["Machine", "Date", "Shift", "SKUCode", "Qty", "CO_Mins",
                 "StartTime", "EndTime", "Machine_Group", "CO_Type"]
     _xl_header(ws, 3, bld_cols)
-    # DISPLAY ONLY: interleave the expired GT/carcass waste rows chronologically. These
-    # are NOT in bld_shift_rows / prod_rows, so every aggregate sheet (Daily GT & Carcass
-    # production totals, Demand Fulfillment, Machine Utilization) and all KPIs are untouched.
+    # Expired GT/carcass waste rows are NO LONGER interleaved here — they live in the
+    # dedicated "expired" sheet (added below). The Shift Schedule now shows production +
+    # building CO rows only. (Daily GT & Carcass Expired_GT/Expired_Carcass columns are a
+    # separate aggregation over expiry_rows and are unaffected.)
     _EXP_TYPES = {"expired_GT", "expired_carcass"}
     _display_rows = sorted(
-        list(bld_shift_rows) + list(expiry_rows or []),
+        list(bld_shift_rows),
         key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
     )
-    for ri, row in enumerate(_display_rows, 4):     # already split (single source above)
+    for ri, row in enumerate(_display_rows, 4):     # production + CO rows only
         is_co  = str(row.get("SKUCode", "")).upper() in _SENTINEL
-        is_exp = row.get("CO_Type", "") in _EXP_TYPES
         for ci, col in enumerate(bld_cols, 1):
             cell = ws.cell(row=ri, column=ci, value=row.get(col, ""))
             cell.alignment = _ctr()
             if is_co:
                 cell.fill = _fill(_CO)
                 cell.font = Font(bold=True)
-            elif is_exp:
-                cell.fill = _fill(_RED)   # waste marker (aged-out GT / carcass)
     for col in ws.columns:
         w = max((len(str(c.value or "")) for c in col), default=8)
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 38)
@@ -5260,13 +5337,14 @@ def _write_rolling_building_excel(
     # are always included regardless of whether they appear in production or CO dicts.
     # (6801/bj1stage1 removed — plant retired it → 14 Stage-1.)
     _ALL_BUILDING_MACHINES = frozenset({
-        "6801","6802","6803","6909","6911","7601","7701",
+        # "6801", "ps3", "ps4"
+        "6802","6803","6909","6911","7601","7701",
         "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (15, incl 6801)
         "8201","8301","8302","8501","8502","7301",                # Stage-2 (6)
         "7001","7002","7003","7004","6001","6002","6003","6004",  # VMI (8)
         "7101","7102","7103","7104","7105","7106","7201",         # BJ (7)
         "7501","7502","7503",                                     # UNI_NARROW (3)
-        "ps3","ps4",                                              # NEW 2026-08 GT machines (2)
+                                                      # NEW 2026-08 GT machines (2)
     })
     all_machines = sorted(
         _ALL_BUILDING_MACHINES,
@@ -5352,6 +5430,34 @@ def _write_rolling_building_excel(
         ws_util.column_dimensions[get_column_letter(ltr_idx)].width = w
     ws_util.freeze_panes = "A3"
 
+    # ── Sheet: expired ─────────────────────────────────────────────────────────
+    # All aged-out GT / carcass, moved OUT of the Shift Schedule into their own sheet.
+    # expired_GT is SKU-level FIFO lot aging and expired_carcass is per-SKU bank aging —
+    # neither is tied to a physical machine, so Machine / Machine Name render "—".
+    ws_exp = wb.create_sheet("expired")
+    # NOTE: "SKUCode Description" (after SKUCode) and "Machine Name" (after Machine) are added
+    # automatically by _inject_label_columns post-write, so they are NOT listed here.
+    exp_cols = ["Date", "Shift", "SKUCode", "Type", "Qty", "Machine"]
+    _xl_header(ws_exp, 1, exp_cols)
+    _type_lbl = {"expired_GT": "Expired GT", "expired_carcass": "Expired Carcass"}
+    _exp_sorted = sorted(list(expiry_rows or []),
+                         key=lambda r: (str(r.get("Date", "")), str(r.get("Shift", "")),
+                                        str(r.get("CO_Type", "")), str(r.get("SKUCode", ""))))
+    for ri, row in enumerate(_exp_sorted, 2):
+        _mach = row.get("Machine", "—") or "—"
+        vals = {"Date": row.get("Date", ""), "Shift": row.get("Shift", ""),
+                "SKUCode": row.get("SKUCode", ""),
+                "Type": _type_lbl.get(row.get("CO_Type", ""), row.get("CO_Type", "")),
+                "Qty": row.get("Qty", 0), "Machine": _mach}
+        for ci, col in enumerate(exp_cols, 1):
+            cell = ws_exp.cell(row=ri, column=ci, value=vals.get(col, ""))
+            cell.alignment = _ctr()
+            cell.fill = _fill(_RED)   # waste marker
+    for col in ws_exp.columns:
+        w = max((len(str(c.value or "")) for c in col), default=8)
+        ws_exp.column_dimensions[get_column_letter(col[0].column)].width = min(w + 2, 38)
+    ws_exp.freeze_panes = "A2"
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
     print(f"  [Rolling] Building output → {output_path}")
@@ -5413,7 +5519,7 @@ def _write_rolling_curing_excel(
     # overlap) ONCE, so the Shift Schedule + MouldInUse sheets read shift-accurate rows.
     # even_qty=True → every shift's cured Qty is EVEN (2 cavities = 2 tyres/cycle; a boundary
     # cycle is credited to its completion shift). Preserves per-(press,SKU) totals.
-    cure_shift_rows = _split_rows_at_shift_boundaries(cure_shift_rows, "Machine", even_qty=True)
+    cure_shift_rows = _split_rows_at_shift_boundaries(cure_shift_rows, "Machine", even_qty=True, mpq=_CURING_MPQ)
 
     # ── Build priority + category lookup from df_day0 ─────────────────────────
     pri_map: dict[str, float] = {}
@@ -9170,10 +9276,36 @@ def run_rolling_pipeline(
                 prev_inch = sku_inch.get(prev_sku, "")
                 _cursor   = _shift_start
                 for _tier_idx, (sku, qty, co_type) in enumerate(campaigns):
+                    # MPQ (shift-level floor): skip a sub-floor building block — do NOT CO or
+                    # build it. The un-built quantity persists as unmet deficit (GT not credited)
+                    # and is naturally rebuilt >= floor in a later shift; a residual sub-MPQ tail
+                    # stays unbuilt (unmet). Skipping only reduces build → never over-produces.
+                    if _BUILDING_MPQ > 0 and 0 < qty < _BUILDING_MPQ:
+                        continue
                     _ct_sec = _bld_ct_sec(machine, sku)   # per-SKU CT for the timeline
-                    if co_type != "start":
+                    if co_type != "start" and prev_sku:
                         co_mins = (INCH_PLUS3_CO_MINS if co_type == "plus3_CO"
-                                   else _co_cost(machine, prev_inch, sku_inch.get(sku, "")))
+                                   else _co_cost(machine, prev_inch, sku_inch.get(sku, ""),
+                                                 from_sku=prev_sku, to_sku=sku))
+                        # SHIFT-CONTAINMENT (client hard rule): a building CO must START and FINISH
+                        # inside one shift. The per-shift assignment budget already guarantees this
+                        # for GT machines (0 crossings observed, all months), so this is a defensive
+                        # HARD invariant: if a CO would ever cross the shift boundary, defer the whole
+                        # campaign (CO + its production) to the next shift instead of emitting a
+                        # boundary-crossing CO. The un-built qty persists as deficit and rebuilds next
+                        # shift; the machine idles this shift's remainder (no CO produces output).
+                        if (_CO_SHIFT_CONTAINED
+                                and _cursor + timedelta(minutes=co_mins) > _shift_start + timedelta(minutes=SHIFT_MINS)):
+                            continue
+                        # Keep the DISPLAYED CO_Type in lock-step with the charged minutes by
+                        # deriving it from the SAME prev_inch that _co_cost uses (prevents label↔
+                        # minutes drift, e.g. a Day-1 seed labelling a real inch-change same_size).
+                        # A free machine (blank prev_sku) skips the CO entirely — its first mount of
+                        # the month is a setup ("start"), not a charged CO (honours BLD_START_FREE),
+                        # which is what produced the reported same_size/45-min VMI mismatch.
+                        _disp_co_type = ("plus3_CO" if co_mins == INCH_PLUS3_CO_MINS
+                                         else "same_size_CO" if prev_inch == sku_inch.get(sku, "")
+                                         else "diff_size_CO")
                         _co_start = _cursor
                         _cursor   = _cursor + timedelta(minutes=co_mins)
                         bld_shift_rows.append({
@@ -9190,7 +9322,7 @@ def run_rolling_pipeline(
                             "StartTime":     _fmt_dt(_co_start),
                             "EndTime":       _fmt_dt(_cursor),
                             "Machine_Group": _group_label(machine),
-                            "CO_Type":       co_type,
+                            "CO_Type":       _disp_co_type,
                         })
                         bld_co_events.append({
                             "Machine":      machine,
@@ -9200,9 +9332,9 @@ def run_rolling_pipeline(
                             "CO_Day_Index": day,
                             "From_SKU":     prev_sku,
                             "Target_SKU":   sku,
-                            "CO_Type":      co_type,
+                            "CO_Type":      _disp_co_type,
                             "CO_Cost_Mins": co_mins,
-                            "Status":       f"Rolling CO ({co_type})",
+                            "Status":       f"Rolling CO ({_disp_co_type})",
                         })
                     _prod_start = _cursor
                     _cursor     = _cursor + timedelta(minutes=qty * _ct_sec / 60.0)
@@ -9504,6 +9636,12 @@ def run_rolling_pipeline(
                         cured = min(cap_time, int(gt_avail), int(demand_left), cap_life)
                     else:
                         cured = min(cap, int(gt_avail), int(demand_left))
+                    # MPQ (shift-level floor): don't emit a sub-floor cured block. The GT is
+                    # LEFT in inventory (batches a later shift); a genuine sub-MPQ demand tail
+                    # is dropped via the _demand_done release threshold below (press moves on,
+                    # tail stays UNMET — no over-production, no coverage inflation).
+                    if _CURING_MPQ > 0 and 0 < cured < _CURING_MPQ:
+                        cured = 0
                     gt_inventory[sku]      = gt_avail - cured
                     if cured > 0:                                     # FIFO: draw oldest lots first
                         _gt_consume_lots(sku, cured)
@@ -9560,7 +9698,10 @@ def run_rolling_pipeline(
                     # time = CHANGEOVER).  Next shift = PRODUCTION for new SKU.
                     # Conditions: no pre-planned CO today, not already in a
                     # dynamic CO, and no pre-planned CO tomorrow (avoid conflict).
-                    _demand_done = demand_remaining.get(sku, 0.0) <= 0
+                    # MPQ: a press is "demand-done" (releases / CO's away) once its SKU's
+                    # remaining demand is at/below the curing floor — the sub-MPQ tail is left
+                    # unmet rather than wasting further press-shifts on <MPQ cures.
+                    _demand_done = demand_remaining.get(sku, 0.0) <= (_CURING_MPQ if _CURING_MPQ > 0 else 0)
                     # Early-CO (_EARLY_CO_ENABLED): a press may reassign BEFORE its
                     # SKU's demand is done, IFF that SKU's remaining demand is met by
                     # its OTHER (n-1) presses within the horizon — i.e. this press is

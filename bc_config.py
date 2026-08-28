@@ -35,11 +35,11 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_240826.xlsx")  # per-month demand workbook
+PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
+DEMAND_FILE   = os.path.join(INPUT_DIR, "july_correct_plan.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
-PLANT_HOLIDAYS = False                      # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+PLANT_HOLIDAYS = False                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
@@ -529,24 +529,33 @@ DIFF_CO_MIN_TARGET_UNITS = 300    # min sustained target-inch demand to justify 
 
 BUILDING_CO_SAME_SIZE = {
     # machine group  →  same_size_CO duration (min)
-    "VMI":      20,   # 6001–6004, 7001–7004  — cheapest CO (4.2% of shift)
+    "VMI":      25,   # 6001–6004, 7001–7004  — cheapest CO (4.2% of shift)
     "BJ":       45,   # 7101–7106, 7201
     "STAGE2":   59,   # 8201, 8301, 8302, 8501, 8502, 7301
-    "STAGE1":   60,   # 6802–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 (6801 retired)
+    "STAGE1":   90,   # 6802–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 (6801 retired)
     "MID":      60,   # same as Stage-1 (shared group in CO master)
-    "UNISTAGE": 110,  # 7501–7503
+    "UNISTAGE": 120,  # 7501–7503
     "PS":       30,   # ps3, ps4 (NEW 2026-08 GT machines) — plant same_size_CO = 30 min
 }
 
 BUILDING_CO_DIFF_SIZE = {
     # machine group  →  diff_size_CO duration (min)
     "STAGE2":   88,   # acceptable if no VMI alternative (88 min)
-    "BJ":       90,   # 7101–7106, 7201
-    "VMI":      40,   # 6001–6004, 7001–7004 — plant-confirmed (was wrongly 120); cheap inch change
+    "BJ":       180,   # 7101–7106, 7201
+    "VMI":      45,   # 6001–6004, 7001–7004 — plant-confirmed (was wrongly 120); cheap inch change
     "STAGE1":   180,  # 37.5% of one shift — avoid unless critical demand
     "MID":      180,
-    "UNISTAGE": 180,  # 7501–7503 — same as Stage-1
+    "UNISTAGE": 157,  # 7501–7503 — same as Stage-1
     "PS":       60,   # ps3, ps4 (NEW 2026-08 GT machines) — plant diff_size_CO = 60 min
+}
+
+# ── BJ-only same-size CO exceptions (specific SKU pairs) ─────────────────────
+# For BJ machines ONLY, a same-size (same-inch) changeover BETWEEN a listed SKU PAIR
+# costs the mapped minutes instead of BUILDING_CO_SAME_SIZE["BJ"]. Direction-agnostic
+# (the key is an unordered frozenset of the two SKU codes). Applies ONLY to BJ, ONLY
+# same-inch, ONLY these exact pairs — nothing else in the CO maps is affected.
+BJ_SAME_SIZE_CO_EXCEPTIONS = {
+    frozenset({"1225170015010LSTL0", "1225170015012LSTL0"}): 20,  # 7.00R15 STEELKING 10PR<->12PR
 }
 
 # ── ps3 / ps4 NEW machines — MASTER ON/OFF toggle ────────────────────────────────────
@@ -592,6 +601,19 @@ MIN_CAMPAIGN_MINS   = 60
 
 MIN_CAMPAIGN_UNITS  = 40
 # Secondary guard: minimum units per campaign (after MIN_CAMPAIGN_MINS passes).
+
+# ── Shift-level Minimum Production Quantity (MPQ) ─────────────────────────────
+# A per-(machine/press × SKU × SHIFT) production block below the floor is not emitted:
+# the small quantity is batched into a later same-machine/press+SKU shift where possible,
+# otherwise it is DROPPED (left unmet — NEVER over-produced). ADDITIONAL to and INDEPENDENT
+# of MIN_CAMPAIGN_MINS/UNITS (those still gate campaign formation). Tunable; set to 0 to
+# disable the floor for that stage (env BUILDING_MPQ / CURING_MPQ override).
+BUILDING_MPQ = 20   # building: no per-shift GT production block < 20 units (ON; net-neutral, batches)
+CURING_MPQ   = 0    # curing:  OFF — it was the only KPI-reducing floor (July −4.9k / Sept+hol −7.9k);
+                    #          set to 10 (or ~6) to re-enable the <10 cured-block floor
+CARCASS_MPQ  = 0    # Stage-1 carcass: OFF — the 20-floor was display-only (0 KPI change) but its
+                    #                   row-drop made shown carcass < the GT it feeds (looked like
+                    #                   "GT without carcass"); 0 shows carcass fully backing GT
 
 
 OVERBUILD_BUFFER_FRAC = 0.2

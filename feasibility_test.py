@@ -370,7 +370,7 @@ def load_sources():
         _try("open_gt", _open_gt)
 
         def _open_carc():
-            from curing_b2c import _load_opening_carcass
+            from connection import _load_opening_carcass   # lives in connection.py, not curing_b2c
             m = _load_opening_carcass(eng)
             return {str(k): float(v) for k, v in dict(m).items()}
         _try("open_carc", _open_carc)
