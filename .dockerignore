@@ -46,3 +46,8 @@ scratch_*.py
 !data/analysis_aug/machine_inch_dominant_aug.xlsx
 !data/analysis_aug/machine_inch_dominant_4months_Apr-Jul.xlsx
 !data/input/Cycle_time_Building.xlsx
+# 2026-09: latest_building_CT.xlsx is now BOTH the building CT AND the allowable matrix
+# (bc_config.BLD_CT_FILE + BUILDING_ALLOWABLE_FILE). The cloud engine reads it every run —
+# it MUST ship in the image or cloud silently diverges/breaks. (Cycle_time_Building.xlsx is
+# superseded but kept for the INCH_HIST_LOCK=0 fallback.)
+!data/input/latest_building_CT.xlsx

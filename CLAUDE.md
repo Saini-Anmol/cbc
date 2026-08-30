@@ -114,14 +114,21 @@ the lock the 10/12/14/16 sweep had re-confirmed 12 (July-only preferred 16 for +
 was raised to 17 alongside the press-HOLD lever (§10) — with churn removed, the freed CO budget is
 spent on genuine demand-done moves. Carcass lead kept at 2.
 
-### Adopted-approach KPIs (hist-lock + Lever A + hybrid CO items 1+2, `MAX_CO=12`, deterministic, feasibility-clean, cap 0-over, local==cloud byte-parity)
+### Adopted-approach KPIs (CURRENT — core+spare hybrid planner §19 + file allowable/CT + ps3/ps4 §20; deterministic, feasibility-clean R1B/R3B/R4/R8/R14=41/R17, cap 0-over)
 
 | Month | Demand file | Demand | Days | GT built | GT cured | Coverage | Curing COs | Starvation | Expired GT | Expired carcass |
 |-------|-------------|--------|------|----------|----------|----------|-----------|-----------|-----------|----------------|
-| June  | `correct_june_plan.xlsx`     | 704,194 | 30 | 645,568 | **650,381** | **92.36%** | 256 | 2,654 | 666   | 10,008 |
-| July  | `july_correct_plan.xlsx`     | 727,779 | 31 | 679,223 | **685,342** | **94.17%** | 306 | 2,926 | 1,279 | 9,914  |
-| Aug   | `august_demand_tomerji.xlsx` | 689,563 | 31 | 644,523 | **648,687** | **94.07%** | 284 | 3,234 | 1,420 | 10,264 |
-| **Total** | | 2,121,536 | | | **1,984,410** | — | — | — | — | — |
+| June  | `correct_june_plan.xlsx`      | 704,194 | 30 | 669,452 | **674,176** | **95.74%** | 276 | 2,942 | 1,654 | 638 |
+| July  | `july_correct_plan.xlsx`      | 727,779 | 31 | 700,336 | **707,175** | **97.17%** | 271 | 2,862 | 1,592 | 1,670 |
+| Aug   | `august_demand_tomerji.xlsx`  | 689,563 | 31 | 661,105 | **666,182** | **96.61%** | 276 | 2,997 | 1,301 | 2,185 |
+| Sept  | `BTP_SEPT26_DEMAND_240826.xlsx` | 789,194 | 30 | 707,417 | **710,188** | **89.99%** | 264 | 2,758 | 1,929 | 563 |
+| Sept+hol 17th | `BTP_SEPT26_DEMAND_240826.xlsx` | 789,194 | 30 | 691,456 | **693,284** | **87.85%** | 258 | 2,501 | — | — |
+| **Total (4-mo, no holiday)** | | 2,910,730 | | | **2,757,721** | — | — | — | — | — |
+
+> These SUPERSEDE the older 650,381 / 685,342 / 648,687 (hist-lock + memoryless greedy) numbers. Current
+> stack: **core+spare hybrid** (§19, STATEFUL_PLAN + SP_SPARE_OPP default ON) + **building allowable & CT
+> from `latest_building_CT.xlsx`** (§20, CT-present = allowable) + **ps3 (15")/ps4 (16") live GT machines
+> (ps2 13"/ps3 15"/ps4 16", 41 total)** + cold-start direct-production. As-of-date (DB-drift); ps caps 20k/40k/30k.
 
 > These SUPERSEDE the older 636,201 / 673,221 / 648,118 numbers (new hybrid-CO stack + new demand
 > files). They use the NEW inputs (`correct_june_plan.xlsx` / `july_correct_plan.xlsx` /
@@ -552,6 +559,67 @@ The Day-0 opening snapshot (running moulds + opening GT + opening carcass) is re
   recovers **+13,523 cured** (84.35%→86.06%, lower waste) — realizable only by relaxing the adopted VMI
   inch-allocation policy (the 18″/structural trade-off). A client PDF report of this lives at
   `data/output/September_Spare_Capacity_Report.pdf`.
+
+### 19. Monotonic press activation — CORE+SPARE hybrid planner (ADOPTED, `curing_consumption_dynamic.py`)
+
+**Problem (client):** adding eligible curing presses (e.g. `85201`-`85215` to the allowable matrix)
+must be MONOTONIC — KPI must never DROP. It did (July −6,702 WITH vs WITHOUT the 852xx presses).
+**Root cause (proven):** greedy press-set FRAGMENTATION — a SKU spreads across MORE presses (7→9)
+when more become eligible, each less productive → less cured. Confirmed: concentration (STATEFUL)
+flips the sign to monotonic. **Fix = CORE+SPARE hybrid, both toggles now DEFAULT ON:**
+- **`_STATEFUL_PLAN` (env STATEFUL_PLAN, default ON):** upfront per-SKU CORE press target (monotone
+  ramp, demand/mould-sized, **independent of how many presses are eligible**) → no fragmentation.
+- **`_SP_SPARE_OPP` (env SP_SPARE_OPP, default ON):** SPARE overlay — a press may exceed the core
+  count cap (NOT the `_peaked` no-boomerang latch) IFF building can feed the extra press
+  (`(n+1)·rate ≤ _perSKU_feed × _SP_SPARE_MARGIN`, margin default 1.0). Building-LIMITED inches stay
+  concentrated (monotone); building-SUFFICIENT SKUs absorb spare presses → recovers the opportunistic
+  ceiling the pure-core plan misses.
+- **`STATEFUL_PLAN=0` reverts to the memoryless greedy bit-for-bit.** The `CAMPAIGN_PLAN` active-SKU
+  -limiting scaffold is REJECTED (collapses coverage to 17-40%). Cloud inherits via the env default
+  (`main.py` has no override). Also DEFAULT ON this cycle: **cold-start presses START DIRECT PRODUCTION**
+  in Day-1 Shift A (a fresh press with new moulds is not a changeover — no phantom curing CO; +2,532/4mo).
+
+**Adopted KPIs (July DB day, WITH 852xx = real config; deterministic seed1==seed2; R17 mould PASS,
+R8 demand-cap PASS, R10 CO-cap PASS):**
+
+| Month | Memoryless (prior) | **Hybrid (adopted)** | Δ |
+|-------|--------------------|----------------------|---|
+| June  | 658,388 | 650,551 | **−7,837** |
+| July  | 679,499 | **686,218** | +6,719 |
+| Aug   | 646,810 | 649,929 | +3,119 |
+| Sept  | 676,024 | 677,714 | +1,690 |
+
+**July monotonicity PROVEN:** hybrid WITH-852 686,218 ≥ WITHOUT-852 684,977 (+1,241 — adding presses
+now HELPS). **KNOWN CAVEAT — June −7,837:** its slack profile needs a smarter spare-eligibility rule
+(the `SP_SPARE_MARGIN` knob interacts badly with the monotone `_peaked` latch); pending fix. Mid-month
+/ holiday / delivery-priority interactions with STATEFUL_PLAN not yet re-verified. As-of-date (DB-drift):
+always compare WITH vs WITHOUT-852 on the SAME day (`EXCLUDE_PRESS_PREFIX=852` reproduces WITHOUT).
+
+### 20. Building allowable + CT from `latest_building_CT.xlsx` + ps3/ps4 live (ADOPTED 2026-09)
+
+**Single-file source (replaces the DB `Master_Building_Allowable_Machines` + old `Cycle_time_Building.xlsx`):**
+`data/input/latest_building_CT.xlsx` (sheet `cycle time matrix`) is BOTH the per-(SKU,machine) building
+CT AND the allowable matrix — **a (SKU, machine) is building-allowable IFF its CT cell holds a number**
+(`BUILDING_ALLOWABLE_RULE = "ct_present"`). Config in `bc_config.py`: `BUILDING_ALLOWABLE_FROM_FILE=True`,
+`BUILDING_ALLOWABLE_FILE = BLD_CT_FILE`, `BLD_CT_FILE = latest_building_CT.xlsx`. `=False` → DB path.
+- **Machines = 41 (2026-09):** the 38 live old + **ps2 (dom 13") + ps3 (dom 15") + ps4 (dom 16")** —
+  new independent GT machines (group `PS`, ≠STAGE1 → GT-producing, no carcass dep; CT 48 fallback,
+  file CT used when present; **PS_MAX_BUILD ps2=20k / ps3=40k / ps4=30k** (ENFORCED cap; hit → machine
+  dropped for the day); CO `PS`=25/45; inch-lock ps2→["13"]/ps3→["15"]/ps4→["16"]).
+  `PS_MACHINES_ENABLED=True`; MAX curing CO this cycle = **16/day**.
+- **File-column mapping (headers are mixed int/str — match by `str(col)`):** allowable+CT both rename
+  `6402→ps2`, `6403→ps3`, `6404→ps4`; **drop `6801` (retired), `6401` (empty)**. Registered in
+  `_MACHINE_GROUP`/`_mgroup`/`_ALL_BUILDING_MACHINES` (b2c_pipeline), `connection._GROUP_MACHINES["PS"]`,
+  `building.Config.UNISTAGE`, `feasibility _MG_FALLBACK["PS"]` (R14 now **41**).
+- **KPIs (CURRENT — hybrid ON, file allowable+CT, ps2/ps3/ps4 live @ caps 20k/40k/30k, MAX_CO=16,
+  7501 12→13 one-way; feasibility-clean R1B/R3B/R4/R8/R14=41/R17 PASS):** June 674,176 (95.74%) /
+  July 707,175 (97.17%) / Aug 666,182 (96.61%) / Sept 710,188 (89.99%) [+hol-17 693,284 (87.85%)].
+  ps2 adds ~20k of under-served 13"; ps3 15" / ps4 16". These SUPERSEDE the earlier 662k/691k/650k/680k
+  (ps3/ps4-only @ 10k/7k) — every month lifted by the ps raises + the 13" ps2 machine.
+- **CAVEATS:** (a) 1–2 demand SKUs/month are NOT in the CT file (e.g. `1325221417096HURL3`) → 0 allowable
+  machines → unbuilt; add them to the file if needed. (b) **CLOUD/Docker:** the file-allowable path reads
+  `latest_building_CT.xlsx` from the filesystem — it MUST be in the image (`.dockerignore` re-include) or
+  cloud diverges. (c) determinism / cloud-parity for the file path not yet re-verified.
 
 ---
 
@@ -1128,25 +1196,28 @@ When answering "should we / what if / what's wrong" questions:
 
 ---
 
-## Current KPIs (ADOPTED approach 2026-08 — historical inch-lock + Lever A)
+## Current KPIs (ADOPTED approach 2026-09 — core+spare hybrid + file allowable/CT + ps3/ps4)
 
 The rolling pipeline is **deterministic** (verified, fixed + random `PYTHONHASHSEED`).
-Current committed stack: **historical inch-lock (INCH_HIST_LOCK, 27 fixed / 12 flexible, ±2 band
-OFF) + Lever A flexible-inch scarcity targeting (FLEX_SCARCE_INCH) + hybrid curing-CO items 1+2
-(PERSKU_FEED_V2 + HYBRID_CO_DEFER, +29,836 net) + mould gate + retarget + CO scorer + mould life v2
-+ mould clean + 4-SKU/day cap + IUkeep + dynamic buffer (β=2 @ 10k GT cap)**, `MAX_CO=12`, carcass
-lead 2. `FIXED_ESCAPE` (Lever B), `+3/−3 escape`, global mould optimiser, hybrid items 3/4, plant
-holidays (`PLANT_HOLIDAYS=False`) are OFF/inert. Inputs: per-month demand files, month-keyed
+Current committed stack: **core+spare hybrid press planner (§19, STATEFUL_PLAN + SP_SPARE_OPP default ON
+— monotonic press activation) + building allowable & CT from `latest_building_CT.xlsx` (§20, CT-present =
+allowable) + ps3 (15")/ps4 (16") live GT machines (40 total, build at cap 10k/7k) + cold-start
+direct-production + historical inch-lock + hybrid curing-CO items 1+2 (PERSKU_FEED_V2 + HYBRID_CO_DEFER)
++ mould gate + retarget + CO scorer + mould life v2 + mould clean + 4-SKU/day cap + IUkeep + dynamic
+buffer**. `FIXED_ESCAPE`, `+3/−3 escape`, global mould optimiser, `BLD_DRAW_CAP` / `MOULD_CONTENTION_GATE`
+(rejected), plant holidays (`PLANT_HOLIDAYS=False`) are OFF/inert. Inputs: per-month demand files, month-keyed
 `Daily_Running_Moulds` (`plan_month`), single `gt_inventory_manual`, building start-free.
 
-**LOCAL, `MAX_CO=12`, all feasibility-clean, demand-cap 0-over, deterministic, local==cloud byte-parity:**
+**LOCAL, all feasibility-clean (R1B/R3B/R4/R8/R14=40/R17), demand-cap 0-over, deterministic:**
 
 | Month | Demand file | Demand | Days | GT built | GT cured | Coverage | Curing COs | Starv | Expired GT | Expired carcass |
 |-------|-------------|--------|------|----------|----------|----------|-----------|-------|-----------|----------------|
-| June | `correct_june_plan.xlsx`     | 704,194 | 30 | 645,568 | **650,381** | **92.36%** | 256 | 2,654 | 666   | 10,008 |
-| July | `july_correct_plan.xlsx`     | 727,779 | 31 | 679,223 | **685,342** | **94.17%** | 306 | 2,926 | 1,279 | 9,914  |
-| Aug  | `august_demand_tomerji.xlsx` | 689,563 | 31 | 644,523 | **648,687** | **94.07%** | 284 | 3,234 | 1,420 | 10,264 |
-| **Total** | | 2,121,536 | | | **1,984,410** | — | — | — | — | — |
+| June | `correct_june_plan.xlsx`      | 704,194 | 30 | 669,452 | **674,176** | **95.74%** | 276 | 2,942 | 1,654 | 638 |
+| July | `july_correct_plan.xlsx`      | 727,779 | 31 | 700,336 | **707,175** | **97.17%** | 271 | 2,862 | 1,592 | 1,670 |
+| Aug  | `august_demand_tomerji.xlsx`  | 689,563 | 31 | 661,105 | **666,182** | **96.61%** | 276 | 2,997 | 1,301 | 2,185 |
+| Sept | `BTP_SEPT26_DEMAND_240826.xlsx` | 789,194 | 30 | 707,417 | **710,188** | **89.99%** | 264 | 2,758 | 1,929 | 563 |
+| Sept+hol 17th | `BTP_SEPT26_DEMAND_240826.xlsx` | 789,194 | 30 | 691,456 | **693,284** | **87.85%** | 258 | 2,501 | — | — |
+| **Total (4-mo, no holiday)** | | 2,910,730 | | | **2,757,721** | — | — | — | — | — |
 
 > These SUPERSEDE the older 636,201 / 673,221 / 648,118 numbers (new hybrid-CO stack + new demand
 > files `correct_june_plan.xlsx` / `july_correct_plan.xlsx` / `august_demand_tomerji.xlsx`).

@@ -3,6 +3,9 @@ data/
 # Secrets
 .env
 
+CLAUDE.md
+scratchpad/
+
 # Python
 __pycache__/
 *.pyc

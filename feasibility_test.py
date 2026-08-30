@@ -41,7 +41,7 @@ R2.  CHANGEOVER / CLEAN TIMES come from config, not invented:
 R3.  ALLOWABLE MATRICES strictly followed:
        - Every built (SKU,machine) is in Master_Building_Allowable_Machines
          (Stage-1 carcass rows exempt — carcass is upstream of the GT SKU).
-       - Every cured (SKU,press) is in Master_Curing_Allowable_Machines.
+       - Every cured (SKU,press) is in Master_Curing_Allowable_Machines_source.
        - Mould mapping (Master_Mapping_Mould_SKU) respected — see R17.
 
 R4.  HISTORICAL INCH-SIZE respected: each building GT row's SKU inch is inside the
@@ -223,6 +223,7 @@ for _g, _ms in {
     "STAGE2": ["8201", "8301", "8302", "8501", "8502", "7301"],
     "STAGE1": ["6802", "6803", "6909", "6911", "7601", "7701", "7801", "7802",
                "7803", "7804", "8001", "8002", "8003", "8101"],
+    "PS": ["ps2", "ps3", "ps4"],   # NEW independent GT machines (ps2=13", ps3=15", ps4=16")
 }.items():
     for _m in _ms:
         _MG_FALLBACK[_m] = _g
@@ -280,6 +281,11 @@ def load_sources():
               else pd.read_csv(path, dtype=str))
         if "SKU Code" not in df.columns:
             raise ValueError(f"'SKU Code' column missing in {path}")
+        # New-machine CT columns are renamed to internal ids (file uses 6403/6404 for ps3/ps4).
+        # Match by str(col) — some headers are int (6403), some str; a plain str-key rename misses them.
+        _ctmap = getattr(bc, "BLD_CT_COL_MAP", {})
+        if _ctmap:
+            df = df.rename(columns={_c: _ctmap[str(_c)] for _c in df.columns if str(_c) in _ctmap})
         mach_cols = [c for c in df.columns[2:]]
         out: dict = {}
         for _, r in df.iterrows():
@@ -445,7 +451,7 @@ def sku_inch(sku: str) -> str:
 
 S1_MACHINES = {m for m, g in _MG_FALLBACK.items() if g == "STAGE1"}
 S2_MACHINES = {m for m, g in _MG_FALLBACK.items() if g == "STAGE2"}
-GT_MACHINES = {m for m, g in _MG_FALLBACK.items() if g in ("VMI", "BJ", "UNISTAGE", "STAGE2")}
+GT_MACHINES = {m for m, g in _MG_FALLBACK.items() if g in ("VMI", "BJ", "UNISTAGE", "STAGE2", "PS")}
 ALL_38 = set(_MG_FALLBACK.keys())
 SHIFT_ORDER = {"A": 0, "B": 1, "C": 2}
 
@@ -588,7 +594,9 @@ def parse_building(path):
         # Expired GT / carcass are WASTE display markers (Machine "—", CO_Mins 0), NOT
         # production or changeovers — skip entirely so they never count toward build/CO/
         # shift-minute rules (R5/R8/R10/R11/R18).
-        if cotype in ("expired_GT", "expired_carcass"):
+        # PM / MTC are maintenance-downtime DISPLAY markers (SKUCode "—", any equipment id) —
+        # likewise skipped (they are neither production nor changeovers).
+        if cotype in ("expired_GT", "expired_carcass", "PM", "MTC"):
             continue
         qty = num(r.get("Qty"))
         co = num(r.get("CO_Mins"))
@@ -616,6 +624,10 @@ def parse_curing(path):
     for _, r in df.iterrows():
         p = str(r.get("Machine", "")).strip()
         if not p or p.lower() in ("nan", "none") or "total" in p.lower() or "average" in p.lower():
+            continue
+        # PM / MTC maintenance-downtime DISPLAY markers (Remarks "PM Schedule"/"MTC Schedule",
+        # SKUCode "—") — skip so they never count toward CO / shift-minute / press rules.
+        if str(r.get("Remarks", "")).strip() in ("PM Schedule", "MTC Schedule"):
             continue
         qty = num(r.get("Qty"))
         co = num(r.get("CO_Mins"))
@@ -665,10 +677,10 @@ def build_horizon(bld, cur):
 def r14_building_roster(bld):
     for r in bld:
         if r["machine"] not in ALL_38:
-            add("R14", "building machine not in the 38-machine roster",
+            add("R14", f"building machine not in the {len(ALL_38)}-machine roster",
                 r["date"], r["shift"], r["machine"], r["sku"], r["qty"],
-                expected="one of 38", actual=r["machine"])
-    rule_result("R14", "Only the 38 building machines are used", len(bld))
+                expected=f"one of {len(ALL_38)}", actual=r["machine"])
+    rule_result("R14", f"Only the {len(ALL_38)} building machines are used", len(bld))
 
 
 def r13_curing_roster(cur):

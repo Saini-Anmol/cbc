@@ -66,6 +66,7 @@ _GROUP_MACHINES = {
     "STAGE2":     {"8201", "8301", "8302", "8501", "8502", "7301"},
     "STAGE1":     {"6802", "6803", "6909", "6911", "7601", "7701",
                    "7801", "7802", "7803", "7804", "8001", "8002", "8003", "8101"},  # 6801 retired → 14
+    "PS":         {"ps2", "ps3", "ps4"},   # NEW independent GT machines (ps2=13", ps3=15", ps4=16")
 }
 
 _OUTPUT_TABLES = [
@@ -449,6 +450,12 @@ class ConsumptionETL:
         )
         df = df.rename(columns={"SKU Code": "SKUCode"})
         mcols = [c for c in df.columns if str(c).isdigit()]
+        # DIAGNOSTIC (env EXCLUDE_PRESS_PREFIX, default "" = no-op / bit-for-bit): drop press-ID
+        # columns whose name starts with the given comma-separated prefix(es), so a run can
+        # reproduce the roster from BEFORE a set of presses was added to the allowable matrix.
+        _xpfx = tuple(p for p in os.environ.get("EXCLUDE_PRESS_PREFIX", "").split(",") if p)
+        if _xpfx:
+            mcols = [c for c in mcols if not str(c).startswith(_xpfx)]
         df["Machines"] = df.apply(
             lambda r: [str(c) for c in mcols if str(r[c]).strip().lower() == "yes"], axis=1
         )
@@ -466,7 +473,9 @@ class ConsumptionETL:
         df = self._sql(
             f"SELECT * FROM {self.db}.Master_Curing_Allowable_Machines_source"
         )
-        return {str(c) for c in df.columns if str(c).isdigit()}
+        _xpfx = tuple(p for p in os.environ.get("EXCLUDE_PRESS_PREFIX", "").split(",") if p)
+        return {str(c) for c in df.columns
+                if str(c).isdigit() and not (_xpfx and str(c).startswith(_xpfx))}
 
     def load_building_allowable_skus(self) -> set:
         """SKUs that appear in building allowable master with at least one machine."""
@@ -626,22 +635,74 @@ class ETL:
         except Exception:
             return pd.DataFrame(columns=["SKUCode","Carcass_Inventory"])
 
+    def _load_machine_allowable_file(self):
+        """Build the SKU→[machine ids] allowable frame from the wide xlsx matrix
+        (bc_config.BUILDING_ALLOWABLE_FILE). Rule (BUILDING_ALLOWABLE_RULE):
+          'ct_present' → a machine is allowable for the SKU iff its cell holds a CT number
+                         (the CT file doubles as the allowable matrix); else 'yes' cell.
+        File machine-columns are renamed via BUILDING_ALLOWABLE_COL_MAP (6403→ps3, 6404→ps4) and
+        BUILDING_ALLOWABLE_COL_DROP columns (6801 retired, 6401 empty, 6402=ps2) are excluded.
+        Returns [SKUCode, Machines]."""
+        import bc_config as _bc
+        path  = _bc.BUILDING_ALLOWABLE_FILE
+        sheet = getattr(_bc, "BUILDING_ALLOWABLE_SHEET", 0)
+        rule  = getattr(_bc, "BUILDING_ALLOWABLE_RULE", "yes")
+        cmap  = dict(getattr(_bc, "BUILDING_ALLOWABLE_COL_MAP", {}))
+        drop  = {str(c) for c in getattr(_bc, "BUILDING_ALLOWABLE_COL_DROP", set())}
+        raw = pd.read_excel(path, sheet_name=sheet, dtype=str)
+        raw = raw.rename(columns={"SKU Code": "SKUCode"})
+        _skip = {"SKU Name", "SKUCode", "Inch", "size", "Size", "Demand", "Demand "}
+        def _mid(c):
+            c = str(c).strip()
+            if c in cmap:  return cmap[c]
+            return str(int(c)) if c.isdigit() else c
+        def _allowable(v):
+            if pd.isna(v) or str(v).strip() == "":
+                return False
+            if rule == "ct_present":
+                try:
+                    return float(str(v).strip()) > 0        # a CT number present ⇒ allowable
+                except (TypeError, ValueError):
+                    return False
+            return str(v).strip().lower() == "yes"
+        mcols = [c for c in raw.columns
+                 if str(c).strip() not in _skip and str(c).strip() not in drop]
+        rows = []
+        for _, r in raw.iterrows():
+            sku = str(r.get("SKUCode", "")).strip()
+            if not sku or sku.lower() == "nan":
+                continue
+            ms = [_mid(c) for c in mcols if _allowable(r[c])]
+            rows.append({"SKUCode": sku, "Machines": ms})
+        print(f"  [BLD_ALLOW] {len(rows)} SKUs from {os.path.basename(str(path))} "
+              f"(rule={rule}; dropped cols {sorted(drop)})")
+        return pd.DataFrame(rows, columns=["SKUCode", "Machines"])
+
     def load_machine_allowable(self):
-        df = self._sql(
-            f"SELECT * FROM {Config.DB_NAME}.Master_Building_Allowable_Machines"
-        )
-        def _parse(s):
-            if pd.isna(s) or not str(s).strip(): return []
-            # keep numeric IDs (normalised) AND alphanumeric machine codes like ps3/ps4
-            out = []
-            for p in str(s).split(','):
-                p = p.strip()
-                if not p:
-                    continue
-                out.append(str(int(p)) if p.isdigit() else p)
-            return out
-        df = df.rename(columns={"Machines": "_machines_raw"})
-        df["Machines"] = df["_machines_raw"].apply(_parse)
+        _from_file = False
+        try:
+            from bc_config import BUILDING_ALLOWABLE_FROM_FILE as _AF
+            _from_file = bool(_AF)
+        except Exception:
+            _from_file = False
+        if _from_file:
+            df = self._load_machine_allowable_file()
+        else:
+            df = self._sql(
+                f"SELECT * FROM {Config.DB_NAME}.Master_Building_Allowable_Machines"
+            )
+            def _parse(s):
+                if pd.isna(s) or not str(s).strip(): return []
+                # keep numeric IDs (normalised) AND alphanumeric machine codes like ps3/ps4
+                out = []
+                for p in str(s).split(','):
+                    p = p.strip()
+                    if not p:
+                        continue
+                    out.append(str(int(p)) if p.isdigit() else p)
+                return out
+            df = df.rename(columns={"Machines": "_machines_raw"})
+            df["Machines"] = df["_machines_raw"].apply(_parse)
         # ── ps3/ps4 MASTER ON/OFF (bc_config.PS_MACHINES_ENABLED, default OFF) ──────────────
         # OFF strips ps3/ps4 from every allowable list -> the plant's ORIGINAL line without the
         # new machines (measures max production without them). Env PS_MACHINES=1 forces ON.
@@ -652,7 +713,7 @@ class ETL:
         if os.environ.get("PS_MACHINES") is not None:
             _PS_ON = (os.environ.get("PS_MACHINES") != "0")
         if not _PS_ON:
-            df["Machines"] = df["Machines"].apply(lambda ms: [m for m in ms if m not in ("ps3", "ps4")])
+            df["Machines"] = df["Machines"].apply(lambda ms: [m for m in ms if m not in ("ps2", "ps3", "ps4")])
         # ps3/ps4 SKU-EXCLUSIVITY (env PS_EXCLUSIVE, default ON): any SKU allowable on a NEW
         # ps machine is built ONLY on the ps machine(s) — the plant dedicated ps3/ps4 to these
         # SKUs, which also frees the shared VMI pool for other inches. Removes all non-ps
@@ -662,7 +723,7 @@ class ETL:
         # BJ bottleneck). ps3/ps4 add the most value SHARED in the pool. Set PS_EXCLUSIVE=1 to
         # re-enable dedication (dynamic set via bc_config.PS_DEDICATION / _ps_dedicated_skus).
         if _os.environ.get("PS_EXCLUSIVE", "0") == "1":
-            _PS = {"ps3", "ps4"}
+            _PS = {"ps2", "ps3", "ps4"}
             _env = _os.environ.get("PS_EXCL_SKUS", "").strip()
             if _env:                                     # fixed override (A/B / pinning a set)
                 _sel = {s.strip() for s in _env.split(",") if s.strip()}
@@ -688,9 +749,12 @@ class ETL:
         return co_map
 
     def load_sku_sizes(self):
+        # Single source of truth for curing: read SKU sizes from the SAME table as the
+        # press-allowable matrix (Master_Curing_Allowable_Machines_source). Its SKU column
+        # is `SKU Code` (with a space).
         df = self._sql(
-            f"SELECT SKUCode, Size "
-            f"FROM {Config.DB_NAME}.Master_Curing_Allowable_Machines"
+            f"SELECT `SKU Code` AS SKUCode, Size "
+            f"FROM {Config.DB_NAME}.Master_Curing_Allowable_Machines_source"
         )
         return dict(zip(df["SKUCode"].astype(str), df["Size"].astype(str)))
 
@@ -1158,7 +1222,8 @@ def write_db(engine, plan_id: str, result: dict,
     # UNI_NARROW + Stage-2 = 24), NOT Stage-2 alone. Stage-1 (carcass) is
     # excluded. Column name kept for API/DB compatibility (per user decision).
     _gt_machines = (_GROUP_MACHINES["VMI"] | _GROUP_MACHINES["BJ"]
-                    | _GROUP_MACHINES["UNI_NARROW"] | _GROUP_MACHINES["STAGE2"])
+                    | _GROUP_MACHINES["UNI_NARROW"] | _GROUP_MACHINES["STAGE2"]
+                    | _GROUP_MACHINES["PS"])
     u_s2     = _occ(bu[_mach.isin(_gt_machines)], _bld_busy)   # all GT machines
     u_s1     = _group_occ("STAGE1")
     u_vmi    = _group_occ("VMI")

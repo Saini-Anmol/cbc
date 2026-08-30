@@ -35,14 +35,19 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 7, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 31                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "july_correct_plan.xlsx")  # per-month demand workbook
+PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
+DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_240826.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
-PLANT_HOLIDAYS = False                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
+# SINGLE building matrix file (FINAL format): building ALLOWABLE + building CT in ONE workbook.
+# A (SKU, machine) cell holding a NUMBER = allowable AND that number is its building CT; "No" = not
+# allowable. Sheet "Sheet1"; cols SKU Name / SKU Code / size / <machine cols…> (ps = 6402/6403/6404).
+BUILDING_MATRIX_FILE = os.path.join(INPUT_DIR, "Yuvraj_Matrix.xlsx")   # ← allowable + CT source (line 46)
+PM_MTC_ENABLED = os.environ.get("PM_MTC", "1") != "0"   # ← TOGGLE PM/MTC maintenance downtime ON(1)/OFF(0)  (line 50)
 # SNAPSHOT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
 # tables carry a `date` column. The opening snapshot is ALWAYS taken from the START-OF-MONTH row
 # (f"{PLAN_MONTH}-01"), regardless of the actual plan-start day: e.g. a plan starting 2026-08-21 still
@@ -213,11 +218,53 @@ RUNNER_OUT_DAY1_CO_ENABLED = False   # default ON
 #     fixed CT in b2c_pipeline._BLD_CT_SEC (never a blind default).
 # Toggle OFF (or env BLD_CT_FILE=0) reproduces the fixed-per-machine-CT plan
 # bit-for-bit. See b2c_pipeline._bld_ct_sec / _load_bld_ct_file.
+# ── TOGGLE: use remaining_building_matrix.xlsx for ALLOWABLE + old Cycle_time_Building.xlsx for CT ──
+# ON  → building allowable comes from data/input/remaining_building_matrix.xlsx (a Yes/No matrix,
+#       rule="yes") and building CT comes from the OLD data/input/Cycle_time_Building.xlsx.
+# OFF (default) → CURRENT behaviour: allowable + CT BOTH from latest_building_CT.xlsx (rule="ct_present").
+# Env USE_REMAINING_MATRIX=1 also forces ON. Flip this one line to switch the whole allowable+CT source.
+USE_REMAINING_BUILDING_MATRIX = os.environ.get("USE_REMAINING_MATRIX", "0") != "0"   # ← TOGGLE (OFF: use Yuvraj_Matrix single-file source above)
+
+# ── PM / MTC machine maintenance downtime (env PM_MTC, default OFF = bit-for-bit) ──
+# A machine (building OR curing press) is DOWN during its maintenance window (no production/CO);
+# the overlapped shift's available minutes are reduced MINUTE-PRECISELY. Both sheets (PM + MTC)
+# carry both stages — stage is detected by machine-id. File: [Machine ID, Downtime Reason,
+# Scheduled Start Time, Scheduled End Time], times "DD/MM/YYYY:HH:MM AM/PM".
+# PM_MTC_ENABLED is defined at line 50 (top RUN PARAMETERS block) — do not redefine here.
+PM_MTC_FILE = os.path.join(INPUT_DIR, "PM and MTC sep.xlsx")
+
 BLD_CT_FILE_ENABLED = True
 # CORRECT building-CT source (per-(SKU,machine) sec/unit). Loader reads .xlsx or .csv by
 # extension (b2c_pipeline._load_bld_ct_file). The old *_Cycle_time_Building.csv variants are
 # retired — this xlsx is the single authoritative CT file.
-BLD_CT_FILE = os.path.join(INPUT_DIR, "Cycle_time_Building.xlsx")
+BLD_CT_FILE = BUILDING_MATRIX_FILE   # FINAL single source = Yuvraj_Matrix.xlsx (allowable + CT in one)
+
+# ── Building ALLOWABLE matrix = the CT file itself (2026-09), NOT the DB ────────────
+# SINGLE source: `latest_building_CT.xlsx` is BOTH the per-(SKU,machine) CT AND the allowable
+# matrix — a (SKU, machine) is building-allowable IFF its CT cell is non-empty (a CT is present).
+# connection.load_machine_allowable() reads it with BUILDING_ALLOWABLE_RULE="ct_present". Machines
+# = all old (38 live) + ps3/ps4; 6403/6404 rename to ps3/ps4; 6801 (retired), 6401 (empty), 6402
+# (=ps2, not run) are dropped. =False → DB path bit-for-bit.
+BUILDING_ALLOWABLE_FROM_FILE = True
+BUILDING_ALLOWABLE_FILE = BLD_CT_FILE                       # same file as the CT source
+BUILDING_ALLOWABLE_SHEET = "Sheet1"                         # Yuvraj_Matrix.xlsx sheet
+BUILDING_ALLOWABLE_RULE = "ct_present"                      # numeric CT cell ⇒ allowable; "No" ⇒ not
+# Rename file machine-columns → internal machine ids (CT file uses 6403/6404 for ps3/ps4).
+BUILDING_ALLOWABLE_COL_MAP = {"6402": "ps2", "6403": "ps3", "6404": "ps4"}
+# Drop these file columns entirely (6801 retired; 6401 empty/unused; 6402 = ps2, not run).
+BUILDING_ALLOWABLE_COL_DROP = {"6801", "6401"}   # ps2=6402 now LIVE; 6801 retired, 6401 empty
+# Same-shaped mapping for the per-(SKU,machine) CT file (uses 6403/6404 for ps3/ps4).
+BLD_CT_COL_MAP = {"6402": "ps2", "6403": "ps3", "6404": "ps4"}
+
+if USE_REMAINING_BUILDING_MATRIX:      # TOGGLE ON: Yes-matrix allowable + OLD CT sheet
+    BLD_CT_FILE              = os.path.join(INPUT_DIR, "Cycle_time_Building.xlsx")
+    BUILDING_ALLOWABLE_FILE  = os.path.join(INPUT_DIR, "remaining_building_matrix.xlsx")
+    BUILDING_ALLOWABLE_SHEET = "Latest Building Allowable -Alig"
+    BUILDING_ALLOWABLE_RULE  = "yes"
+    BUILDING_ALLOWABLE_COL_MAP = {"PS2": "ps2", "PS3": "ps3", "PS4": "ps4",
+                                  "6402": "ps2", "6403": "ps3", "6404": "ps4"}   # new file uses 6402/6403/6404 headers
+    BUILDING_ALLOWABLE_COL_DROP = {"6801"}      # retired
+    BLD_CT_COL_MAP = {}                         # old CT sheet has no ps cols → ps use _BLD_CT_SEC fallback
 
 # ── Per-machine dominant-inch ranking file (inch-locking source) ─────────────
 # When DOMINANT_INCH_FILE_ENABLED, each building machine's dominant inch AND its
@@ -271,7 +318,7 @@ INCH_HIST_LOCK_SETS = {
     "6911": ["15", "13"],
     "7001": ["15"],                # ADOPTED VMI realloc: 15"-only (16"→6004, 18"→7003)
     "7002": ["14", "16"],          # 14"→16" one-way (timing enforced in code, no 14↔16 churn)
-    "7003": ["16", "18"],          # ADOPTED: 16"(d1-20) → 18"(d21+); INCH18_DEFER timing in code
+    "7003": ["18"],          # DEDICATED to 18" the WHOLE month (2026-09 reshuffle; INCH18_SWITCH_DAY=1)
     "7004": ["14"],
     "7101": ["15"],
     "7102": ["15"],
@@ -281,7 +328,7 @@ INCH_HIST_LOCK_SETS = {
     "7106": ["13"],
     "7201": ["16"],
     "7301": ["15"],
-    "7501": ["12"],
+    "7501": ["12", "13"],    # 12" dominant; ONE diff-CO to 13" once 12" demand is done (deficit-done override)
     "7502": ["13"],
     "7503": ["13"],
     "7601": ["15"],
@@ -299,9 +346,42 @@ INCH_HIST_LOCK_SETS = {
     "8302": ["12", "15", "13"],
     "8501": ["13", "12"],          # point6: drop 15" → specialize 8501 to 12"/13" (kills its 15↔12 +3 COs)
     "8502": ["16", "15", "14"],    # 8502 already builds those 15" SKUs (16.9 idle shifts) → absorbs them
+    "ps2": ["13"],
     "ps3": ["15"],
     "ps4": ["16"],
 }
+
+# ── SEPTEMBER-ONLY inch-lock (2026-09) ────────────────────────────────────────
+# A SEPARATE, re-optimised inch-lock for September ONLY — derived from the NEW Sept
+# building allowable (remaining_building_matrix.xlsx) + Sept demand. The 4-month historical
+# lock above is KEPT for June/July/Aug; only Sept swaps to this list. Method: for each GT
+# machine, DROP inches the new matrix no longer allows (dead locks) and REPOINT the dominant
+# to the matrix's biggest-Sept-demand inch. Only 7 machines differ from the historical lock:
+# Re-optimized (TRIM2: each GT machine = its top-2 Sept-demand matrix inches) for the CURRENT
+# remaining_building_matrix.xlsx (ps cols 6402/6403/6404 = ps2/ps3/ps4; ps allowability reduced).
+# Measured Sept (hol-17, cap17), after hill-climb (8502→["15"]): PM off 642,279 (81.38%) /
+# PM on 634,421 (80.39%). TRIM2-alone was 638,288/624,045; the 8502 concentration adds
+# +3,991/+10,376. Applied ONLY when PLAN_MONTH == "2026-09" (below).
+# Reflects the remaining_building_matrix allowability — pair with USE_REMAINING_BUILDING_MATRIX ON.
+# Re-derive if that file changes again (helper: scratchpad inch candidates + INCH_LOCK_JSON hook).
+INCH_HIST_LOCK_SETS_SEPT = dict(INCH_HIST_LOCK_SETS)
+INCH_HIST_LOCK_SETS_SEPT.update({
+    "7001": ["15", "14"],
+    "7002": ["14", "15"],
+    "7003": ["15", "16"],
+    "7004": ["14", "15"],
+    "7103": ["16", "15"],
+    "7105": ["13", "15"],
+    "7106": ["13", "15"],
+    "7201": ["15"],
+    "7501": ["12"],
+    "8302": ["12", "13"],
+    "8501": ["15", "12", "13"],   # +13": 8501 uses its carcass-free idle time on QXPC0 13" (+443 PM-on / +1,344 PM-off, no matrix change)
+    "8502": ["15"],          # hill-climb winner: drop 16", concentrate on scarce 15" (+3,991 PM-off / +10,376 PM-on)
+})
+if PLAN_MONTH == "2026-09":
+    INCH_HIST_LOCK_SETS = INCH_HIST_LOCK_SETS_SEPT
+
 # Apply the historical lock to Stage-1 carcass machines too? Default OFF: Stage-1 is
 # post-hoc (doesn't gate GT/cured) and _STAGE1_SINGLE_INCH already fixes each S1 machine
 # to ONE (demand-optimal, carcass-FEASIBLE) inch — that already satisfies "fixed = one
@@ -369,7 +449,7 @@ TOPUP_LOOKAHEAD_DAYS_GT = 3
 # Physical reason: building CT ≈ 2 min → 1 machine produces 240 GT/shift,
 # enough to feed ≈ 4.3 curing presses in real time. Pre-build buffer not needed.
 
-MAX_CHANGEOVERS_PER_DAY = 17   # validated CO cap (lowest starvation; cap=16 hurt July ~11pp).
+MAX_CHANGEOVERS_PER_DAY = int(os.environ.get("MAX_CO", "17"))   # validated CO cap; env MAX_CO overrides (both b2c + curing Phase-0).
 # Only caps 12 and 14 have been measured on correct data (Daily_Running_Moulds):
 #   cap 12 -> May 644,570 | June 611,593 | July 641,262   (best of the two)
 #   cap 14 -> May 665,244 | June 603,933 | July 627,916   (net -332, rejected)
@@ -430,7 +510,7 @@ CO_CLASS_B_THRESHOLD = 0.8
 
 
 # ── NEW ARCHITECTURE: Building machine CO cap ────────────────────────────────
-MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = 2
+MAX_BUILDING_COS_PER_MACHINE_PER_SHIFT = int(os.environ.get("BLD_CO_MAX", "2"))   # env BLD_CO_MAX raises diff-CO budget/shift
 # Maximum changeovers a single building machine may perform in ONE SHIFT.
 # Plant currently averages 0.57 CO/shift/machine (1 CO per shift is typical).
 # Upper bound = 2 CO/shift; actual value depends on curing press consumption
@@ -535,7 +615,7 @@ BUILDING_CO_SAME_SIZE = {
     "STAGE1":   90,   # 6802–6803, 6909, 6911, 7601, 7701, 7801–7804, 8001–8003, 8101 (6801 retired)
     "MID":      60,   # same as Stage-1 (shared group in CO master)
     "UNISTAGE": 120,  # 7501–7503
-    "PS":       30,   # ps3, ps4 (NEW 2026-08 GT machines) — plant same_size_CO = 30 min
+    "PS":       25,   # ps3, ps4 (NEW 2026-08 GT machines) — plant same_size_CO = 30 min
 }
 
 BUILDING_CO_DIFF_SIZE = {
@@ -546,7 +626,7 @@ BUILDING_CO_DIFF_SIZE = {
     "STAGE1":   180,  # 37.5% of one shift — avoid unless critical demand
     "MID":      180,
     "UNISTAGE": 157,  # 7501–7503 — same as Stage-1
-    "PS":       60,   # ps3, ps4 (NEW 2026-08 GT machines) — plant diff_size_CO = 60 min
+    "PS":       45,   # ps3, ps4 (NEW 2026-08 GT machines) — plant diff_size_CO = 60 min
 }
 
 # ── BJ-only same-size CO exceptions (specific SKU pairs) ─────────────────────
@@ -563,10 +643,10 @@ BJ_SAME_SIZE_CO_EXCEPTIONS = {
 # building allowable entirely, as if not installed) → measures max production without the
 # new machines. ON = ps3/ps4 active (their DB-allowable SKUs, CT 48, inch ps3=15"/ps4=16",
 # CO 30/60). Env PS_MACHINES=1 forces ON, PS_MACHINES=0 forces OFF.
-PS_MACHINES_ENABLED = False   # default OFF
+PS_MACHINES_ENABLED = True    # ADOPTED 2026-09: ps3 (15") + ps4 (16") are live GT machines
 # When ON, each ps machine may build at most this many units for the whole month (hard cap,
 # applies in shared or dedicated mode). Plant's real monthly capacity for the new machines.
-PS_MAX_BUILD = {"ps3": 10000, "ps4": 7000}
+PS_MAX_BUILD = {"ps2": 20000, "ps3": 40000, "ps4": 30000}   # monthly build cap (ENFORCED; PS_DEDICATION.max_build is inert)
 
 # ── ps3 / ps4 NEW-machine dedication (DYNAMIC per-month) ──────────────────────────────
 # Each new GT machine is dedicated to a set of SKUs chosen FRESH from every month's demand:
@@ -576,8 +656,9 @@ PS_MAX_BUILD = {"ps3": 10000, "ps4": 7000}
 # in building.load_machine_allowable(); env PS_EXCL_SKUS overrides with a fixed list, PS_EXCLUSIVE=0
 # disables. Edit inch / cap here.
 PS_DEDICATION = {
-    "ps3": {"inch": "15", "max_build": 10000},   # us3 — 15", max 10k (aligned to PS_MAX_BUILD)
-    "ps4": {"inch": "16", "max_build": 7000},    # us4 — 16", max 7k  (aligned to PS_MAX_BUILD)
+    "ps2": {"inch": "13", "max_build": 20000},   # ps2 — 13" (NEW 2026-09; aligned to PS_MAX_BUILD)
+    "ps3": {"inch": "15", "max_build": 40000},   # ps3 — 15", max 10k (aligned to PS_MAX_BUILD)
+    "ps4": {"inch": "16", "max_build": 30000},    # ps4 — 16", max 7k  (aligned to PS_MAX_BUILD)
 }
 
 STAGE2_CO_TIME_MULTIPLIER = 2.0
@@ -867,28 +948,16 @@ CURING_PRESS_COUNT = 170
 # the denominator keeps the KPI stable and comparable across runs. Change this
 # one line when the curing-press roster changes.
 
-# ── Restrict the press roster to the allowable matrix (LOCAL-ONLY, default OFF) ──
-# The live Daily_Running_Moulds snapshot sometimes carries MORE unique presses
-# than the 170-press allowable matrix (Master_Curing_Allowable_Machines_source):
-# e.g. July has 2 extra (85214, 85215) and August 8 extra (85207–85215). Those
-# presses are not in any SKU's allowable list, so they can run their Day-0 SKU
-# but can never CO anywhere. When RESTRICT_PRESSES_TO_ALLOWABLE is ON, the
-# running-moulds snapshot is filtered so ONLY the 170 allowable presses exist
-# (assume no other press exists); their Day-0 moulds return to the free pool.
-# LOCAL-ONLY: local_main.py passes this flag into run_rolling_pipeline; the cloud
-# path (main.py) never passes it, so cloud is unaffected regardless of this value.
-# ADOPTED business rule (default ON): only the 170 DB-allowable presses exist.
-# Env PRESS_ALLOWABLE_ONLY=0 reverts to including stray non-roster presses.
-RESTRICT_PRESSES_TO_ALLOWABLE = (os.environ.get("PRESS_ALLOWABLE_ONLY", "1") != "0")
+# ── Press roster = UNION of the Day-0 running-moulds snapshot and the allowable matrix ──
+# Every press in the Day-0 running-moulds snapshot is used (running presses are always in the
+# allowable matrix), AND every allowable press ABSENT from the snapshot is brought online via
+# IDLE_PRESS_ACTIVATE below.
 
-# IDLE_PRESS_ACTIVATE — the other half of the 170-press business rule (default ON):
-# any of the 170 roster presses ABSENT from the Day-0 running-moulds snapshot is
-# brought online via a cold-start curing CO (nothing -> SKU) in Day-1 Shift A, then
-# produces from Day-1 Shift B. Target = neediest allowable SKU with 2 free moulds.
-# Together with RESTRICT_PRESSES_TO_ALLOWABLE this makes every run simulate EXACTLY
-# the 170 certified presses. Env IDLE_PRESS_ACT=0 reverts. Logic in b2c_pipeline.py.
-# KPI vs OFF (measured, mould-audit PASS, deterministic): June +8,118 / July -917 /
-# Aug -3,839 (net +3,362) — adopted as a business/correctness rule, not a KPI lever.
+# IDLE_PRESS_ACTIVATE (default ON): any allowable-matrix press ABSENT from the Day-0
+# running-moulds snapshot is brought online via a cold-start curing CO (nothing -> SKU) in
+# Day-1 Shift A, then produces from Day-1 Shift B (target = neediest allowable SKU with 2 free
+# moulds). All new presses are client-confirmed ready for production. Env IDLE_PRESS_ACT=0
+# reverts. Logic in b2c_pipeline.py.
 IDLE_PRESS_ACTIVATE_ENABLED = (os.environ.get("IDLE_PRESS_ACT", "1") != "0")
 
 # ── Curing press changeover times ────────────────────────────────────────────
@@ -949,6 +1018,7 @@ BUILDING_MACHINE_NAMES = {
     "8001": "sai1stage1",  "8002": "sai2stage1",  "8003": "sai3stage1",
     "8101": "88d1stage1",  "8201": "oldirm",      "8301": "gtic1",       "8302": "gtic2",
     "8501": "vmi1",        "8502": "vmi2",
+    "ps2": "ps2",          "ps3": "ps3",          "ps4": "ps4",   # NEW 2026-09 GT machines — display name = machine code (no NA)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

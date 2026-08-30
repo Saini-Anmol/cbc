@@ -476,6 +476,23 @@ _PRESS_VALVE_MARGIN = int(os.environ.get("PRESS_VALVE_MARGIN", "2"))  # donor su
 # MARGIN=2 (not 1): a shed donor keeps ONE press of genuine slack, so a building-limited donor
 # (scarce inch, produces below rate) won't immediately flip Class-A and re-acquire (the ping-pong).
 
+# ── Single-source press stability (PRESS_STABLE_SINGLESRC, default OFF = bit-for-bit) ──
+# Targets the mid-month press EXODUS + month-end BOOMERANG that idles a sole-builder, building-rate-
+# limited SKU (e.g. 1325114812074TUHL0 12", demand 15,000, built ONLY by machine 7501 ~687 GT/day).
+# ROOT CAUSE: the Phase-0 demand-drain (below) subtracts press_count·rate/day, i.e. it assumes EVERY
+# committed press produces at full rate. For a sole-builder SKU with more presses than building can
+# feed, that drains updated_demand to 0 too EARLY (planner thinks demand is met when ~4k is still
+# physically unbuilt) → the presses flip demand_done_free → the pairing loop CO's them ALL away →
+# building's curing-draw signal → 0 → 7501 idles ~10 days → the presses boomerang back at month-end.
+# FIX: for a SKU built by <= SS_MAX_BLD building machines (a genuine single source), CAP the daily
+# demand-drain at the SKU's actual BUILDABLE GT/day (_perSKU_feed), so updated_demand tracks REAL
+# building output. Demand then hits 0 only when building has genuinely finished → presses stay held
+# (PRESS_STABLE) the whole time, no premature demand_done exodus, no month-end re-acquire boomerang →
+# building runs continuously toward full demand. Needs feed_ctx/buildable_rate (else no-op). OFF or no
+# building context → bit-for-bit baseline (drain = press_count·rate exactly as before).
+_PRESS_STABLE_SINGLESRC = os.environ.get("PRESS_STABLE_SINGLESRC", "1") != "0"   # ADOPTED ON: general single-source press-hold, +7,405 cured Sept (21 SKUs), feasibility-clean. =0 reverts bit-for-bit.
+_SS_MAX_BLD = int(os.environ.get("SS_MAX_BLD", "1"))  # SKU is single-source if built by <= this many machines
+
 # Curing CO same-inch alignment (env CURING_INCH_ALIGN, default OFF). When on (and a sku_inch
 # map is supplied), a press changing over PREFERS a target SKU of the SAME inch as its current
 # SKU — a tiebreak placed AFTER urgency_class + constraint, so demand-critical (Class-A) and
@@ -594,12 +611,32 @@ _SUPPLY_OVERFEED_MARGIN = float(os.environ.get("SUPPLY_OVERFEED_MARGIN", "1.0"))
 # a MONOTONE rule: a SKU ramps UP toward its target, then once it sheds ANY press it may never re-gain
 # (unimodal ramp up→peak→down). No boomerang and no CO-to-undo by construction. STATEFUL_PLAN=0 → the
 # current memoryless behaviour bit-for-bit.
-_STATEFUL_PLAN = os.environ.get("STATEFUL_PLAN", "0") != "0"
+_STATEFUL_PLAN = os.environ.get("STATEFUL_PLAN", "1") != "0"   # ADOPTED (core of the v4 core+spare hybrid)
 _SP_FILL = float(os.environ.get("SP_FILL", "0.85"))   # steady-fill factor sizing the peak vs a flat month
 _SP_MONOTONE = os.environ.get("SP_MONOTONE", "1") != "0"   # unimodal ramp (no re-gain after a shed)
 _SP_CAP = os.environ.get("SP_CAP", "1") != "0"             # enforce the per-SKU target peak cap
 _SP_V2 = os.environ.get("SP_V2", "0") != "0"               # v2 supply-cap+per-inch norm: MEASURED WORSE (off)
 _SP_WARM_FIRST = os.environ.get("SP_WARM_FIRST", "1") != "0"  # v3: fill warm SKUs before opening cold ones
+# v4 CORE+SPARE hybrid (env SP_SPARE_OPP, default OFF; used WITH STATEFUL_PLAN). STATEFUL gives a
+# monotonic but ~10k-below-ceiling plan because its flat per-SKU core cap (_target_peak) leaves
+# building-sufficient SKUs under-served. SP_SPARE_OPP relaxes ONLY the count cap (never the monotone
+# no-boomerang latch): a press may exceed a SKU's core peak IFF building can still feed the extra
+# press ((n+1)·rate ≤ _perSKU_feed) — i.e. spare/over-produced building GT exists for it. Building-
+# LIMITED inches (13"/15", where extra presses fragment) stay capped → monotone preserved; building-
+# SUFFICIENT SKUs absorb spare presses → recovers the opportunistic ~10k. Adding eligible presses can
+# only grow this spare capture, never shrink the core → monotonic by construction.
+_SP_SPARE_OPP = os.environ.get("SP_SPARE_OPP", "1") != "0"   # ADOPTED (spare-overlay: monotonic + recovers ceiling)
+# Spare-gate aggressiveness: a spare press may exceed the core peak when (n+1)·rate ≤ _perSKU_feed
+# × SP_SPARE_MARGIN. 1.0 = strict feasible-supply only (most monotone); >1.0 lets a press take a
+# SKU whose building feed is slightly short (captures more opportunistic GT — needed on slack months
+# like June where the strict feed estimate is too conservative), at some monotonicity risk. Tuned.
+_SP_SPARE_MARGIN = float(os.environ.get("SP_SPARE_MARGIN", "1.0"))
+# UNMET BOOTSTRAP (env UNMET_BOOTSTRAP, default ON): a demanded SKU that has NEVER been served (0
+# presses) but has real unmet demand jumps the acquisition queue for its FIRST press — otherwise
+# small NRI SKUs (e.g. TULX0, 539 units, exclusive free moulds) always lose the urgency-ranked race
+# to big SKUs and stay at 0 built/cured forever (free moulds + idle presses, but never bootstrapped).
+# The mould gate still applies at mount, so a press is only taken if 2 eligible moulds are free.
+_UNMET_BOOTSTRAP = os.environ.get("UNMET_BOOTSTRAP", "0") != "0"   # default OFF: net −1.5k July + can't help SKUs whose 1 press is HOLD-locked (needs a press-release, not re-ranking)
 
 # ── v4 CAMPAIGN / active-set planner (env CAMPAIGN_PLAN, default OFF) ──────────────────
 # Phase 1 = build the abstract per-SKU-per-day campaign target (Stage 1) + LOG diagnostics only
@@ -1248,6 +1285,25 @@ class COScheduler:
                 print(f"  [CAMPAIGN] active/day={[_act_per_day[d] for d in range(1, planning_days+1)]}")
                 print(f"  [CAMPAIGN] deferred eg={[str(s)[-8:] for s in _deferred[:10]]}")
 
+        # ── PRESS_STABLE_SINGLESRC: identify sole-builder (single-source) SKUs ─────
+        # A SKU built by <= _SS_MAX_BLD building machines (from the lock-BLIND raw_sku_machines — the
+        # lock-aware sku_machines drops a sole builder anchored to a different inch, e.g. 7501→13")
+        # is a genuine single source: building cannot over-feed it, so its curing DRAW-drain must be
+        # pinned to what its one machine can build (Σ machine GT/day). Empty ctx → empty set → no-op.
+        _ss_singlesrc: set = set()
+        _ss_feedrate: dict[str, float] = {}
+        _raw_sm = (feed_ctx or {}).get("raw_sku_machines", {})
+        _ss_feed_map = (feed_ctx or {}).get("singlesrc_feed", {})
+        if _PRESS_STABLE_SINGLESRC and _raw_sm and _ss_feed_map:
+            for _s in all_demand_skus:
+                _bm = _raw_sm.get(str(_s))
+                _fr = _ss_feed_map.get(str(_s))
+                if _bm is not None and 0 < len(_bm) <= _SS_MAX_BLD and _fr is not None:
+                    _ss_singlesrc.add(_s)
+                    _ss_feedrate[_s] = _fr
+            print(f"  [PRESS_STABLE_SINGLESRC] {len(_ss_singlesrc)} single-source SKUs "
+                  f"(<= {_SS_MAX_BLD} builder machine(s)) — draw-drain pinned to buildable feed")
+
         # ── Day-by-day simulation ─────────────────────────────────────────────
         for day in range(1, planning_days + 1):
             horizon_left = _working_days_left(day, planning_days, _hol)
@@ -1263,7 +1319,18 @@ class COScheduler:
                         continue
                     rate = _qty_per_press_per_day(
                         ct_map.get(sku, ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN))
-                    updated_demand[sku] = max(0.0, updated_demand[sku] - n * rate)
+                    _drain = n * rate
+                    # PRESS_STABLE_SINGLESRC: for a sole-builder SKU, cap the drain at the actual
+                    # buildable GT/day (Σ its 1-2 machines' GT/day) so updated_demand tracks REAL
+                    # building output, not the optimistic n·rate. Prevents the premature demand_done
+                    # that triggers the mid-month press exodus + month-end boomerang: presses stay
+                    # committed until building has GENUINELY cleared the SKU, so the sole builder runs
+                    # continuously toward full demand. No feed context → no cap → bit-for-bit baseline.
+                    if sku in _ss_singlesrc:
+                        _feed = _ss_feedrate.get(sku)
+                        if _feed is not None and _feed >= 0:
+                            _drain = min(_drain, _feed)
+                    updated_demand[sku] = max(0.0, updated_demand[sku] - _drain)
 
             if co_used >= max_co_per_day:
                 continue
@@ -1599,7 +1666,18 @@ class COScheduler:
                                     (_SP_MONOTONE and target in _peaked)
                                     or (_SP_CAP and press_count.get(target, 0)
                                         >= _target_peak.get(target, 10**6))):
-                                continue
+                                # CORE+SPARE hybrid: allow exceeding the core count cap (NOT the
+                                # monotone no-boomerang latch) when building can feed the extra press.
+                                _spare_ok = False
+                                if (_SP_SPARE_OPP and buildable_rate is not None
+                                        and not (_SP_MONOTONE and target in _peaked)):
+                                    _n0 = press_count.get(target, 0)
+                                    _r0 = _qty_per_press_per_day(ct_map.get(target, _dct))
+                                    _bf0 = _perSKU_feed(target, _n0, _r0)
+                                    if _bf0 is not None and _r0 > 0 and (_n0 + 1) * _r0 <= _bf0 * _SP_SPARE_MARGIN:
+                                        _spare_ok = True
+                                if not _spare_ok:
+                                    continue
                             if _PRESS_DWELL:
                                 # GAIN cap: target already took its daily quota of new presses.
                                 if _gain_today.get(target, 0) >= _PRESS_MAX_GAIN_PER_DAY:
@@ -1729,6 +1807,12 @@ class COScheduler:
                         # so cureRUN stays close to what building feeds (fewer starved presses).
                         _warm = (0 if press_count.get(pr[1], 0) > 0 else 1) if (
                             _STATEFUL_PLAN and _SP_WARM_FIRST) else 0
+                        # UNMET BOOTSTRAP: a never-served SKU (0 presses) with real unmet demand jumps
+                        # the queue for its FIRST press so small NRI SKUs get bootstrapped (moulds are
+                        # still gated at mount). 0 = bootstrap-worthy → ranked first within its class.
+                        _boot = 0 if (_UNMET_BOOTSTRAP and press_count.get(pr[1], 0) == 0
+                                      and updated_demand.get(pr[1], 0.0)
+                                          > _qty_per_press_per_day(ct_map.get(pr[1], _dct))) else 1
                         _tail = (pr[3][1], pr[3][2],                # -priority, after_days
                                  ct_map.get(pr[1], _dct), pr[0], pr[1])
                         if _STATEFUL_PLAN and _SP_WARM_FIRST:
@@ -1742,7 +1826,7 @@ class COScheduler:
                         elif _SAME_INCH_FIRST:
                             _base = (_cls, _si, _con, _sup, *_tail)  # "safe": Class-A first, then same-inch
                         else:
-                            _base = (_cls, _con, _sup, _si, *_tail)  # OFF: current order (same-inch 4th)
+                            _base = (_cls, _boot, _con, _sup, _si, *_tail)  # never-served SKUs bootstrap first
                         if not _prio_acq:
                             return _base
                         # DELIVERY_PRIORITY: committed targets fire FIRST, EARLIEST-DEADLINE-FIRST.

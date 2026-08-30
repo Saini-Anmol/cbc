@@ -139,7 +139,7 @@ for _m in ("8201","8301","8302","8501","8502","7301"):
 for _m in ("6801","6802","6803","6909","6911","7601","7701",
            "7801","7802","7803","7804","8001","8002","8003","8101"):  # Stage-1 (15; 6801 is Stage-1 carcass, not GT)
     _MACHINE_GROUP[_m] = "STAGE1"
-for _m in ("ps3","ps4"):   # NEW 2026-08 GT machines (independent GT, like Unistage; CO 30/60 via "PS" key)
+for _m in ("ps2","ps3","ps4"):   # NEW GT machines (independent GT, like Unistage; CO 25/45 via "PS" key)
     _MACHINE_GROUP[_m] = "PS"
 
 # Plant-facing display labels — used ONLY for the Machine_Group column in the
@@ -727,7 +727,7 @@ _BLD_CT_SEC: dict[str, float] = {
     "7701":163,   "7801":135,   "7802":135,
     "7803":135,   "7804":135,   "8001":113,
     "8002":113,   "8003":113,   "8101":230,
-    "ps3":48.0,   "ps4":48.0,   # NEW plant building machines (2026-08): ps3 dom 15", ps4 dom 16"; CT 48 sec/unit
+    "ps2":48.0,   "ps3":48.0,   "ps4":48.0,   # NEW plant GT machines: ps2 dom 13", ps3 15", ps4 16" (CT 48 fallback; file CT used when present)
 }
 
 # ── Per-(SKU × machine) building CT (sec/unit) — LIVE, toggle-gated ───────────
@@ -762,6 +762,11 @@ def _load_bld_ct_file() -> None:
     except Exception as _e:
         print(f"  [BLD_CT] read failed ({_e}); using fixed per-machine CT")
         return
+    # Rename new-machine CT columns to internal ids (file uses 6403/6404 for ps3/ps4). Match by
+    # str(col) because some headers are int (6403) and some str — a plain str-key rename misses them.
+    _ctmap = getattr(_bc_cfg, "BLD_CT_COL_MAP", {})
+    if _ctmap:
+        _df = _df.rename(columns={_c: _ctmap[str(_c)] for _c in _df.columns if str(_c) in _ctmap})
     _mach_cols = [c for c in _df.columns[2:] if str(c) in _BLD_CT_SEC]
     _n = 0
     for _, _row in _df.iterrows():
@@ -792,6 +797,250 @@ def _bld_ct_sec(machine, sku=None) -> float:
         if _v is not None:
             return _v
     return _BLD_CT_SEC.get(m, 120.0)
+
+# ── PM / MTC maintenance downtime (bc_config.PM_MTC_ENABLED, default OFF) ────────────
+# A machine (building OR curing press) is DOWN during its window (no prod/CO); the overlapped
+# shift's minutes are reduced minute-precisely. Stage detected by _MACHINE_GROUP membership.
+_PM_MTC_ENABLED = bool(getattr(_bc_cfg, "PM_MTC_ENABLED", False))
+_BLD_DOWN: dict[str, list] = {}    # building machine -> [(start_dt, end_dt)]
+_CUR_DOWN: dict[str, list] = {}    # curing press    -> [(start_dt, end_dt)]
+
+def _load_pm_mtc() -> None:
+    if not _PM_MTC_ENABLED:
+        return
+    _path = getattr(_bc_cfg, "PM_MTC_FILE", "")
+    if not _path or not os.path.exists(_path):
+        print(f"  [PM_MTC] file not found ({_path}); no downtime applied")
+        return
+    from datetime import datetime as _dt
+    def _parse(_t):
+        try:
+            return _dt.strptime(str(_t).strip(), "%d/%m/%Y:%I:%M %p")
+        except (TypeError, ValueError):
+            return None
+    _wb = pd.ExcelFile(_path)
+    for _sh in _wb.sheet_names:
+        # Route STRICTLY by sheet name: 'building' sheet -> building machines,
+        # 'curing' sheet -> curing presses (user-confirmed; sheets renamed 2026-08-29).
+        _sl = str(_sh).strip().lower()
+        if _sl in ("building", "mtc"):
+            _target = _BLD_DOWN
+        elif _sl in ("curing", "pm"):
+            _target = _CUR_DOWN
+        else:
+            continue
+        _df = _wb.parse(_sh)
+        _df.columns = [str(c).strip() for c in _df.columns]
+        if "Machine ID" not in _df.columns:
+            continue
+        for _, _r in _df.iterrows():
+            _m = str(_r.get("Machine ID", "")).strip().split(".")[0]
+            if _m == "6801":
+                continue                              # plant-retired: no production, no PM/MTC
+            _s, _e = _parse(_r.get("Scheduled Start Time")), _parse(_r.get("Scheduled End Time"))
+            if not _m or _m.lower() == "nan" or _s is None or _e is None or _e <= _s:
+                continue
+            # Maintenance TYPE is the per-row 'Downtime Reason' column (PM / MTC) — NOT the
+            # sheet. Stored with each window so the schedule sheets can label each row.
+            _reason = str(_r.get("Downtime Reason", "")).strip().upper()
+            _reason = _reason if _reason in ("PM", "MTC") else "PM"
+            _target.setdefault(_m, []).append((_s, _e, _reason))
+    print(f"  [PM_MTC] {sum(len(v) for v in _BLD_DOWN.values())} building + "
+          f"{sum(len(v) for v in _CUR_DOWN.values())} curing downtime windows loaded")
+
+_load_pm_mtc()
+
+# PM/MTC NO-OVERLAP building placement: the existing building handling only REDUCES the shift's
+# available minutes (so the produced qty is right) but still emitted a single StartTime→EndTime run
+# that SPANNED a maintenance window. The fix lives in `_split_rows_at_shift_boundaries` (building,
+# not even_qty): a machine's production skips OVER any window it hits (the window is an idle gap; the
+# same production minutes resume after it, extending wall-clock — NO quantity is dropped, so the
+# sheet still reconciles to the built/cured KPI and mould feasibility). A CO (indivisible) is moved
+# to start just after any window it would collide with. Toggle `_PM_MTC_NO_OVERLAP` (defined below).
+
+def _down_mins(windows, sh_start, sh_end) -> float:
+    """Minutes of [sh_start, sh_end] covered by any maintenance window (minute-precise overlap)."""
+    if not windows:
+        return 0.0
+    _tot = 0.0
+    for _w in windows:
+        _s, _e = _w[0], _w[1]
+        _lo = max(_s, sh_start); _hi = min(_e, sh_end)
+        if _hi > _lo:
+            _tot += (_hi - _lo).total_seconds() / 60.0
+    return _tot
+
+# ── PM/MTC time-placement: emit activity only in the shift minutes NOT under a
+# maintenance window (env PM_MTC_NO_OVERLAP, default ON whenever PM_MTC is on). A
+# press's (already capacity-reduced) curing is laid into the shift's FREE
+# sub-intervals so an emitted StartTime→EndTime never overlaps a window. OFF (or
+# PM_MTC off) = the naive shift-start cursor (bit-for-bit baseline).
+_PM_MTC_NO_OVERLAP = (_PM_MTC_ENABLED
+                      and os.environ.get("PM_MTC_NO_OVERLAP", "1") != "0")
+
+def _free_intervals(windows, sh_start, sh_end):
+    """Free (non-maintenance) sub-intervals of [sh_start, sh_end], as a list of
+    (start_dt, end_dt) sorted chronologically. Subtracts every maintenance window
+    overlapping the shift. Returns [(sh_start, sh_end)] when there is no downtime."""
+    if not windows:
+        return [(sh_start, sh_end)]
+    # Clip + merge the maintenance windows that touch this shift.
+    _busy = []
+    for _w in windows:
+        _lo = max(_w[0], sh_start); _hi = min(_w[1], sh_end)
+        if _hi > _lo:
+            _busy.append((_lo, _hi))
+    if not _busy:
+        return [(sh_start, sh_end)]
+    _busy.sort()
+    _merged = [list(_busy[0])]
+    for _lo, _hi in _busy[1:]:
+        if _lo <= _merged[-1][1]:
+            _merged[-1][1] = max(_merged[-1][1], _hi)
+        else:
+            _merged.append([_lo, _hi])
+    # Complement of the merged busy windows within the shift.
+    _free = []
+    _cur = sh_start
+    for _lo, _hi in _merged:
+        if _lo > _cur:
+            _free.append((_cur, _lo))
+        _cur = max(_cur, _hi)
+    if _cur < sh_end:
+        _free.append((_cur, sh_end))
+    return _free
+
+def _post_maint_free(windows, sh_start, sh_end):
+    """(post_free_mins, post_start_dt) for a press's shift: production resumes strictly AFTER
+    the LAST maintenance window that overlaps this shift. post_start = the latest window-end
+    within the shift; post_free = the free minutes from there to shift end. The pre-maintenance
+    gap (before the last window) is NOT counted — a deferred remainder carries to a later shift,
+    not backwards into that gap (per plant rule). No overlap → (full shift, sh_start)."""
+    _wend = sh_start
+    for _w in (windows or []):
+        _lo = max(_w[0], sh_start); _hi = min(_w[1], sh_end)
+        if _hi > _lo and _hi > _wend:
+            _wend = _hi
+    _wend = min(_wend, sh_end)
+    return max(0.0, (sh_end - _wend).total_seconds() / 60.0), _wend
+
+def _pm_shift_of_bounds(dt):
+    """(shift_start, shift_end) datetimes for the plant shift containing dt (07/15/23)."""
+    _h = dt.hour
+    _d0 = dt.replace(minute=0, second=0, microsecond=0)
+    if 7 <= _h < 15:
+        _s = _d0.replace(hour=7)
+    elif 15 <= _h < 23:
+        _s = _d0.replace(hour=15)
+    elif _h >= 23:
+        _s = _d0.replace(hour=23)
+    else:                                  # 00:00–06:59 → shift C started 23:00 the prior day
+        _s = (_d0 - timedelta(days=1)).replace(hour=23)
+    return _s, _s + timedelta(minutes=float(SHIFT_MINS))
+
+def _pm_relocate_curing_rows(rows):
+    """POST-PROCESS (env PM_MTC_NO_OVERLAP, ON with PM_MTC): after rows are shift-split, move
+    every CURING (Qty>0) row whose [StartTime,EndTime] overlaps this press's maintenance window
+    into the FREE (non-maintenance) sub-interval(s) of its OWN shift — quantity unchanged. Runs
+    AFTER the sim + shift-boundary split, so it touches NO plan state and never feeds the
+    per-press continuous-cursor / even-Qty machinery (no cascade). A row that already clears its
+    windows is left byte-identical. A row that fits one free interval stays a SINGLE row (the R17
+    bipartite mould audit counts one (press,SKU) per Qty>0 row → unaffected); only a row longer
+    than every single free interval (a window bisecting the shift with production exceeding either
+    side) is SPLIT across intervals — does not occur in the current data. OFF → not called."""
+    if not (_PM_MTC_NO_OVERLAP and _CUR_DOWN):
+        return rows
+    def _p(s):
+        try:
+            return datetime.strptime(str(s), "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return None
+    _out = []
+    _moved = 0
+    for r in rows:
+        try:
+            _q = float(r.get("Qty", 0) or 0)
+        except (TypeError, ValueError):
+            _q = 0.0
+        _wins = _CUR_DOWN.get(str(r.get("Machine", "")))
+        _st = _p(r.get("StartTime")); _en = _p(r.get("EndTime"))
+        if _q <= 0 or not _wins or _st is None or _en is None or _en <= _st:
+            _out.append(r)                                  # not a curing row / no window data → unchanged
+            continue
+        _sh_s, _sh_e = _pm_shift_of_bounds(_st)
+        if _down_mins(_wins, _sh_s, _sh_e) <= 0:            # no maintenance in this shift → unchanged
+            _out.append(r)
+            continue
+        _post_free, _post_start = _post_maint_free(_wins, _sh_s, _sh_e)
+        _dur = (_en - _st).total_seconds() / 60.0
+        if _post_free >= _dur - 1e-6 and _post_free > 0:
+            # place the whole (sim-capped) run AFTER the window ends → single row, no split
+            _nr = dict(r)
+            _nr["StartTime"] = _fmt_dt(_post_start)
+            _nr["EndTime"]   = _fmt_dt(_post_start + timedelta(minutes=_dur))
+            _out.append(_nr)
+            _moved += 1
+        elif _post_free > 0:
+            # defensive: run longer than post-maintenance free (should not occur — the sim caps
+            # curing to post-maintenance minutes). Clamp the row to the post-maintenance window;
+            # any over-hang stays as-is rather than re-entering the window.
+            _nr = dict(r)
+            _nr["StartTime"] = _fmt_dt(_post_start)
+            _nr["EndTime"]   = _fmt_dt(_sh_e)
+            _out.append(_nr)
+            _moved += 1
+        else:
+            _out.append(r)                                  # no post-maintenance time (window to shift end) → leave
+    if _moved:
+        print(f"  [PM_MTC] no-overlap: relocated {_moved} curing row(s) out of maintenance windows")
+    return _out
+
+def _shift_of(_dt) -> str:
+    """Shift letter from a datetime's hour: A 07-15, B 15-23, C 23-07."""
+    _h = _dt.hour
+    return "A" if 7 <= _h < 15 else ("B" if 15 <= _h < 23 else "C")
+
+def _pm_mtc_display_rows(plan_start, planning_days, stage):
+    """DISPLAY-ONLY maintenance rows for a Shift Schedule sheet — one row per (equipment,
+    window) overlapping the plan horizon, from BOTH sources (PM=curing presses +
+    MTC=building machines). BOTH sheets show BOTH types, each labelled: building via
+    CO_Type ('PM'/'MTC'), curing via Remarks ('PM Schedule'/'MTC Schedule'). Never fed
+    to prod_rows / KPIs / feasibility. stage: 'building' or 'curing' (row schema)."""
+    from datetime import timedelta as _td
+    if not _PM_MTC_ENABLED:
+        return []
+    _h_start = plan_start
+    _h_end   = plan_start + _td(days=planning_days)
+    _rows = []
+    for _down_dict in (_BLD_DOWN, _CUR_DOWN):
+        for _id, _wins in (_down_dict or {}).items():
+            # Route by EQUIPMENT TYPE: building machines → building sheet (label in CO_Type),
+            # curing presses → curing sheet (label in Remarks). The PM/MTC TYPE comes from
+            # each window's 'Downtime Reason' — so BOTH sheets carry BOTH PM and MTC rows.
+            _is_bld = _id in _MACHINE_GROUP
+            if (stage == "building") != _is_bld:      # building sheet ⇔ building machine only
+                continue
+            for _w in _wins:
+                _s, _e = _w[0], _w[1]
+                _reason = _w[2] if len(_w) > 2 else "PM"   # "PM" or "MTC"
+                if _e <= _h_start or _s >= _h_end:  # outside plan horizon (e.g. Sept windows on a July run)
+                    continue
+                _mins = round((_e - _s).total_seconds() / 60.0)
+                _st = _s.strftime("%Y-%m-%d %H:%M"); _en = _e.strftime("%Y-%m-%d %H:%M")
+                if stage == "building":
+                    _rows.append({"Machine": _id, "Date": _s.strftime("%Y-%m-%d"),
+                                  "Shift": _shift_of(_s), "SKUCode": "—", "Qty": 0,
+                                  "CO_Mins": _mins, "StartTime": _st, "EndTime": _en,
+                                  "Machine_Group": _MACHINE_GROUP.get(_id, ""), "CO_Type": _reason,
+                                  "Remarks": f"{_reason} Schedule"})
+                else:
+                    _rows.append({"Date": _s.strftime("%Y-%m-%d"), "Shift": _shift_of(_s),
+                                  "Machine": _id, "SKUCode": "—", "StartTime": _st,
+                                  "EndTime": _en, "Qty": 0, "CO_Mins": _mins,
+                                  "Mould_Clean_Mins": 0, "CycleTime_min": "", "GT_Inventory": "",
+                                  "CO_Type": _reason, "Remarks": f"{_reason} Schedule",
+                                  "_status": "PM_MTC"})
+    return _rows
 
 DEFAULT_CURING_CT = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
 CURING_CAVITIES   = 2
@@ -890,6 +1139,22 @@ def _load_inch_hist_lock() -> None:
     No-op if the toggle is off or the file is missing (keeps ±2 bit-for-bit)."""
     if not _INCH_HIST_LOCK_ENABLED:
         return
+    # FAST-ITERATION HOOK: env INCH_LOCK_JSON → load per-machine allowed-inch sets from a
+    # JSON file {machine: [inches]} (overrides bc_config). For tuning the Sept inch-lock.
+    _lj = os.environ.get("INCH_LOCK_JSON", "")
+    if _lj and os.path.exists(_lj):
+        import json as _json
+        _sets = _json.load(open(_lj))
+        _n = 0
+        for _m, _al in _sets.items():
+            _m = str(_m).strip(); _keep = [str(i).strip() for i in _al if str(i).strip()]
+            if not _m or not _keep:
+                continue
+            _MACHINE_ALLOWED_INCHES[_m] = list(_keep); _MACHINE_ALLOWED_INCH_SET[_m] = set(_keep)
+            _MACHINE_DOMINANT_INCH[_m] = _keep[0]; _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_keep)
+            _n += 1
+        print(f"  [INCH_HIST_LOCK] loaded {_n} machines from INCH_LOCK_JSON={_lj}")
+        return
     # Preferred source: the hardcoded, already-final sets in bc_config. When present,
     # these are the FINAL ranked allowed-inch lists (2%/max-3/BJ-no-+3 already applied),
     # so build the four maps DIRECTLY and SKIP the Excel read + per-2%/rank/BJ logic.
@@ -977,6 +1242,9 @@ _INCH18_EXC = os.environ.get("INCH18_EXC", "0") != "0"
 _INCH18_DEFER = os.environ.get("INCH18_DEFER", "1") != "0"    # ADOPTED (default ON): VMI realloc —
 #   7001→15, 6004→16, 7003→16"(d1-20)→18"(d21+), 7002→14"→16" one-way (no churn). INCH18_DEFER=0 reverts.
 _INCH18_MACHINE = os.environ.get("INCH18_MACHINE", "7003")     # the machine 18" moves to
+# 7501 one-way 12"→13" (env INCH_7501_FLEX, default ON): 7501 builds 12" until all 12" demand is
+# done, then takes ONE diff-CO to 13" and stays (no revert). =0 keeps 7501 locked to its config set.
+_INCH_7501_FLEX = os.environ.get("INCH_7501_FLEX", "1") != "0"
 if _INCH18_EXC or _INCH18_DEFER:
     # Optimal VMI allocation (June+July analysis): 7001→15, 6004→16, 7003→16(early)+18(from day21),
     # 7002→14(early)+16(one-way, kills its 14↔16 churn). Others keep historical (6001/7004→14, 6002→15,
@@ -985,7 +1253,7 @@ if _INCH18_EXC or _INCH18_DEFER:
     # 7002→[14,16], 6004→[16]) so the config file reflects reality — this loop is idempotent belt-and-
     # suspenders (re-asserts them when INCH18_DEFER on). The per-day timing (7003 16→18@d21, 7002 one-way)
     # lives in the day loop; INCH18_DEFER=0 keeps the config sets but drops the timing.
-    _inch18_override = {"7001": ["15"], _INCH18_MACHINE: ["16", "18"], "6004": ["16"], "7002": ["14", "16"]}
+    _inch18_override = {"7001": ["15"], _INCH18_MACHINE: ["18"], "6004": ["16"], "7002": ["14", "16"]}  # 7003 DEDICATED to 18" (whole month)
     for _m, _al in _inch18_override.items():
         _MACHINE_ALLOWED_INCHES[_m] = list(_al)
         _MACHINE_ALLOWED_INCH_SET[_m] = set(_al)
@@ -1016,6 +1284,14 @@ _FIXED_ESCAPE_MAX_COS = int(getattr(_bc_cfg, "FIXED_ESCAPE_MAX_COS", 1))
 # prevents the inch-wander that regressed the unconstrained unlock. ONEWAY_INCH=0 → current lock.
 _ONEWAY_INCH_ENABLED = os.environ.get("ONEWAY_INCH", "0") != "0"
 _ONEWAY_MAX_JUMP = int(os.environ.get("ONEWAY_MAX_JUMP", "2"))   # max inch distance per single diff-CO
+# ── GENERAL one-way inch rule (env ONEWAY_INCH_GENERAL, default ON) ─────────────────────────────
+# Every building machine starts on its DOMINANT/historical inch and builds it until that inch's
+# servable demand is DONE; then it takes exactly ONE diff-CO to the NEEDIEST OTHER inch it is
+# CT-allowable for (from latest_building_CT.xlsx) and STAYS there (one-way, no revert). Subsumes the
+# per-machine 7003/7501/7002 switches. Enforced purely by flipping machine_locked_inches (the
+# _inch_gate choke point); eligibility comes from the allowable matrix. =0 → hist-lock (fixed) sets.
+_ONEWAY_INCH_GENERAL = os.environ.get("ONEWAY_INCH_GENERAL", "0") != "0"   # default OFF — MEASURED WORSE (July −33k): forcing dominant-only+1 switch beats the existing flexible hist-lock only when inches finish early, but they are curing-limited
+_ONEWAY_GEN_DONE_EPS = float(os.environ.get("ONEWAY_GEN_DONE_EPS", "1.0"))  # inch "done" when remaining ≤ this
 # KEEP_DOMINANT: a machine may ALWAYS return to its historical dominant inch (bread-and-butter);
 # the no-revert rule applies only to SECONDARY excursions. Pure one-way (=0) strands machines off
 # their main inch and regressed −36k..−58k/month, so this defaults ON.
@@ -1139,7 +1415,7 @@ _INCH_FLEX_INCLUDE_UNI_NARROW = False   # add 7501-7503 (trust DB allowable)
 # first; "demand_first" = largest remaining demand first (best amortization of
 # the expensive diff-inch CO). Tested both ways — see plan verification.
 _INCH_FLEX_OFFINCH_ORDER      = "starving_first"
-_INCH_FLEX_EXTRA_COS          = 2   # extra building-CO budget for flex machines (off-inch excursions)
+_INCH_FLEX_EXTRA_COS          = int(os.environ.get("INCH_FLEX_EXTRA_COS", "2"))   # env raises off-inch CO budget for flex machines
 
 # ── CLIENT INCH RULES (hard plant rules on building inch movement) ────────────
 # Rule 1 — one-way inch movement. A machine may take a diff_size_CO only when the
@@ -1461,15 +1737,47 @@ _CONCENTRATION = (os.environ.get("CONC_ALLOC",
 _CONC_STARV_SHIFTS = float(os.environ.get("CONC_STARV_SHIFTS",
                            str(getattr(_bc_cfg, "CONC_STARV_SHIFTS", 1.0))))
 
-# IDLE_PRESS_ACTIVATE (env IDLE_PRESS_ACT, default OFF): the authoritative curing roster is the
-# 170 presses in Master_Curing_Allowable_Machines_source (cetl.load_allowable_press_ids()). Any
-# of the 170 NOT present in the Day-0 running-moulds snapshot (idle / mid-CO / clean at 07:00 on
-# Day 1) is brought online via a cold-start curing CO (nothing -> SKU) in Day-1 Shift A, then
-# produces from Day-1 Shift B. Target = neediest allowable SKU with 2 free moulds (reuses
-# _pick_retarget). Pair with PRESS_ALLOWABLE_ONLY=1 to also DROP any running press NOT in the 170,
-# so every month simulates EXACTLY the 170 roster presses. OFF = current behaviour bit-for-bit.
+# IDLE_PRESS_ACTIVATE (env IDLE_PRESS_ACT, default ON): press roster = UNION of the Day-0
+# running-moulds snapshot and the allowable matrix (Master_Curing_Allowable_Machines_source,
+# cetl.load_allowable_press_ids()). Any allowable press NOT present in the Day-0 snapshot (idle /
+# mid-CO / clean at 07:00 on Day 1) is brought online via a cold-start curing CO (nothing -> SKU)
+# in Day-1 Shift A, then produces from Day-1 Shift B. Target = neediest allowable SKU with 2 free
+# moulds (reuses _pick_retarget). Every Day-0 snapshot press is used as-is (running ⊆ allowable).
+# OFF = no cold-start (snapshot presses only), bit-for-bit.
 _IDLE_PRESS_ACTIVATE = (os.environ.get("IDLE_PRESS_ACT",
                         "1" if bool(getattr(_bc_cfg, "IDLE_PRESS_ACTIVATE_ENABLED", False)) else "0") != "0")
+
+# NOTE (measured + REJECTED): a "dynamic supply-aware cold-start gate" that skips activating a
+# roster press when its target INCH's committed curing draw already exceeds building GT/day
+# (`_building_inch_capacity`) does NOT work. Committed curing draw ALWAYS vastly exceeds building
+# capacity (that is the entire starvation story), so the ceiling fires on every inch and over-skips
+# the HELPFUL cold-starts too. Measured net −20,685 vs activate-all (June −15,400 / Jul +1,896 /
+# Aug −1,921 / Sep −5,260). Activate-all is the best aggregate (cold-start is +31,520 net; it only
+# hurts July −4,479 via 15"/13" mould contention). July's harm is mould-pair contention, not
+# inch-supply saturation, so a building-capacity gate cannot isolate it. Kept activate-all.
+
+# MONOTONICITY experiment — building-draw per-inch cap (env BLD_DRAW_CAP, default OFF). REJECTED.
+# Idea: clamp each inch's aggregate curing-draw signal (shift_cure_demand) passed to the building
+# assigner to that inch's building GT/shift capacity, so extra presses on a building-SATURATED inch
+# cannot inflate the signal and pull machines off productive inches. MEASURED WORSE: building output
+# tracks the draw MAGNITUDE (it produces proportional to the signal), so scaling the signal DOWN
+# under-produces the high-demand inches — July WITH-852 679,499→676,126 and even the WITHOUT-852
+# baseline 686,201→685,292 (−909). The gap WIDENED (−6,702→−9,166). The non-monotonicity is a
+# machine↔inch RE-RANKING/reshuffle (propagates through Stage-1→Stage-2), NOT signal magnitude, so a
+# draw-reduction cap is the wrong lever. Kept OFF for the record.
+_BLD_DRAW_CAP = os.environ.get("BLD_DRAW_CAP", "0") != "0"
+
+# MONOTONICITY FIX — mould-contention-aware activation gate (env MOULD_CONTENTION_GATE, default
+# OFF = bit-for-bit). Root cause of "adding eligible curing presses lowers cured": scarce moulds
+# are SHARED across several demanded SKUs (e.g. the 13" QXPC0 pool = 11 moulds shared by 4 SKUs).
+# When extra eligible presses (the 852xx additions) mount those shared moulds, they DISPLACE a
+# productive press that needed them → the displaced SKU cures less (measured: 1D25215Z13008QXPC0
+# eligible presses 7→9 but cured 8,027→5,747). Building then builds less of it (downstream). The
+# gate: a mount may take a mould only if it leaves every OTHER mould-sharing DEMANDED SKU at least
+# 2 usable moulds (free or owned by a press already running it). If the only available moulds would
+# strip a sharing SKU's last pair, the mount is refused → the extra press stays idle instead of
+# displacing a productive one → adding presses can never REDUCE cured (monotonic).
+_MOULD_CONTENTION_GATE = os.environ.get("MOULD_CONTENTION_GATE", "0") != "0"
 
 # Demand-optimal machine->inch anchor pre-solve for GT machines (env INCH_ANCHOR_OPT).
 # Seeds machine_anchor_inch/inch_now/inch_since before the day loop from the shared solver
@@ -1943,10 +2251,27 @@ def _co_plan_supply(engine, demand_path: str, sku_inch: dict, planning_days: int
             buildable[s] = buildable.get(s, 0.0) + m_day
             sku_machines.setdefault(str(s), []).append(m)
             machine_la_skus.setdefault(m, set()).add(str(s))
+    # PRESS_STABLE_SINGLESRC: lock-BLIND SKU -> ALL eligible GT machines (ignores the BJ/US anchor
+    # lock, unlike sku_machines above). A sole-builder SKU (e.g. 12" 1325114812074TUHL0 → only 7501)
+    # is dropped from the lock-aware map when its one machine is anchored to a different inch, so the
+    # single-source detector needs this raw view of who can PHYSICALLY build the SKU.
+    raw_sku_machines: dict[str, list] = {}
+    for m, skus in machine_skus.items():
+        for s in skus:
+            raw_sku_machines.setdefault(str(s), []).append(m)
+    # SKU-SPECIFIC buildable GT/day for (near-)single-source SKUs (<=2 machines). Uses the
+    # per-(SKU,machine) building CT (_bld_qty_per_shift(m, s)), NOT the generic machine GT/day —
+    # e.g. 12" 1325114812074TUHL0 on 7501 builds 687/day (its CT), not 7501's generic 960/day. This
+    # is what PRESS_STABLE_SINGLESRC pins the curing draw-drain to so the planner tracks real output.
+    singlesrc_feed: dict[str, float] = {}
+    for s, ms in raw_sku_machines.items():
+        if len(ms) <= 2:
+            singlesrc_feed[s] = float(sum(_bld_qty_per_shift(m, s) * 3 for m in ms))
     return {"bjus_lock": bjus_lock, "building_inch_capacity": dict(inch_cap), "buildable": buildable,
             "inch_dem": dict(inch_dem),      # per-inch total demand (INCH18_DEFER switch_day calc)
             "feed_ctx": {"sku_machines": sku_machines, "machine_skus": machine_la_skus,
-                         "machine_gtday": machine_gtday}}
+                         "machine_gtday": machine_gtday, "raw_sku_machines": raw_sku_machines,
+                         "singlesrc_feed": singlesrc_feed}}
 
 
 def _shift_start_dt(date_str: str, shift: str) -> "datetime":
@@ -2046,41 +2371,32 @@ def _mould_in_use_rows(cure_shift_rows: list, mould_info: dict,
 
 
 def _sku_data_skip_reasons(sku, sku_machine_map=None, cure_ct_map=None,
-                           curing_allowable=None, sku_moulds=None) -> str:
-    """Data-availability diagnostics for one SKU's Demand-Fulfillment row.
+                           curing_allowable=None, sku_moulds=None,
+                           bld_matrix_skus=None, cur_master_skus=None) -> str:
+    """Skip_Reason for one SKU's Demand-Fulfillment row.
 
-    Returns a '; '-joined list of every REQUIRED input master that has NO entry for
-    this SKU (so the plan cannot fully build/cure it from the source data), or ''
-    when every input is present. Checks, in order:
-      • missing building allowable machine   — Master_Building_Allowable_Machines
-      • missing building CT                   — per-SKU building CT file (only flagged
-        when that file is enabled and the SKU is absent from it for all its machines)
-      • missing curing CT                     — cure_ct_map (curing CT master)
-      • missing curing allowable machine      — Master_Curing_Allowable_Machines
-      • missing curing mould mapping data     — Master_Mapping_Mould_SKU
-      • insufficient curing moulds (<2)       — has a mapping but <2 moulds (a press
-        needs 2), so it still cannot run
-    A map passed as None is skipped (that source isn't available in this writer)."""
+    RULE (user-specified): key ONLY on ALLOWABLE-MATRIX membership.
+      • present in the allowable matrix  → write NOTHING (blank), even if the SKU is
+        inch-locked off its inch or press-starved this snapshot (those are scheduling
+        outcomes, NOT data gaps — verified: QSTL0/LSTL0 are in the masters and cure/build).
+      • absent from the allowable matrix → write "missing from <building|curing> allowable matrix".
+    `bld_matrix_skus` = set of SKUs present in the RAW building allowable matrix (lock-blind);
+    `cur_master_skus` = set of SKUs present in the curing allowable master. When these sets are
+    supplied they are authoritative. (Legacy fallback below runs only if a set is None.)"""
     s = str(sku)
     reasons = []
-    # ── building side ──
-    if sku_machine_map is not None:
-        if not sku_machine_map.get(s):
-            reasons.append("missing building allowable machine")
-        elif _BLD_CT_SKU_MACH and not any(
-                (s, str(m)) in _BLD_CT_SKU_MACH for m in sku_machine_map.get(s, ())):
-            reasons.append("missing building CT")
-    # ── curing side ──
-    if cure_ct_map is not None and s not in cure_ct_map:
-        reasons.append("missing curing CT")
-    if curing_allowable is not None and not curing_allowable.get(s):
-        reasons.append("missing curing allowable machine")
-    if sku_moulds is not None:
-        _m = sku_moulds.get(s)
-        if not _m:
-            reasons.append("missing curing mould mapping data")
-        elif len(_m) < 2:
-            reasons.append("insufficient curing moulds (<2)")
+    # ── building: raw allowable-matrix membership only ──
+    if bld_matrix_skus is not None:
+        if s not in bld_matrix_skus:
+            reasons.append("missing from building allowable matrix")
+    elif sku_machine_map is not None and not sku_machine_map.get(s):
+        reasons.append("missing from building allowable matrix")     # legacy fallback
+    # ── curing: allowable-master membership only ──
+    if cur_master_skus is not None:
+        if s not in cur_master_skus:
+            reasons.append("missing from curing allowable matrix")
+    elif cur_master_skus is None and curing_allowable is not None and not curing_allowable.get(s):
+        reasons.append("missing from curing allowable matrix")       # legacy fallback
     return "; ".join(reasons)
 
 
@@ -2232,6 +2548,13 @@ def _stage1_carcass_schedule(bld_shift_rows: list, s1_sku_to_machines: dict,
     for (mi, tau), items in bymt.items():
         m = S1[mi]; dstr, sh = shifts[tau]
         cursor = _shift_start_dt(dstr, sh)
+        # PM/MTC: a Stage-1 carcass machine's carcass is 1-day-shelf and aged DAY-granular, so a
+        # maintenance window only needs the emitted times kept OUT of the window (done by the
+        # window-skip in `_split_rows_at_shift_boundaries`, which splits a spanning carcass run
+        # around the window in the SAME shift/day → aging unchanged). Carcass qty is NOT
+        # maintenance-reduced here (it is sized to feed Stage-2), so forcing it strictly
+        # post-window would overflow into later days and strand the Stage-2 GT it backs; the
+        # same-day split is the correct, aging-safe handling for carcass.
         for sku, q in sorted(items):
             # MPQ (shift-level floor) for Stage-1 carcass: don't emit a sub-floor carcass block.
             # This is a post-plan display render (carcass ≠ GT, not in gt_inventory), so a skip
@@ -3294,6 +3617,7 @@ def _assign_building_shift(
     fwd_work_shifts: int | None = None,          # #2 NO-PERISH: working shifts inside the GT shelf window (None → full 9)
     bridge_shifts: int = 0,                      # #3 BRIDGE: consecutive holiday shifts imminent (0 → no bridge)
     shift_budget_mins: int | None = None,        # #7 HOLIDAY_SHIFTC_CAP: per-shift minute budget override (None → SHIFT_MINS)
+    machine_down_mins: dict | None = None,        # PM/MTC: per-machine maintenance minutes lost THIS shift
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -3672,9 +3996,11 @@ def _assign_building_shift(
             return (0, -d)
 
         machines = [m for m in machine_skus if _MACHINE_GROUP.get(m, "") != "STAGE1"]
+        _mdown = machine_down_mins or {}
         stg = {
             m: {
-                "remaining": _sbud, "co_count": 0, "max_cos": _max_cos(m),
+                "remaining": max(0.0, _sbud - float(_mdown.get(str(m), 0.0))),   # PM/MTC downtime
+                "co_count": 0, "max_cos": _max_cos(m),
                 "cur_sku": machine_current_sku.get(m, ""),
                 "rate": _bld_qty_per_shift(m) / SHIFT_MINS,
                 "dom": _MACHINE_DOMINANT_INCH.get(
@@ -4520,7 +4846,7 @@ def _assign_building_shift(
         if not any(_deficit(s) > 0 for s in eligible):
             continue
 
-        remaining = _sbud
+        remaining = max(0.0, _sbud - float((machine_down_mins or {}).get(str(machine), 0.0)))   # PM/MTC
         co_count  = 0
         MAX_COS   = _max_cos(machine)
         cur_sku   = machine_current_sku.get(machine, "")
@@ -4879,6 +5205,26 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0)
                 dur = e - s
                 s = cursor
                 e = s + dur
+            # PM/MTC NO-OVERLAP (building only): the cross-shift cursor above can bump a building
+            # machine's production/CO INTO a maintenance window (e.g. a prior campaign's cross-midnight
+            # tail pushes the cursor past the window start). Keep the emitted [StartTime,EndTime] clear
+            # of the window WITHOUT dropping any quantity: production skips OVER a window (the window is
+            # an idle gap; the same production minutes resume after it, extending wall-clock — no clamp,
+            # so the sheet still reconciles to the built/cured KPI and mould feasibility). A CO
+            # (indivisible) is moved to start just AFTER any window it would collide with.
+            _mw = None
+            if _PM_MTC_NO_OVERLAP and not even_qty and e > s:
+                _w = _BLD_DOWN.get(str(r.get(mkey, "")).split(".")[0])
+                if _w and _down_mins(_w, s, e) > 0:      # only reshape a row that ACTUALLY hits a window
+                    _mw = _w
+            _is_co = _mw is not None and float(r.get("CO_Mins", 0) or 0) > 0 \
+                     and int(float(r.get("Qty", 0) or 0)) == 0
+            if _mw and _is_co:
+                _co0 = float(r.get("CO_Mins", 0) or 0)
+                for _ws, _we, *_rest in sorted(_mw):
+                    if s < _we and _ws < s + timedelta(minutes=_co0):   # CO body overlaps window → after it
+                        s = _we
+                e = s + timedelta(minutes=_co0)
             total = (e - s).total_seconds() / 60.0
             qty = float(r.get("Qty", 0) or 0)
             qfloor = int(qty)          # FLOOR: the Qty column carries NO decimals (Qty >= 0)
@@ -4886,10 +5232,42 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0)
             clean = float(r.get("Mould_Clean_Mins", 0) or 0)
             segs = []
             cur = s
-            while cur < e:
-                we = min(_win_end(cur), e)
-                segs.append((cur, we))
-                cur = we
+            if _mw and not _is_co:
+                # Lay `total` production minutes from s into the free (non-maintenance) time, skipping
+                # OVER every maintenance window (a window is an idle gap) and breaking at shift
+                # boundaries. No quantity is dropped — production resumes AFTER a window, extending
+                # wall-clock into later shifts when the window leaves no room in this one (used for
+                # Stage-1 carcass, whose long windows can cover a whole shift; GT machines are already
+                # capped to post-maintenance minutes upstream so a GT run never enters this branch).
+                # A window covering carcass same-day keeps its DAY-granular 1-day aging unchanged.
+                _rem = total
+                _guard = 0
+                while _rem > 1e-9 and _guard < 500:
+                    _guard += 1
+                    _jump = None
+                    for _ws, _we, *_rest in sorted(_mw):        # inside a window → jump to its end
+                        if _ws <= cur < _we:
+                            _jump = _we; break
+                    if _jump is not None:
+                        cur = _jump; continue
+                    _lim = _win_end(cur)                         # next shift boundary
+                    for _ws, _we, *_rest in sorted(_mw):        # or next window open, whichever first
+                        if cur < _ws < _lim:
+                            _lim = _ws; break
+                    _avail = (_lim - cur).total_seconds() / 60.0
+                    _take = min(_avail, _rem)
+                    if _take > 1e-9:
+                        segs.append((cur, cur + timedelta(minutes=_take)))
+                        _rem -= _take
+                    cur = _lim if _take >= _avail - 1e-9 else cur + timedelta(minutes=_take)
+                if not segs:                                    # defensive: nothing placed → keep 1 row
+                    segs.append((s, s))
+                e = segs[-1][1]                                 # final wall-clock end (for the cursor)
+            else:
+                while cur < e:
+                    we = min(_win_end(cur), e)
+                    segs.append((cur, we))
+                    cur = we
             # CURING even-Qty: fold in the odd tyre carried from this press's previous cure, emit
             # an EVEN Qty (whole cycles), and carry any new odd tyre forward. This preserves the
             # press's TOTAL (no per-row loss — only the very last odd tyre can strand), so the KPI
@@ -4938,7 +5316,11 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0)
             # wall-clock fragment. Fold each <mpq fragment into the adjacent piece of the SAME run
             # (total-preserving) so no sub-floor production block is EMITTED. (A whole run < mpq is
             # already prevented by the campaign-level MPQ guard; only split fragments reach here.)
-            if mpq > 0 and qfloor > 0 and len(_pieces) > 1:
+            # SKIP the fold for a PM/MTC maintenance-machine run: the fold sets StartTime=min /
+            # EndTime=max, which would merge two pieces ACROSS the maintenance-window gap and
+            # re-create the very overlap the window-skip above removed. Leaving the (few) sub-MPQ
+            # fragments as separate rows is total-preserving and keeps every row clear of the window.
+            if mpq > 0 and qfloor > 0 and len(_pieces) > 1 and not _mw:
                 _guard = 0
                 while len(_pieces) > 1 and _guard < 64:
                     _guard += 1
@@ -4981,6 +5363,9 @@ def _write_rolling_building_excel(
     carcass_waste_map: "dict | None" = None,  # {sku: expired carcass units}
     expiry_rows: "list | None" = None,        # per-(day,shift,SKU) expired GT/carcass display rows
     holiday_dates: "set | None" = None,       # #4: plant-holiday date strings → Holiday flag + idle-day rows
+    pm_mtc_rows: "list | None" = None,         # DISPLAY-ONLY MTC maintenance rows (CO_Type="MTC")
+    bld_matrix_skus: "set | None" = None,      # SKUs present in RAW building allowable matrix (Skip_Reason)
+    cur_master_skus: "set | None" = None,      # SKUs present in curing allowable master (Skip_Reason)
 ) -> None:
     """
     Write building Excel matching the legacy bc_building_schedule output.
@@ -5040,16 +5425,22 @@ def _write_rolling_building_excel(
     # building CO rows only. (Daily GT & Carcass Expired_GT/Expired_Carcass columns are a
     # separate aggregation over expiry_rows and are unaffected.)
     _EXP_TYPES = {"expired_GT", "expired_carcass"}
+    # PM/MTC: DISPLAY-ONLY MTC maintenance rows (CO_Type="MTC"), merged into the Shift
+    # Schedule for visibility only — NOT in prod_rows / KPIs / feasibility.
     _display_rows = sorted(
-        list(bld_shift_rows),
+        list(bld_shift_rows) + list(pm_mtc_rows or []),
         key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
     )
-    for ri, row in enumerate(_display_rows, 4):     # production + CO rows only
+    for ri, row in enumerate(_display_rows, 4):     # production + CO + MTC rows
         is_co  = str(row.get("SKUCode", "")).upper() in _SENTINEL
+        is_mtc = str(row.get("CO_Type", "")) in ("MTC", "PM")
         for ci, col in enumerate(bld_cols, 1):
             cell = ws.cell(row=ri, column=ci, value=row.get(col, ""))
             cell.alignment = _ctr()
-            if is_co:
+            if is_mtc:
+                cell.fill = _fill(_GREY)
+                cell.font = Font(bold=True)
+            elif is_co:
                 cell.fill = _fill(_CO)
                 cell.font = Font(bold=True)
     for col in ws.columns:
@@ -5237,7 +5628,8 @@ def _write_rolling_building_excel(
             "Presses_Needed": p_needed,
             "expired GT/carcass": _waste_cell(sku),
             "Skip_Reason": _sku_data_skip_reasons(
-                sku, sku_machine_map, cure_ct_map, curing_allowable, sku_moulds),
+                sku, sku_machine_map, cure_ct_map, curing_allowable, sku_moulds,
+                bld_matrix_skus=bld_matrix_skus, cur_master_skus=cur_master_skus),
         })
     status_colors = {"FULLY MET": _GREEN, "PARTIAL": _AMBER, "UNMET": _RED}
     pu_col_idx = dem_cols.index("Planned_Units") + 1
@@ -5300,7 +5692,7 @@ def _write_rolling_building_excel(
         if m in {"6001","6002","6003","6004","7001","7002","7003","7004"}: return "VMI"
         if m in {"7101","7102","7103","7104","7105","7106","7201"}:        return "BJ"
         if m in {"7501","7502","7503"}:                                    return "UNI_NARROW"
-        if m in {"ps3","ps4"}:                                             return "PS"
+        if m in {"ps2","ps3","ps4"}:                                       return "PS"
         if m in {"8201","8301","8302","8501","8502","7301"}:               return "Stage-2"
         return "Stage-1"
 
@@ -5337,14 +5729,14 @@ def _write_rolling_building_excel(
     # are always included regardless of whether they appear in production or CO dicts.
     # (6801/bj1stage1 removed — plant retired it → 14 Stage-1.)
     _ALL_BUILDING_MACHINES = frozenset({
-        # "6801", "ps3", "ps4"
+        # 6801 stays retired (excluded); ps3/ps4 LIVE 2026-09.
         "6802","6803","6909","6911","7601","7701",
-        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (15, incl 6801)
+        "7801","7802","7803","7804","8001","8002","8003","8101",  # Stage-1 (14)
         "8201","8301","8302","8501","8502","7301",                # Stage-2 (6)
         "7001","7002","7003","7004","6001","6002","6003","6004",  # VMI (8)
         "7101","7102","7103","7104","7105","7106","7201",         # BJ (7)
         "7501","7502","7503",                                     # UNI_NARROW (3)
-                                                      # NEW 2026-08 GT machines (2)
+        "ps2","ps3","ps4",                                        # NEW GT machines (3) — ps2=13", ps3=15", ps4=16"
     })
     all_machines = sorted(
         _ALL_BUILDING_MACHINES,
@@ -5485,6 +5877,9 @@ def _write_rolling_curing_excel(
     mould_info: "dict | None" = None,       # end-of-plan mould state for the Mould Tracker sheet
     sku_desc_map: "dict | None" = None,     # {sku: description} for the MouldInUse sheet
     sku_machine_map: "dict | None" = None,  # {sku: set(building machines)} — for Skip_Reason
+    pm_mtc_rows: "list | None" = None,       # DISPLAY-ONLY PM maintenance rows (Remarks="PM Schedule")
+    bld_matrix_skus: "set | None" = None,    # SKUs present in RAW building allowable matrix (Skip_Reason)
+    cur_master_skus: "set | None" = None,    # SKUs present in curing allowable master (Skip_Reason)
 ) -> None:
     """
     Write curing Excel matching the legacy bc_curing_b2c output.
@@ -5520,6 +5915,10 @@ def _write_rolling_curing_excel(
     # even_qty=True → every shift's cured Qty is EVEN (2 cavities = 2 tyres/cycle; a boundary
     # cycle is credited to its completion shift). Preserves per-(press,SKU) totals.
     cure_shift_rows = _split_rows_at_shift_boundaries(cure_shift_rows, "Machine", even_qty=True, mpq=_CURING_MPQ)
+
+    # PM/MTC no-overlap: relocate curing (Qty>0) rows that overlap a press's maintenance window
+    # into the free minutes of their shift (post-split; plan-neutral, quantity-preserving).
+    cure_shift_rows = _pm_relocate_curing_rows(cure_shift_rows)
 
     # ── Build priority + category lookup from df_day0 ─────────────────────────
     pri_map: dict[str, float] = {}
@@ -5567,7 +5966,8 @@ def _write_rolling_curing_excel(
             "Presses_Needed": p_needed,
             "Skip_Reason": _sku_data_skip_reasons(
                 sku, sku_machine_map, cure_ct_map, curing_allowable,
-                (mould_info or {}).get("sku_moulds")),
+                (mould_info or {}).get("sku_moulds"),
+                bld_matrix_skus=bld_matrix_skus, cur_master_skus=cur_master_skus),
         })
     for ri, r in enumerate(rows_out, 2):
         f = _fill(status_fill.get(r["Status"], _WHITE))
@@ -5649,18 +6049,26 @@ def _write_rolling_curing_excel(
                "CycleTime_min", "GT_Inventory", "Remarks"]
     _hdr(ws, 1, ss_cols)
     s_fill = {"A": _fill(_BLUE), "B": _fill(_LYELL), "C": _fill(_DGREY)}
-    for ri, r in enumerate(cure_shift_rows, 2):      # already split (single source above)
+    # PM/MTC: DISPLAY-ONLY PM maintenance rows (Remarks="PM Schedule"), merged for
+    # visibility only — NOT in any KPI / utilization / feasibility computation above.
+    _cur_display = sorted(
+        list(cure_shift_rows) + list(pm_mtc_rows or []),
+        key=lambda r: (str(r.get("StartTime", "")), str(r.get("Machine", ""))),
+    )
+    for ri, r in enumerate(_cur_display, 2):         # already split (single source above)
         st = r.get("_status", "RUNNING")
         if st == "CHANGEOVER":
             f = _fill(_ORANGE)
         elif st == "MOULD_CLEAN":
             f = _fill(_AMBER)
+        elif st == "PM_MTC":
+            f = _fill(_LGREY)
         else:
             f = s_fill.get(r.get("Shift", ""), _fill(_WHITE))
         for ci, h in enumerate(ss_cols, 1):
             cell = ws.cell(row=ri, column=ci, value=r.get(h, ""))
             cell.fill = f; cell.alignment = _ctr()
-            if st in ("CHANGEOVER", "MOULD_CLEAN"):
+            if st in ("CHANGEOVER", "MOULD_CLEAN", "PM_MTC"):
                 cell.font = Font(bold=True)
     ws.column_dimensions["A"].width = 14; ws.column_dimensions["D"].width = 32
     ws.column_dimensions["I"].width = 16; ws.freeze_panes = "A2"
@@ -6333,7 +6741,6 @@ def run_rolling_pipeline_2pass(
     build_output:   str | None = None,
     curing_output:  str | None = None,
     sku_desc_map:   dict | None = None,
-    restrict_to_allowable_presses: bool = False,
 ) -> dict:
     """Mid-month wrapper around run_rolling_pipeline (see block comment above). When
     _MIDMONTH_DEDUCT is ON and plan_start is not the 1st, runs Run 1 (full month, original demand)
@@ -6357,8 +6764,7 @@ def run_rolling_pipeline_2pass(
                   f"EFFECTIVE start {plan_start.date()} (+{planning_days}d), state date={plan_start.date()}")
     if plan_start.day == 1 or (not _MIDMONTH_DEDUCT and not _ACTUAL_PROD_DEDUCT):
         return run_rolling_pipeline(demand_path, plan_start, planning_days,
-                                    build_output, curing_output, sku_desc_map,
-                                    restrict_to_allowable_presses)
+                                    build_output, curing_output, sku_desc_map)
     if _ACTUAL_PROD_DEDUCT:
         # ── SINGLE RUN with ACTUAL SAP production (adopted path) ─────────────────────────────
         # Deduct real cured production for days 1..(start-1); run ONCE from the start date, whose
@@ -6374,7 +6780,7 @@ def run_rolling_pipeline_2pass(
               f"{sum(deducted.values()):,.0f} over {len(deducted)} SKUs deducted → single run "
               f"{plan_start.date()} +{planning_days}d (state date={plan_start.date()})")
         res = run_rolling_pipeline(_upd, plan_start, planning_days, build_output, curing_output,
-                                   sku_desc_map, restrict_to_allowable_presses)
+                                   sku_desc_map)
         res["actual_prod"] = {"deducted_total": sum(deducted.values()), "sku_count": len(deducted)}
         return res
     k_days = plan_start.day - 1                                   # already-produced days 1..k
@@ -6386,8 +6792,7 @@ def run_rolling_pipeline_2pass(
     print(f"[midmonth] mid-month start day={plan_start.day}: Run 1 full month "
           f"({run1_start.date()} +{run1_days}d), snapshot state at day {plan_start.day} (07:00)")
     res1 = run_rolling_pipeline(demand_path, run1_start, run1_days, r1_bld, r1_cur,
-                                sku_desc_map, restrict_to_allowable_presses,
-                                snapshot_at_day=plan_start.day)
+                                sku_desc_map, snapshot_at_day=plan_start.day)
     snap = res1.get("state_snapshot")
     if snap is None:
         raise RuntimeError("[midmonth] Run 1 returned no state_snapshot (snapshot_at_day missed)")
@@ -6403,7 +6808,7 @@ def run_rolling_pipeline_2pass(
           f"Run 2 ({plan_start.date()} +{planning_days}d) seeded from day-{plan_start.day} state")
     res = run_rolling_pipeline(upd_path, plan_start, planning_days,
                               build_output, curing_output, sku_desc_map,
-                              restrict_to_allowable_presses, initial_state=snap)
+                              initial_state=snap)
     res["midmonth"] = {"k_days": k_days, "run1_start": run1_start, "run1_days": run1_days,
                        "sku_count": len(simulated),
                        "cured_prior": sum(produced.values()),
@@ -6441,18 +6846,16 @@ def run_rolling_pipeline(
     build_output:   str | None = None,
     curing_output:  str | None = None,
     sku_desc_map:   dict | None = None,
-    restrict_to_allowable_presses: bool = False,
     snapshot_at_day: int | None = None,
     initial_state:   dict | None = None,
 ) -> dict:
     """
     Rolling day-by-day B2C pipeline.
 
-    restrict_to_allowable_presses (LOCAL-ONLY, default OFF): when True, drop any
-    running-moulds press that is NOT in the 170-press allowable matrix, so only
-    the allowable presses exist. local_main.py passes bc_config
-    .RESTRICT_PRESSES_TO_ALLOWABLE here; the cloud path never passes it (stays
-    False), so cloud behaviour is unaffected.
+    Press roster = the UNION of the Day-0 running-moulds snapshot and the allowable
+    matrix: every snapshot press is used (running ⊆ allowable), and allowable presses
+    absent from the snapshot are cold-started as production (IDLE_PRESS_ACTIVATE). The
+    old "drop a running press not in the allowable matrix" restriction was removed.
 
     Generates building and curing schedules simultaneously:
       - Building machines are assigned based on actual GT deficit each day
@@ -6555,22 +6958,26 @@ def run_rolling_pipeline(
                   f"{ {k: round(v) for k, v in sorted(_building_inch_capacity.items())} }")
         except Exception as _e:
             print(f"  [Rolling] co-plan supply failed ({_e})")
-    # INCH18_DEFER: compute the 7003 15→18 switch day ONCE (option b — 7003 covers only the 15"
-    # SHORTFALL the OTHER 15" machines can't; then switches to 18"). Shared with curing so both agree.
-    switch_day18 = None
-    switch_day_7002 = None
-    if _INCH18_DEFER:
-        # 7003: 16" until switch_day18-1, then → 18" (one-way). Fixed day (user rule: 18" from day 21).
-        switch_day18 = min(planning_days, int(os.environ.get("INCH18_SWITCH_DAY", "21")))
-        # 7002: 14" until its 14" SHARE (the 14" demand 6001+7004 can't cover) is done, then → 16"
-        # (one-way, no revert). Demand-driven so it adapts (July: 14" ≈ covered by 6001+7004 → early 16").
-        _d14 = float(_coplan_inch_dem.get("14", 0.0))
-        _c14_other = (_bld_qty_per_shift("6001") + _bld_qty_per_shift("7004")) * 3.0
-        _r14_7002 = max(1.0, _bld_qty_per_shift("7002") * 3.0)
-        _short14 = max(0.0, _d14 - _c14_other * planning_days)
-        switch_day_7002 = min(planning_days, max(1, math.ceil(_short14 / _r14_7002) + 1))
-        print(f"  [INCH18_DEFER] 7003: 16\" → 18\" from day {switch_day18}; "
-              f"7002: 14\" until day {switch_day_7002 - 1} → 16\" one-way (14 shortfall={_short14:.0f})")
+    # Per-machine ONE-WAY inch switches (kept even when the GENERAL rule is OFF): 7002 14"→16" and
+    # 7501 12"→13" build their dominant inch until its share is done, then flip ONCE and STAY (no
+    # revert) — stops the 14↔16 / 12↔13 ping-pong that Lever-A re-ranking otherwise causes.
+    switch_day_7002 = switch_day_7501 = None
+    if _building_inch_capacity:
+        def _oneway_switch_day(mach, dom, others_rate):
+            _d = float(_coplan_inch_dem.get(dom, 0.0))
+            _r = max(1.0, _bld_qty_per_shift(mach) * 3.0)
+            _short = max(0.0, _d - others_rate * planning_days)
+            return min(planning_days, max(1, math.ceil(_short / _r) + 1))
+        # 7002: LEFT FLEXIBLE (14"/16"), NOT one-way. Measured: its 14↔16 flexibility is PRODUCTIVE
+        # (July 705k vs 699.5k if pinned) because 14" keeps a real gap all month; an upfront one-way
+        # switch either strands 7002 on 16" (co-plan overestimates 14" coverage → day-1 switch) or on
+        # 14". The only cost of the flex is the ~585 CO-min of day-to-day churn (a runtime inch-dwell,
+        # not a one-way lock, is the right way to damp that — see the 7002 note). switch_day_7002=None.
+        # 7501: 12" until the OTHER 12" machines can cover the rest → 13" (one-way; the user's rule).
+        _cap12 = float((_building_inch_capacity or {}).get("12", 0.0))
+        switch_day_7501 = _oneway_switch_day(
+            "7501", "12", max(0.0, _cap12 - _bld_qty_per_shift("7501") * 3.0))
+        print(f"  [INCH_ONEWAY] 7501: 12\"→13\" one-way @day {switch_day_7501} (7002 left flexible 14/16)")
 
     cc_result = run_dynamic_consumption(
         demand_path=demand_path, output_path=CC_OUTPUT,
@@ -6582,7 +6989,7 @@ def run_rolling_pipeline(
         feed_ctx=_feed_ctx,
         priority_deadline_map=(priority_deadline_map if _prio_active else None),
         reactive_only=_REACTIVE_ONLY,   # Part B: skip planned schedule + CC workbook
-        switch_day18=(switch_day18 if _INCH18_DEFER else None),   # INCH18_DEFER: 18" acquisition gate
+        switch_day18=None,   # 18" defer REMOVED — 18" is built + cured from day 1 (general one-way rule)
         # STAGE 3 (mid-month): seed the CO planner from the carried day-K press positions (same as
         # the day-loop injection) so plan and execution agree. None on a normal run → Day-0 snapshot.
         initial_press_state=({
@@ -6716,6 +7123,9 @@ def run_rolling_pipeline(
                      # ONE-WAY: keep the FULL DB-allowable set eligible so any inch is reachable;
                      # the one-way + ≤2-jump discipline is enforced at runtime in _inch_gate.
                      or _ONEWAY_INCH_ENABLED
+                     # GENERAL one-way rule: keep every CT-allowable SKU eligible; machine_locked_inches
+                     # (seeded to the dominant, flipped once when done) does the per-day restriction.
+                     or _ONEWAY_INCH_GENERAL
                      or str(m) not in _MACHINE_ALLOWED_INCH_SET
                      or si in _MACHINE_ALLOWED_INCH_SET[str(m)]
                      # Lever B: keep a fixed machine's full DB-allowable set eligible so it
@@ -6746,30 +7156,18 @@ def run_rolling_pipeline(
         print(f"  [Rolling] Allowable map: failed ({_e})")
 
     # ── C: Press state ────────────────────────────────────────────────────────
+    # PRESS ROSTER = UNION of the Day-0 running-moulds snapshot AND the allowable matrix.
+    # Every press in the running-moulds snapshot is used (running presses are always in the
+    # allowable matrix); allowable presses absent from the snapshot are cold-started as
+    # production via IDLE_PRESS_ACTIVATE below (all new presses are client-confirmed ready).
+    # (The old "drop a running press not in the allowable matrix" restriction was removed —
+    # running ⊆ allowable, so it dropped nothing.)
     df_moulds = cetl.load_running_moulds()
-    # LOCAL-ONLY (default OFF): restrict the roster to the 170 allowable presses.
-    # The running-moulds snapshot occasionally carries presses NOT in the
-    # allowable matrix (e.g. Aug 85207–85215); they can never CO anywhere. When
-    # enabled, drop them here — before press_state AND the Day-0 mould seeding
-    # (both iterate df_moulds) — so their moulds return to the free pool and only
-    # the 170 allowable presses exist. Cloud never sets this flag → no-op there.
-    if restrict_to_allowable_presses:
-        try:
-            _allowed_presses = cetl.load_allowable_press_ids()
-        except Exception as _e:
-            _allowed_presses = set()
-            print(f"  [Rolling] allowable-press roster load FAILED ({_e}); "
-                  f"no press restriction applied")
-        if _allowed_presses:
-            _mcol = df_moulds["Machine"].astype(str)
-            _keep = _mcol.isin(_allowed_presses)
-            _dropped = sorted(set(_mcol[~_keep]))
-            _before = _mcol.nunique()
-            df_moulds = df_moulds[_keep].reset_index(drop=True)
-            _after = df_moulds["Machine"].astype(str).nunique()
-            print(f"  [Rolling] Press roster restricted to allowable matrix: "
-                  f"{_before} → {_after} presses "
-                  f"({len(_dropped)} dropped: {_dropped})")
+    # DIAGNOSTIC (env EXCLUDE_PRESS_PREFIX): also drop matching presses from the running snapshot
+    # so a run can fully reproduce the roster before a set of presses existed (default no-op).
+    _xpfx = tuple(p for p in os.environ.get("EXCLUDE_PRESS_PREFIX", "").split(",") if p)
+    if _xpfx:
+        df_moulds = df_moulds[~df_moulds["Machine"].astype(str).str.startswith(_xpfx)].reset_index(drop=True)
     press_state: dict[str, dict] = {}
     for _, r in df_moulds.iterrows():
         press_state[str(r["Machine"])] = {"sku": str(r["SKUCode"]), "status": "RUNNING"}
@@ -6887,6 +7285,45 @@ def run_rolling_pipeline(
     mould_events: list = []
     _cur_day = [0]
 
+    # ── Mould-contention gate (MONOTONICITY FIX) support ──────────────────────────
+    # Reverse map: mould -> set of DEMANDED SKUs eligible for it (static eligibility).
+    _mould_to_skus: dict[str, set] = defaultdict(set)
+    if _MOULD_CONTENTION_GATE:
+        for _sku_e, _ms_e in _sku_moulds.items():
+            for _m_e in _ms_e:
+                _mould_to_skus[_m_e].add(_sku_e)
+
+    def _avail_for_sku(sku: str, exclude: set) -> int:
+        """How many of `sku`'s eligible moulds remain USABLE for it if `exclude` moulds
+        are taken away: a mould counts if it is free OR already owned by a press that is
+        currently running `sku` (so `sku` keeps it). ≥2 ⇒ sku can still hold a pair."""
+        cnt = 0
+        for _m in _sku_moulds.get(sku, ()):  # small (≈ that SKU's mould list)
+            if _m in exclude:
+                continue
+            _o = _mould_owner.get(_m)
+            if _o is None or press_state.get(_o, {}).get("sku") == sku:
+                cnt += 1
+                if cnt >= 2:
+                    return cnt
+        return cnt
+
+    def _strips_claimant(chosen: list, new_sku: str) -> bool:
+        """True if mounting `chosen` for `new_sku` would drop a DIFFERENT demanded SKU that
+        shares one of these moulds below 2 usable moulds (i.e. displace a productive press)."""
+        _ch = set(chosen)
+        _seen: set = set()
+        for _m in chosen:
+            for _S in _mould_to_skus.get(_m, ()):
+                if _S == new_sku or _S in _seen:
+                    continue
+                if demand_remaining.get(_S, 0.0) <= 0:
+                    continue
+                _seen.add(_S)
+                if _avail_for_sku(_S, _ch) < 2:
+                    return True
+        return False
+
     def _try_mount(press: str, new_sku: str, defer_free: bool = False) -> bool:
         """Allocate 2 eligible moulds for `new_sku` on `press`, or return False.
 
@@ -6906,9 +7343,34 @@ def run_rolling_pipeline(
         # iteration order is hash-randomised → would break determinism.
         reuse = sorted(m for m in own if m in elig)
         free  = sorted(m for m in elig if _mould_owner.get(m) is None and m not in reuse)
-        chosen = (reuse + free)[:2]
-        if len(chosen) < 2:
-            return False
+        if _MOULD_CONTENTION_GATE:
+            # Prefer the LEAST-contended free moulds (fewest other demanded claimants), then refuse
+            # the mount if the resulting pair would strip a mould-sharing under-served SKU's last
+            # pair (displace a productive press). reuse moulds are already this press's → never strip.
+            free = sorted(free, key=lambda m: (
+                sum(1 for _S in _mould_to_skus.get(m, ())
+                    if _S != new_sku and demand_remaining.get(_S, 0.0) > 0), m))
+            chosen = (reuse + free)[:2]
+            if len(chosen) < 2:
+                return False
+            if _strips_claimant(chosen, new_sku):
+                _cand = reuse + free
+                _ok = None
+                for _i in range(len(_cand)):
+                    for _j in range(_i + 1, len(_cand)):
+                        _pair = [_cand[_i], _cand[_j]]
+                        if not _strips_claimant(_pair, new_sku):
+                            _ok = _pair
+                            break
+                    if _ok:
+                        break
+                if _ok is None:
+                    return False           # any pair would displace a productive press → stay idle
+                chosen = _ok
+        else:
+            chosen = (reuse + free)[:2]
+            if len(chosen) < 2:
+                return False
         old_extra = [m for m in own if m not in chosen]
         if defer_free:
             # keep old moulds reserved to the press (still serving old sku); free
@@ -7262,6 +7724,8 @@ def run_rolling_pipeline(
     fixed_escape_used: dict[str, int] = {}
     machine_used_inches: dict[str, set] = {}
     machine_left_skus:   dict[str, set] = {}   # SKU_NO_REVERT: SKUs each machine has built-then-left
+    _oneway_switched:    set = set()           # ONEWAY_INCH_GENERAL: machines that already took their 1 inch-switch
+    _buildable_skus:     set = (set().union(*machine_skus.values()) if machine_skus else set())  # SKUs with ≥1 allowable machine
     # machine_inch_now / machine_inch_since: the machine's CURRENT inch and the day
     # that inch campaign began — the 5-day-dwell clock (Rule: min 5 days per size).
     machine_inch_now:   dict[str, str] = {}
@@ -7552,7 +8016,11 @@ def run_rolling_pipeline(
             if not _al:
                 continue
             _elig = {sku_inch.get(_s, "") for _s in machine_skus[_m]}
-            if ((_FIXED_ESCAPE_ENABLED and str(_m) in _FIXED_MACHS_HIST)
+            if _ONEWAY_INCH_GENERAL:
+                # GENERAL one-way rule: start LOCKED to the dominant inch only; the day loop flips the
+                # lock to the neediest other allowable inch once the dominant inch's demand is done.
+                _set = {_al[0]} if _al[0] in _elig else ({next(iter(_elig))} if _elig else {_al[0]})
+            elif ((_FIXED_ESCAPE_ENABLED and str(_m) in _FIXED_MACHS_HIST)
                     or _ONEWAY_INCH_ENABLED):
                 # Lever B / ONE-WAY: permit ALL DB-allowable inches so the WHICH-gate lets the
                 # transition through; the one-way (no-revisit) + ≤2-jump discipline is enforced
@@ -8334,13 +8802,44 @@ def run_rolling_pipeline(
     _captured_state: dict | None = None            # mid-month: full state at snapshot_at_day start
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
-        # INCH18_DEFER: flip the locks one-way (the +2 CO fires via the normal Phase-B path).
-        #   7003: 16" before switch_day18, 18" from switch_day18.  7002: 14" before switch_day_7002,
-        #   16" from it. _inch_gate rejects any inch not in the set → never reverts.
-        if _INCH18_DEFER and switch_day18 is not None:
-            machine_locked_inches[_INCH18_MACHINE] = {"18"} if day >= switch_day18 else {"16"}
-            if switch_day_7002 is not None:
-                machine_locked_inches["7002"] = {"16"} if day >= switch_day_7002 else {"14"}
+        # Per-machine one-way locks (7002 14→16, 7501 12→13) — flip once on the switch day, never revert.
+        if switch_day_7002 is not None and "7002" in machine_locked_inches:
+            machine_locked_inches["7002"] = {"16"} if day >= switch_day_7002 else {"14"}
+        if switch_day_7501 is not None and "7501" in machine_locked_inches:
+            machine_locked_inches["7501"] = {"13"} if day >= switch_day_7501 else {"12"}
+        # GENERAL one-way inch rule (subsumes the old per-machine 7003/7002/7501 switches): once a
+        # machine's current (dominant) inch's servable demand is DONE, flip its lock ONE-WAY to the
+        # NEEDIEST OTHER inch it is CT-allowable for. _inch_gate then routes a normal diff-CO there;
+        # it never reverts (the machine is recorded in _oneway_switched).
+        if _ONEWAY_INCH_GENERAL and day > 1:
+            # BUILDING-done signal: an inch is "done" for a machine when every one of its SKUs on that
+            # inch already has GT built for all remaining demand (demand_remaining - gt_inventory <= 0),
+            # so no more BUILDING is needed there (curing lags, so demand_remaining alone is too late).
+            # Skip UNBUILDABLE SKUs (no allowable-matrix master data → 0 eligible machines): their
+            # demand can never be completed, so counting them would block the "inch done" check forever.
+            def _bld_rem(_msk, _i):
+                return sum(max(0.0, demand_remaining.get(_s, 0.0) - gt_inventory.get(_s, 0.0))
+                           for _s in _msk
+                           if sku_inch.get(_s, "") == _i and _s in _buildable_skus)
+            for _m in list(machine_locked_inches):
+                if _m in _oneway_switched:
+                    continue
+                _ci = machine_inch_now.get(_m) or next(iter(machine_locked_inches[_m]), None)
+                if not _ci:
+                    continue
+                _msk = machine_skus.get(_m, ())
+                if _bld_rem(_msk, _ci) > _ONEWAY_GEN_DONE_EPS:
+                    continue                                   # current inch still needs building → stay
+                _best = None; _best_rem = _ONEWAY_GEN_DONE_EPS
+                for _oi in ({sku_inch.get(_s, "") for _s in _msk} - {_ci, ""}):
+                    _r = _bld_rem(_msk, _oi)
+                    if _r > _best_rem:
+                        _best_rem = _r; _best = _oi
+                if _best is not None:
+                    machine_locked_inches[_m] = {_best}        # one diff-CO to the neediest other inch
+                    machine_inch_now[_m] = _best
+                    machine_used_inches.setdefault(_m, set()).add(_best)
+                    _oneway_switched.add(_m)
         _holiday = _is_holiday(day)                 # this whole calendar day is a plant holiday
         date     = plan_start + timedelta(days=day - 1)
         date_str = date.strftime("%Y-%m-%d")
@@ -8576,12 +9075,22 @@ def run_rolling_pipeline(
                     continue
                 if not _try_mount(_ip, _tgt, defer_free=False):
                     continue
-                press_state[_ip] = {"sku": _tgt, "status": "RUNNING"}
-                _cold.append((_ip, None, _tgt))
+                # DIRECT PRODUCTION START (no curing CO). A cold-start press has no old SKU/mould
+                # to swap out, so it is NOT a changeover: it starts RUNNING its target from Day-1
+                # Shift A and produces immediately. Kept OUT of today_cos, so it is never marked
+                # CHANGEOVER (no lost Shift A), never charged a 480-min curing CO, and never counted
+                # in the curing-CO total. Mould-life = fresh 3000 (newly mounted moulds, not a CO
+                # clean). press_count / curing_allowable updated here (the end-of-day today_cos loop
+                # no longer sees these presses).
+                press_state[_ip]  = {"sku": _tgt, "status": "RUNNING"}
+                press_count[_tgt] = press_count.get(_tgt, 0) + 1
+                curing_allowable[_tgt].append(_ip)
+                mould_life[_ip]   = MOULD_CLEAN_CYCLES
+                clean_carry[_ip]  = 0.0
+                _cold.append((_ip, _tgt))
             if _cold:
-                today_cos = list(today_cos) + _cold
                 _VERBOSE and print(f"  [Rolling] Day {day} (first working day): cold-started "
-                      f"{len(_cold)} idle press(es) {[(c[0], c[2]) for c in _cold]}")
+                      f"{len(_cold)} idle press(es) as DIRECT PRODUCTION, no CO: {_cold}")
 
         # ── Runner-Out Day-1 CO (Day 1 only) ──────────────────────────────────────
         # Plant rule: a press running a NO-DEMAND SKU at Day-0 (Runner-Out) must change over
@@ -8837,8 +9346,48 @@ def run_rolling_pipeline(
                 if (_HOLIDAY_SHIFTC_CAP and shift == "C"
                     and (day + 1) <= planning_days and (day + 1) in _holiday_days)
                 else SHIFT_MINS)
+            # MONOTONICITY FIX (BLD_DRAW_CAP): clamp the per-inch aggregate draw the building
+            # assigner sees to the inch's building GT/shift capacity, so extra presses on a
+            # saturated inch cannot inflate the signal and pull machines off productive inches.
+            _scd_for_build = dict(shift_cure_demand)
+            if _BLD_DRAW_CAP and _building_inch_capacity:
+                _inch_tot: dict = defaultdict(float)
+                for _s, _v in _scd_for_build.items():
+                    if _v > 0:
+                        _si = sku_inch.get(str(_s)) or (str(_s)[8:10] if len(str(_s)) >= 10 else "")
+                        _inch_tot[_si] += _v
+                for _i, _tot in _inch_tot.items():
+                    _cap_shift = _building_inch_capacity.get(_i, 0.0) / 3.0   # GT/day → GT/shift
+                    if _cap_shift > 0 and _tot > _cap_shift:
+                        _scale = _cap_shift / _tot
+                        for _s in _scd_for_build:
+                            if _scd_for_build[_s] > 0 and (
+                                    sku_inch.get(str(_s)) or (str(_s)[8:10] if len(str(_s)) >= 10 else "")) == _i:
+                                _scd_for_build[_s] *= _scale
+            # PM/MTC: minutes each building machine is in maintenance during THIS shift's wall-clock.
+            # Under _PM_MTC_NO_OVERLAP (default ON), production resumes STRICTLY AFTER the last
+            # maintenance window in the shift — the machine's usable minutes = the POST-maintenance
+            # free time only (the pre-maintenance gap is NOT used; a deferred remainder carries to a
+            # later shift as ordinary unmet deficit and is rebuilt there, so GT ages from its REAL
+            # post-maintenance build day). `_mprod_start` records where emission must begin.
+            _mdown = {}
+            _mprod_start = {}
+            if _PM_MTC_ENABLED and _BLD_DOWN:
+                _sh_start = date + timedelta(hours=8 * _si_now)
+                _sh_end   = _sh_start + timedelta(hours=8)
+                for _dm, _win in _BLD_DOWN.items():
+                    _dn = _down_mins(_win, _sh_start, _sh_end)
+                    if _dn <= 0:
+                        continue
+                    if _PM_MTC_NO_OVERLAP:
+                        _post_free, _post_start = _post_maint_free(_win, _sh_start, _sh_end)
+                        _mdown[_dm] = float(SHIFT_MINS) - _post_free   # usable = post-maintenance only
+                        _mprod_start[_dm] = _post_start
+                    else:
+                        _mdown[_dm] = _dn
             shift_plan = _assign_building_shift(
-                shift_cure_demand=dict(shift_cure_demand),
+                shift_cure_demand=_scd_for_build,
+                machine_down_mins=_mdown,
                 machine_skus=_ms_capped,
                 machine_current_sku=machine_current_sku,
                 sku_inch=sku_inch,
@@ -9274,7 +9823,10 @@ def run_rolling_pipeline(
             for machine, campaigns in shift_plan.items():
                 prev_sku  = machine_current_sku.get(machine, "")
                 prev_inch = sku_inch.get(prev_sku, "")
-                _cursor   = _shift_start
+                # PM/MTC POST-ONLY: a machine under maintenance this shift starts its CO/production
+                # only AFTER the maintenance window ends (its assigned qty was already capped to the
+                # post-maintenance minutes above), so the emitted timeline never touches the window.
+                _cursor   = _mprod_start.get(machine, _shift_start)
                 for _tier_idx, (sku, qty, co_type) in enumerate(campaigns):
                     # MPQ (shift-level floor): skip a sub-floor building block — do NOT CO or
                     # build it. The un-built quantity persists as unmet deficit (GT not credited)
@@ -9560,13 +10112,27 @@ def run_rolling_pipeline(
 
                 ct       = cure_ct_map.get(sku, DEFAULT_CURING_CT)
                 cap      = _cure_qty_per_shift(ct)
+                _pm_down = 0.0                                       # PM/MTC press maintenance mins
+                if _PM_MTC_ENABLED and _CUR_DOWN.get(press):
+                    _ps = date + timedelta(hours=8 * SHIFTS.index(shift))
+                    _pe = _ps + timedelta(hours=8)
+                    _pm_down = _down_mins(_CUR_DOWN[press], _ps, _pe)
+                    if _pm_down > 0:
+                        if _PM_MTC_NO_OVERLAP:
+                            # Production resumes ONLY after the window ends: usable minutes = the
+                            # POST-maintenance free time in this shift (the pre-maintenance gap is
+                            # NOT used — a deferred remainder carries to a later non-maintenance
+                            # shift, cured there against day-start-aged GT so no expired GT is used).
+                            _post_free, _ = _post_maint_free(_CUR_DOWN[press], _ps, _pe)
+                            _pm_down = SHIFT_MINS - _post_free       # effective downtime (drives _avail below)
+                        cap = cap * max(0.0, (SHIFT_MINS - _pm_down) / SHIFT_MINS)
                 gt_avail = max(0.0, gt_inventory.get(sku, 0.0))
 
                 # ── Mould-clean carry-in: a clean that began mid-shift last shift
                 # occupies the front of THIS shift. If it fills the whole shift the
                 # press is in MOULD_CLEAN (no production); otherwise production runs
                 # in the reduced remaining minutes _avail.
-                _avail    = float(SHIFT_MINS)
+                _avail    = max(0.0, float(SHIFT_MINS) - _pm_down)   # PM/MTC: downtime removes shift minutes
                 _busy_in  = 0.0    # CO/clean minutes consumed at the FRONT of this shift
                 # Per-shift CO / mould-clean minutes — surfaced as CO_Mins /
                 # Mould_Clean_Mins columns so every changeover (planned full-shift,
@@ -10187,9 +10753,10 @@ def run_rolling_pipeline(
     # Curing CO breakdown (planned schedule + reactive dynamic) and mould cleans.
     _n_co_planned = sum(1 for e in cure_co_events if e.get("CO_Type") == "Planned")
     _n_co_dynamic = sum(1 for e in cure_co_events if e.get("CO_Type") in ("Dynamic", "Early-CO"))
-    # Cold-start COs (Day-1 IDLE_PRESS_ACTIVATE) ARE charged a full 480-min changeover shift,
-    # so they must be COUNTED too — else the CO count (303) and the utilization CO-minutes
-    # (306×480) disagree. Including them makes count == minutes/480.
+    # Cold-start presses (Day-1 IDLE_PRESS_ACTIVATE) are DIRECT PRODUCTION — a fresh press with
+    # newly mounted moulds is not a changeover, so it starts RUNNING in Shift A with NO curing CO
+    # charged and emits no Cold-Start CO event. _n_co_cold is therefore 0 (kept for back-compat /
+    # any legacy event) and excluded from the CO total.
     _n_co_cold    = sum(1 for e in cure_co_events if e.get("CO_Type") == "Cold-Start")
     _n_co_total   = _n_co_planned + _n_co_dynamic + _n_co_cold
     # One event per clean trigger = the authoritative clean count (matches the
@@ -10232,6 +10799,8 @@ def run_rolling_pipeline(
         if _P3DBG:
             print(f"    [P3-debug] machine-shifts [has-room, stranded, dwell-ok, "
                   f"has-±3-SKU] = {_PLUS3_DBG}")
+    if _PM_MTC_NO_OVERLAP:
+        print(f"  PM/MTC no-overlap    : ON  (curing rows relocated out of maintenance windows; see [PM_MTC] line)")
     print(f"  Mould-blocked COs    : {mould_blocked_cos:>10,}  "
           f"(mould gate {'ON' if _mould_gate else 'OFF'})")
     print(f"  Mould-retargeted COs : {mould_retargeted_cos:>10,}  "
@@ -10433,6 +11002,25 @@ def run_rolling_pipeline(
     # ── Write Excel outputs (same format as legacy pipeline) ─────────────────
     closing_gt_bal = {sku: v for sku, v in gt_inventory.items() if v > 0}
 
+    # RAW allowable-matrix membership sets for the Demand-Fulfillment Skip_Reason
+    # (rule: present in allowable → blank; absent → "missing from allowable matrix").
+    # Lock-blind / master-level, so inch-locked or press-starved SKUs are NOT flagged.
+    try:
+        from connection import B2C_ETL as _BETL_SR
+        _bld_matrix_skus = {str(_r["SKUCode"]).strip()
+                            for _, _r in _BETL_SR(engine).load_machine_allowable().iterrows()
+                            if _r.get("Machines")}
+    except Exception as _e_sr:   # noqa: BLE001
+        print(f"  [Skip_Reason] building matrix set unavailable ({_e_sr}); legacy label")
+        _bld_matrix_skus = None
+    try:
+        _cur_master_skus = {str(_r["SKUCode"]).strip()
+                            for _, _r in cetl.load_curing_allowable().iterrows()
+                            if _r.get("Machines")}
+    except Exception as _e_sr2:  # noqa: BLE001
+        print(f"  [Skip_Reason] curing master set unavailable ({_e_sr2}); legacy label")
+        _cur_master_skus = None
+
     _write_rolling_building_excel(
         output_path    = build_output,
         bld_shift_rows = bld_shift_rows,
@@ -10454,6 +11042,9 @@ def run_rolling_pipeline(
         expiry_rows       = expiry_rows,
         holiday_dates     = {(plan_start + timedelta(days=_d - 1)).strftime("%Y-%m-%d")
                              for _d in _holiday_days},
+        pm_mtc_rows       = _pm_mtc_display_rows(plan_start, planning_days, "building"),
+        bld_matrix_skus   = _bld_matrix_skus,
+        cur_master_skus   = _cur_master_skus,
     )
     _write_rolling_curing_excel(
         output_path       = curing_output,
@@ -10489,6 +11080,9 @@ def run_rolling_pipeline(
         } if _mould_gate else None),
         sku_desc_map      = sku_desc_map,
         sku_machine_map   = sku_machine_map,
+        pm_mtc_rows       = _pm_mtc_display_rows(plan_start, planning_days, "curing"),
+        bld_matrix_skus   = _bld_matrix_skus,
+        cur_master_skus   = _cur_master_skus,
     )
 
     # Client output rule: next to every SKU-code column write its description, and

@@ -33,16 +33,10 @@ from b2c_pipeline import run_rolling_pipeline_2pass
 
 
 def main() -> dict:
-    # LOCAL-ONLY press-roster restriction (default OFF). When
-    # bc_config.RESTRICT_PRESSES_TO_ALLOWABLE is ON, only the 170 presses in the
-    # allowable matrix are used; extra running-moulds presses are dropped. The
-    # cloud path (main.py) never passes this, so cloud is unaffected.
     # 2pass wrapper: for a mid-month PLAN_START (day != 1) with MIDMONTH_DEDUCT=1 it runs a
     # full-month simulation first, deducts already-produced tyres from demand, then plans the
     # remaining period. day==1 or toggle OFF → single run, identical to before.
-    result = run_rolling_pipeline_2pass(  # bc_config defaults (demand, plan_start, days)
-        restrict_to_allowable_presses=bc_config.RESTRICT_PRESSES_TO_ALLOWABLE,
-    )
+    result = run_rolling_pipeline_2pass()  # bc_config defaults (demand, plan_start, days)
     print("\n" + "=" * 60)
     print("  LOCAL RUN COMPLETE (Excel path)")
     print("=" * 60)

@@ -138,6 +138,7 @@ class Config:
         "7001","7002","7003","7004","6001","6002","6003","6004",
         "7101","7102","7103","7104","7105","7106",
         "7201","7501","7502","7503",
+        "ps2","ps3","ps4",                 # NEW independent GT (ps2=13", ps3=15", ps4=16")
     })
 
     # Authoritative source: Master_Building_Machine_Design_cycleTime in DB.

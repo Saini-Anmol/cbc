@@ -282,11 +282,6 @@ def run_plan(plan_id: str, created_by: str = "scheduler",
         build_output=build_out,
         curing_output=curing_out,
         sku_desc_map=sku_desc,          # DB master descriptions → output sheets
-        # CLOUD↔LOCAL PARITY + feasibility: restrict curing to the 170 allowable presses,
-        # exactly like local_main.py. Without this, cloud would cure on running-moulds
-        # presses that are NOT in the allowable matrix (e.g. 85214/85215) — a feasibility
-        # violation and a source of local↔cloud divergence.
-        restrict_to_allowable_presses=getattr(_bc, "RESTRICT_PRESSES_TO_ALLOWABLE", True),
     )
 
     # ── write the 4 output tables (rules 4 & 5 applied inside write_db) ────
