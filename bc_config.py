@@ -39,7 +39,7 @@ PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 
 PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
 DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_240826.xlsx")  # per-month demand workbook
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
-PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+PLANT_HOLIDAYS = False                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
