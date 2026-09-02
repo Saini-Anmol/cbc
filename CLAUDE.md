@@ -307,6 +307,25 @@ stuck mould. Two modes (`MOULD_OPT_MODE`): `ro_only` (only sacrifice demand-done
 
 ### 7. Delivery-date / priority-flag committed-delivery SKUs — LIVE (`DELIVERY_PRIORITY`, default ON, INERT w/o data)
 
+> **2026-09 — TESTED then REVERTED OFF (current baseline = OFF).** `DELIVERY_PRIORITY_ENABLED` +
+> `DELIVERY_PRIORITY_UNDATED_TO_MONTHEND` are back **False** (were briefly True for a test). Demand file with
+> flags: `data/input/sept_priority_demand.xlsx` (22 committed SKUs, undated=EOM; flags INERT while toggles OFF).
+> Test result (priority ON): Sept cured 642,506→640,301 (−2,205); flagged-total 327,272→326,998 (**−274 = no
+> gain**), 1/22 met — flagging ALL 22 is zero-sum (they're capacity-bottleneck SKUs already at ceiling; priority
+> is a reorder lever, can't add capacity). Feasibility proof (2 agents): FXC10 & SSTL0 mould-capped; 13" pool
+> (7105/7106) oversubscribed 133%; only FXC10/QXPC0 are a recoverable Stage-1↔Stage-2 coordination logic gap.
+> See memory `project_delivery_priority`.
+>
+> **PACING lever (`PACING`, `b2c_pipeline.py` ~582, default OFF) + INCH-LOCK relax — both TESTED, NOT adopted.**
+> Pacing = small-buffer rotation (thin 1-2 shift buffer, rotate to next drawn SKU) to flatten toward plant
+> (build ~26.5k/cure ~24k/~2k carry/~48-50 SKUs-day/>90% occ). Sept ON vs OFF: cured −1,536, daily-cured CV
+> −1.2pp (flatter), expired GT −646, but SKUs/day 37 (not 48-50), occ 71% (not >90%), starvation +432. Inch-lock
+> relax (±2 band / widest): coverage moves ~0 (widest −1,183 WORSE), SKUs/day/occupancy unchanged, unmet-by-inch
+> unchanged. **VERDICT: neither pacing nor the inch-lock is the September blocker.** The ~81% ceiling is
+> **downstream CAPACITY — mould scarcity on 13"/12"/15" + the 6-machine Stage-2 carcass bottleneck** (top unmet
+> SKUs need <1 press yet stay unfed). Plant-like output needs more moulds/presses/Stage-2, not scheduling. Both
+> levers stay default OFF (gated, OFF=bit-for-bit). See memory `project_sept_capacity_ceiling`.
+
 Client feature. Two OPTIONAL demand columns — **`Priority Flag`** (`0`/`1`/`Yes`) and
 **`Delivery Date`** (`DD/MM/YY`) — make a SKU **delivery-committed**: it must be fully **cured** by
 its date (or by END OF MONTH if flagged with no date). **A valid date forces commitment even when
@@ -594,6 +613,59 @@ now HELPS). **KNOWN CAVEAT — June −7,837:** its slack profile needs a smarte
 (the `SP_SPARE_MARGIN` knob interacts badly with the monotone `_peaked` latch); pending fix. Mid-month
 / holiday / delivery-priority interactions with STATEFUL_PLAN not yet re-verified. As-of-date (DB-drift):
 always compare WITH vs WITHOUT-852 on the SAME day (`EXCLUDE_PRESS_PREFIX=852` reproduces WITHOUT).
+
+### 22. 2-day plant playback — building replays plant snapshot Days 1-2 (ADOPTED 2026-09, SUPERSEDES §21 for days 1-2)
+
+Building **exactly replays the plant day-0 snapshot for plan Days 1 AND 2, all shifts** (client hard rule),
+then the normal pipeline resumes Day 3. **This supersedes the §21 Day-1-Shift-A seed pin** (the pin is
+disabled when replay is ON). Source of truth = **`data/input/day0_plant_snapshot.xlsx`** — a full 2-day
+per-machine per-shift **SKU + qty** schedule (NOT one SKU per machine): Machine ID is **merged** (blank on a
+machine's 2nd+ SKU rows → forward-fill), each machine builds **multiple SKUs** across shifts, a shift can hold
+**>1 SKU** (in-shift CO, e.g. gtic2 D1C = 88+299), `.`=not-that-shift, skip `Carcass Total`/`Total GT`/`Total
+Green Tyre` summary rows. Parsed (plant names→ids via `S1_NAME_MAP`/`S2_NAME_MAP`, descriptions→codes via
+`last_building_a_ct.xlsx`+demand, 100% clean) into **`data/input/plant_2day_schedule.xlsx`** (272 rows,
+41 machines; cols Machine/Day/Shift/SKUCode/Qty).
+
+- **`_PLANT_2DAY_REPLAY`** (`b2c_pipeline.py` ~340, env `PLANT_2DAY_REPLAY`, default ON when the schedule
+  file exists, `=0` bit-for-bit). Config `PLANT_2DAY_SCHEDULE_FILE` (`bc_config.py` ~235). Days 1-2: bypass
+  `_assign_building_shift`, emit plant rows with **qty = min(plant_qty, floor(28800/_bld_ct_sec)) — no overbuild,
+  no carry-forward**, demand cap IGNORED; GT machines feed `gt_inventory`, Stage-1 forced to plant carcass
+  (post-plan injection ~11783), rows shift-confined (`_replay` tag passes through `_split_rows_at_shift_boundaries`
+  ~5666). Curing derives normally (snapshot is building-only). Day 3+: demand_remaining reduced by the 2-day
+  build (carried GT prevents re-build), state carries; **day≥3 respects the demand cap**.
+- **VERIFIED Days-1-2 exact match = 272/272 SKU + 272/272 qty**, 0 forced-maintenance skips (no building
+  machine has a PM/MTC window Sept 1-2). Determinism byte-identical; OFF byte-identical.
+- **KPIs (Sept, PM_MTC, hol 2026-09-17):** replay ON **cured 645,344 / built 644,617 / cov 81.60% / COs 249**;
+  OFF 646,260 / 81.72% (small dip — days 1-2 follow the plant not the optimizer).
+- **Honest artifact:** to follow the plant 100%, days 1-2 build ~10 machine→SKU pairs NOT in our
+  allowable/inch/CT files (real plant rows: 6001→HURL0, 8501→NSTL0@14", 7102→LSTL0) → feasibility R3B(2)/R4(6)/
+  R1B(2) fail **on days 1-2 only**; day≥3 clean. Add the pairs to the files to reconcile if wanted.
+- **CAVEAT:** default-ON-when-file-exists → a June/July/Aug run would also replay THIS Sept file on its days 1-2;
+  set `PLANT_2DAY_REPLAY=0` or swap the schedule file for other months. See memory `project_day1_seed_pin`.
+
+### 21. Day-1 building = plant snapshot; Shift-A hard seed pin (ADOPTED 2026-09)
+
+Day-1 building must match the plant **day-0 snapshot 100% on Shift A** (each machine builds its exact
+seed SKU); from **Shift B onward the pipeline drives freely for max KPIs** (no plant constraint,
+machines must NOT idle). Seed file = **`data/input/day1_seed_from_plant.xlsx`** (2 cols `Machine ID`/
+`SKU Code`, 41 machines), **generated from `data/input/day0_plant_snapshot.xlsx`** (plant names→ids via
+`connection.S1_NAME_MAP`/`S2_NAME_MAP`; SKU descriptions→codes via `last_building_a_ct.xlsx` +
+demand). Config path at **`bc_config.py` line 51** `DAY1_BUILDING_SEED_FILE` (→ `BLD_ACTUAL_SEED_FILE`).
+`_load_actual_seed` accepts `Machine ID`/`SKU Code` OR `Machine`/`SKUCode`; every row is a seed.
+
+- **`_BLD_SEED_PIN_D1A`** (`b2c_pipeline.py` ~335, env `BLD_SEED_PIN_D1A`, **default ON**, `=0` bit-for-bit):
+  on **day 1, Shift A only**, force every seeded machine onto its exact seed SKU. GT/Stage-2 force (~4416;
+  `_assign_building_shift` gained a `shift_idx` param, caller passes `_si_now`); Phase-B + forward-buffer
+  skip pinned machines (`_d1a_pin_lock`). **Stage-1 carcass force (~11559-11610): applied AFTER
+  `_consolidate_carcass_rows` (re-split per-shift), replaces ONLY the D1-ShiftA row** with the seed SKU at
+  normal single-shift qty — B/C untouched (earlier bug dumped whole-day carcass into A → Stage-1 idle in
+  B/C; fixed → D1B ~10/14, D1C ~6/14, ≈ pin-OFF). Stage-1 is "blind": forces seed carcass even with no
+  Stage-2 draw (un-consumed → expired carcass, accepted).
+- **Result:** D1-ShiftA **41/41** aligned; hard rules PASS (benign R2B/R5/R9C/R9G/R18B only; R9C rises from
+  forced carcass). Pin costs ~4.6k cured (Sept pin-ON 641,854 vs OFF 646,433 on the 2026-09-01 snapshot) —
+  accepted. Curing CT now `round(raw/0.94, 1)` (1-decimal, `connection.load_cycle_times`). Building matrix
+  loader needs the SKU-code column named `SKU Code` (a stray `.`/`SKU_Code` → 0 SKUs → GT built 0; loader
+  now falls back to first sheet + accepts `SKU_Code` + `"Yes"` cells). See memory `project_day1_seed_pin`.
 
 ### 20. Building allowable + CT from `latest_building_CT.xlsx` + ps3/ps4 live (ADOPTED 2026-09)
 

@@ -99,6 +99,10 @@ class ConsumptionConfig:
     CAVITIES_PER_MOULD    = 2
     LOAD_UNLOAD_BUFFER_MIN = 0
     PRESS_EFFICIENCY       = 0.94
+    # Per-press curing efficiency by press-code digit length (toggle _PRESS_EFF_BY_DIGIT,
+    # default OFF). 4-digit clean press codes cure at PRESS_EFFICIENCY (0.94); 5-digit
+    # codes cure ~2% slower → 0.92. Any other length falls back to PRESS_EFFICIENCY.
+    PRESS_EFFICIENCY_5DIGIT = 0.92
     # Default EFFECTIVE cycle time for SKUs missing from the CT master.
     # Already includes buffer + efficiency — do NOT re-apply the formula.
     DEFAULT_CYCLE_TIME_MIN = 17.0
@@ -109,6 +113,27 @@ class ConsumptionConfig:
 
     # ── database ──────────────────────────────────────────────────────────────
     DB_NAME = bc_config.ENV.get("JKT_DB_DATABASE", "jkplanningV1")
+
+
+# Per-press curing efficiency (toggle-gated, DEFAULT OFF → every press uses the flat
+# ConsumptionConfig.PRESS_EFFICIENCY = 0.94, bit-for-bit with the prior behaviour).
+# ON: a press's EFFECTIVE cure CT = per-SKU CT × (0.94 / eff(press)), where eff = 0.94
+# for a 4-digit clean press code, 0.92 for a 5-digit code (default 0.94 for any other
+# length). 5-digit presses therefore cure ~2% fewer units per shift. cure_ct_map stays
+# baked at 0.94 for display; this only scales the SIM cure capacity per press.
+_PRESS_EFF_BY_DIGIT = os.environ.get("PRESS_EFF_BY_DIGIT", "1") != "0"
+
+
+def press_efficiency(press) -> float:
+    """Curing efficiency for a press keyed by its clean numeric code (WCNAME_clean).
+    OFF (or a non-4/5-digit code) → the flat ConsumptionConfig.PRESS_EFFICIENCY (0.94);
+    ON → 0.92 for a 5-digit code, 0.94 for a 4-digit code."""
+    if not _PRESS_EFF_BY_DIGIT:
+        return ConsumptionConfig.PRESS_EFFICIENCY
+    d = str(press).strip()
+    if d.isdigit() and len(d) == 5:
+        return ConsumptionConfig.PRESS_EFFICIENCY_5DIGIT
+    return ConsumptionConfig.PRESS_EFFICIENCY      # 4-digit + any-other-length fallback
 
 
 # ══════════════════════════════════════════════════════════════════════════════

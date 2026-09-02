@@ -266,12 +266,28 @@ def load_sources():
 
     # building machine-group + inch sets (from b2c_pipeline — the CSV/inch truth)
     def _bld_helpers():
-        import b2c_pipeline as bp
+        import b2c_pipeline as bp, bc_config as _bc
         inch = getattr(bp, "_MACHINE_ALLOWED_INCH_SET", {}) or {}
-        return {
-            "MG": dict(getattr(bp, "_MACHINE_GROUP", {})),
-            "inch_set": {str(k): set(str(x) for x in v) for k, v in inch.items()},
-        }
+        _isets = {str(k): set(str(x) for x in v) for k, v in inch.items()}
+        # SEED-AWARE R4: when the Day-1 actual-production seed is on, a seeded machine's
+        # DOMINANT inch is its seed SKU's inch (historical inch is secondary by design), so
+        # union that inch in — else R4 false-flags the intended override (e.g. 7003 → 17").
+        try:
+            if getattr(_bc, "BLD_ACTUAL_SEED_ENABLED", False):
+                import pandas as _pd
+                _sd = _pd.read_excel(getattr(_bc, "BLD_ACTUAL_SEED_FILE"))
+                _sd = _sd.rename(columns={"Machine ID": "Machine", "MachineID": "Machine",
+                                          "SKU Code": "SKUCode", "SKU_Code": "SKUCode"})
+                _has_action = "Seed_Action" in _sd.columns
+                for _, _r in _sd.iterrows():
+                    if _has_action and not str(_r.get("Seed_Action", "")).startswith("SEED"):
+                        continue
+                    _m = str(_r.get("Machine", "")).strip(); _sku = str(_r.get("SKUCode", "")).strip()
+                    if _m and len(_sku) >= 10:
+                        _isets.setdefault(_m, set()).add(_sku[8:10])
+        except Exception:  # noqa: BLE001
+            pass
+        return {"MG": dict(getattr(bp, "_MACHINE_GROUP", {})), "inch_set": _isets}
     _try("bld", _bld_helpers)
 
     # building CT from the CSV ONLY (R1) — per (SKU Code, machine), seconds. No 0.94.

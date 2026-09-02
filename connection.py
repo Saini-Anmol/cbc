@@ -338,7 +338,8 @@ class ConsumptionETL:
         )
         df["CycleTime_min"] = np.round(
             (df["Raw"] + ConsumptionConfig.LOAD_UNLOAD_BUFFER_MIN)
-            / ConsumptionConfig.PRESS_EFFICIENCY
+            / ConsumptionConfig.PRESS_EFFICIENCY,
+            1,                       # keep 1 decimal (was integer) → exact effective CT
         )
         df = df[["SKUCode", "CycleTime_min"]].drop_duplicates("SKUCode")
         df["SKUCode"] = df["SKUCode"].str.strip()
@@ -649,9 +650,16 @@ class ETL:
         rule  = getattr(_bc, "BUILDING_ALLOWABLE_RULE", "yes")
         cmap  = dict(getattr(_bc, "BUILDING_ALLOWABLE_COL_MAP", {}))
         drop  = {str(c) for c in getattr(_bc, "BUILDING_ALLOWABLE_COL_DROP", set())}
-        raw = pd.read_excel(path, sheet_name=sheet, dtype=str)
-        raw = raw.rename(columns={"SKU Code": "SKUCode"})
-        _skip = {"SKU Name", "SKUCode", "Inch", "size", "Size", "Demand", "Demand "}
+        try:
+            raw = pd.read_excel(path, sheet_name=sheet, dtype=str)
+        except ValueError:
+            # configured sheet name not in this file → fall back to the first sheet
+            raw = pd.read_excel(path, sheet_name=0, dtype=str)
+        # accept both the spaced (Yuvraj) and underscored (Consolidated_Time_Matrix) headers
+        raw = raw.rename(columns={"SKU Code": "SKUCode", "SKU_Code": "SKUCode",
+                                  "SKU_Name": "SKU Name"})
+        _skip = {"SKU Name", "SKU_Name", "SKUCode", "Inch", "size", "Size",
+                 "Demand", "Demand "}
         def _mid(c):
             c = str(c).strip()
             if c in cmap:  return cmap[c]
@@ -660,8 +668,11 @@ class ETL:
             if pd.isna(v) or str(v).strip() == "":
                 return False
             if rule == "ct_present":
+                sv = str(v).strip()
+                if sv.lower() == "yes":                     # allowable, CT falls back to group default
+                    return True
                 try:
-                    return float(str(v).strip()) > 0        # a CT number present ⇒ allowable
+                    return float(sv) > 0                    # a CT number present ⇒ allowable
                 except (TypeError, ValueError):
                     return False
             return str(v).strip().lower() == "yes"

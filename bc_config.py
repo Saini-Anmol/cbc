@@ -37,17 +37,19 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 # ══════════════════════════════════════════════════════════════════════════════
 PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
 PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_240826.xlsx")  # per-month demand workbook
+DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND.xlsx")  # per-month demand workbook (priority-flag)
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
-PLANT_HOLIDAYS = False                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
+PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
 RUNNING_MOULDS_MONTH = os.environ.get("RUNNING_MOULDS_MONTH") or PLAN_START.strftime("%Y-%m")
 PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strftime("%Y-%m")
 # SINGLE building matrix file (FINAL format): building ALLOWABLE + building CT in ONE workbook.
 # A (SKU, machine) cell holding a NUMBER = allowable AND that number is its building CT; "No" = not
 # allowable. Sheet "Sheet1"; cols SKU Name / SKU Code / size / <machine cols…> (ps = 6402/6403/6404).
-BUILDING_MATRIX_FILE = os.path.join(INPUT_DIR, "Yuvraj_Matrix.xlsx")   # ← allowable + CT source (line 46)
+BUILDING_MATRIX_FILE = os.path.join(INPUT_DIR, "last_building_a_ct.xlsx")   # ← allowable + CT source (line 46)
 PM_MTC_ENABLED = os.environ.get("PM_MTC", "1") != "0"   # ← TOGGLE PM/MTC maintenance downtime ON(1)/OFF(0)  (line 50)
+DAY1_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day1_seed_from_plant.xlsx")   # ← Day-1 building seed (plant-derived): 2 cols (Machine ID, SKU Code)  (line 51)
+STICKY_HANDOFF = True; STICKY_HANDOFF_LOCK = False   # ← Day2→Day3 handoff LOCK ON: each GT machine keeps its end-of-day-2 SKU on day-3 ShiftA, excluded from Phase B/C that shift  (line 52)
 # SNAPSHOT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
 # tables carry a `date` column. The opening snapshot is ALWAYS taken from the START-OF-MONTH row
 # (f"{PLAN_MONTH}-01"), regardless of the actual plan-start day: e.g. a plan starting 2026-08-21 still
@@ -233,6 +235,13 @@ USE_REMAINING_BUILDING_MATRIX = os.environ.get("USE_REMAINING_MATRIX", "0") != "
 # PM_MTC_ENABLED is defined at line 50 (top RUN PARAMETERS block) — do not redefine here.
 PM_MTC_FILE = os.path.join(INPUT_DIR, "PM and MTC sep.xlsx")
 
+# ── 2-day plant playback (building) ─────────────────────────────────────────────
+# For plan Days 1 and 2 (all shifts A/B/C), building EXACTLY replays the plant's
+# actual day-0 snapshot from this file (cols: Machine, Day, Shift, SKUCode, Qty,
+# PlantName, PlantDesc). See b2c_pipeline._PLANT_2DAY_REPLAY (env PLANT_2DAY_REPLAY,
+# default ON when the file exists; =0 reverts bit-for-bit).
+PLANT_2DAY_SCHEDULE_FILE = os.path.join(INPUT_DIR, "plant_2day_schedule.xlsx")
+
 BLD_CT_FILE_ENABLED = True
 # CORRECT building-CT source (per-(SKU,machine) sec/unit). Loader reads .xlsx or .csv by
 # extension (b2c_pipeline._load_bld_ct_file). The old *_Cycle_time_Building.csv variants are
@@ -403,6 +412,21 @@ FIXED_ESCAPE_MAX_COS  = int(os.environ.get("FIXED_ESCAPE_MAX_COS", "1"))
 # DOMINANT inch (from the file above). Verified: 0 forced initial COs. Env
 # BLD_START_FREE overrides. See b2c_pipeline._BLD_START_FREE / _anchor_seed_inch.
 BLD_START_FREE_ENABLED = True
+
+# ── Day-1 building machine→SKU seed from ACTUAL plant production (env BLD_ACTUAL_SEED) ──
+# Each building machine starts Day-1 on the SKU it was ACTUALLY building in the latest plant
+# production (a seed), so Day-1 doesn't reshuffle / create artificial building changeovers.
+# The seeded SKU's inch becomes the machine's DOMINANT/anchor inch (replacing the historical
+# inch-lock for that machine), and the deficit-done + diff-CO machinery then takes over once
+# the seed inch's demand is done. Takes PRECEDENCE over BLD_START_FREE for the seeded machines.
+# Default ON; BLD_ACTUAL_SEED=0 → bit-for-bit current (free/DB start) behaviour.
+# Seed source = data/input/day1_building_seed.xlsx — a SIMPLE 2-column sheet (Machine, SKUCode),
+# one row per building machine and the SKU it is currently building. EDIT THIS FILE to change a
+# Day-1 assignment (change the SKUCode against a Machine, or add/remove a machine row). A machine
+# NOT listed falls back to normal (curing-optimal) allocation. Every row is a seed (no flag column
+# needed; a legacy Seed_Action column, if present, is still honoured for back-compat).
+BLD_ACTUAL_SEED_ENABLED = os.environ.get("BLD_ACTUAL_SEED", "1") != "0"
+BLD_ACTUAL_SEED_FILE = DAY1_BUILDING_SEED_FILE   # ← path defined at line 51
 
 # ── Daily running-moulds ETL table (Day-0 curing press state) ────────────────
 # SINGLE SOURCE OF TRUTH for which running-moulds snapshot the plan starts from.
@@ -798,6 +822,18 @@ DYN_BUF_CURE_CREDIT = 1.0
 # candidate set; scarcity + over-buffer are structural indicators. Graded inch
 # penalty uses the machine's ranked dominant band. OFF (default) or env
 # GLOBAL_SCORE_V2=0 → the committed _key path, bit-for-bit. Weights tuned by sweep.
+# ── BLD_CURABLE_CAP (default ON) — no-waste-GT bound (invariant #4) ──────────────
+# A building machine must not build a SKU faster than its curing side can consume, or
+# the excess GT ages out (3-day shelf) as expired waste. Acute for single-source / PS
+# machines captive to ONE SKU with only 1-2 eligible curing presses (e.g. ps2 → TUXPE):
+# captive-max builds to the full DEMAND cap while 1 press cures a fraction of it. The
+# lever bounds the captive-max / sticky build by the SKU's CURABLE ceiling = min( live
+# curing-draw over the 3-day shelf (contention-aware), month curable = simul-presses ×
+# cure_rate/shift × 3 × working_days ). Never under-builds a genuinely curable SKU (the
+# 3-day forward buffer is preserved). Set False (or env BLD_CURABLE_CAP=0) to revert
+# bit-for-bit. Toggle/logic in b2c_pipeline.py (_curable_cap).
+BLD_CURABLE_CAP = True
+
 GLOBAL_SCORE_V2 = False
 GS_W_DEF     = 1.0    # ñ this-shift (dynamic-buffer) deficit          (pull)
 GS_W_STARV   = 1.0    # ñ near-dry starvation 1/(gt/draw+eps)          (pull)
