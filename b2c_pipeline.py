@@ -362,6 +362,7 @@ _STICKY_HANDOFF_LOCK = os.environ.get(
 _PLANT_SET_LOCK = os.environ.get(
     "PLANT_SET_LOCK",
     "1" if getattr(_bc_cfg, "PLANT_SET_LOCK", False) else "0") != "0"
+# (mid-month activation boundary _PLANT_SET_LOCK_FROM is defined below, after _PLANT_2DAY_DAYS)
 # STARVING-PRESS CO BYPASS: allow a SAME-INCH building changeover past the 30%-of-remaining CO-cost
 # guard when the target SKU's curing presses are RUNNING but STARVED (live draw, no GT on hand or
 # built this shift, demand remaining). Otherwise a machine with a half-used shift idles its residual
@@ -576,6 +577,18 @@ _PLANT_2DAY_REPLAY = (
     and bool(_PLANT_2DAY_FILE) and os.path.exists(_PLANT_2DAY_FILE)
     and int(getattr(getattr(_bc_cfg, "PLAN_START", None), "day", 1) or 1) == 1)
 _PLANT_2DAY_DAYS = 2                       # replay covers plan days 1..2 (all shifts)
+# PLANT_SET_LOCK mid-month activation boundary. The gate is `day > _PLANT_SET_LOCK_FROM`, where
+# `day` is the PLAN-day index. For a 1st-of-month start, plan days 1-2 ARE the plant replay, so
+# the lock correctly starts at plan day 3 (= _PLANT_2DAY_DAYS) — unchanged, bit-for-bit. For a
+# MID-MONTH start the plant days already physically happened (production deducted from demand,
+# replay off), so every PLANNED day is "after" them and the lock must govern from plan day 1 —
+# otherwise the first two planned days run unlocked and then snap onto the plant set, churning
+# machines. Env PSL_MIDMONTH_FROM_DAY1=0 reverts to the verbatim bc_lp boundary (for A/B).
+_PSL_FROM_DAY1 = os.environ.get("PSL_MIDMONTH_FROM_DAY1", "1") != "0"
+_PLANT_SET_LOCK_FROM = (
+    0 if (_PSL_FROM_DAY1
+          and int(getattr(getattr(_bc_cfg, "PLAN_START", None), "day", 1) or 1) != 1)
+    else _PLANT_2DAY_DAYS)
 _PLANT_2DAY_BY_DS: dict = None             # {(day:int, shift:str): [(machine, sku, qty), ...]} — lazy
 
 
@@ -5315,7 +5328,7 @@ def _assign_building_shift(
         # spare gate no machine ever builds them → they starve (e.g. STMX0 / TUHL0(75)/(77)
         # allowable only on 7502+7503). These are allowed through the plant gate as spare.
         _sole_builder_skus: set = set()
-        if _PLANT_SET_LOCK and day > _PLANT_2DAY_DAYS and _mps:
+        if _PLANT_SET_LOCK and day > _PLANT_SET_LOCK_FROM and _mps:
             _sku_feeders: dict = defaultdict(set)
             for _mm, _sk_set in machine_skus.items():
                 for _sk in _sk_set:
@@ -5332,7 +5345,7 @@ def _assign_building_shift(
             # PLANT-FIRST, SPARE→OTHERS: a plant-set SKU is always allowed (fed first, never removed);
             # a NON-plant SKU is allowed only as SPARE — when no plant-set SKU still needs building
             # this shift (all their per-shift draw is met).
-            if not (_PLANT_SET_LOCK and day > _PLANT_2DAY_DAYS):
+            if not (_PLANT_SET_LOCK and day > _PLANT_SET_LOCK_FROM):
                 return True
             _ps = _mps.get(str(_m))
             if not _ps or _plant_set_done(_m):
