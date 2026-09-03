@@ -35,9 +35,12 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 9, 1, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 30                              # days in the plan horizon (30 June / 31 Jul/Aug)
-DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND.xlsx")  # per-month demand workbook (priority-flag)
+PLAN_START    = datetime(2026, 9, 3, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 28                              # 3 Sep .. 30 Sep inclusive (mid-month start)
+# Mid-month demand: original Sept demand MINUS the plant's actual 2-day curing production
+# (Curing_Production_2days.xlsx), deducted ONCE per SKU and re-allocated proportionally across
+# duplicate MTS/MTO rows. Original file BTP_SEPT26_DEMAND.xlsx is retained untouched.
+DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_minus_2day_prod.xlsx")
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
 PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
@@ -48,7 +51,13 @@ PLAN_MONTH           = os.environ.get("PLAN_MONTH")           or PLAN_START.strf
 # allowable. Sheet "Sheet1"; cols SKU Name / SKU Code / size / <machine cols…> (ps = 6402/6403/6404).
 BUILDING_MATRIX_FILE = os.path.join(INPUT_DIR, "last_building_a_ct.xlsx")   # ← allowable + CT source (line 46)
 PM_MTC_ENABLED = os.environ.get("PM_MTC", "1") != "0"   # ← TOGGLE PM/MTC maintenance downtime ON(1)/OFF(0)  (line 50)
-DAY1_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day1_seed_from_plant.xlsx")   # ← Day-1 building seed (plant-derived): 2 cols (Machine ID, SKU Code)  (line 51)
+# Building carry-in seed (plant-derived): 2 cols (Machine ID, SKU Code) = what each building
+# machine is ALREADY running as the plan's first day begins. Used VERBATIM for a 1st-of-month
+# start. For a MID-MONTH start the engine ignores this file and DERIVES the carry-in from the
+# end of the plant's last replayed day in PLANT_2DAY_SCHEDULE_FILE
+# (b2c_pipeline._derive_seed_from_plant_2day) — the day-1 state is the wrong state once the
+# plant has already run those days. This file is the fallback if that derivation fails.
+DAY1_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day1_seed_from_plant.xlsx")
 STICKY_HANDOFF = True; STICKY_HANDOFF_LOCK = False   # ← Day2→Day3 handoff LOCK ON: each GT machine keeps its end-of-day-2 SKU on day-3 ShiftA, excluded from Phase B/C that shift  (line 52)
 SAME_GROUP_SOFT_A = True   # ← SOFT-A group-allocation DEFAULT (b2c_pipeline.py): SAME_GROUP soft "one SKU→one machine group" rule ON, but SOFT (SG_HARD=0, foreign builds allowed rather than hard-dropped); same-shift multi-group guard stays HARD (SG_SAMESHIFT_HARD, rule 3); deliberate cross-group move-gate stays OFF (SG_MOVE_ADMIT). Env SAME_GROUP=0 fully disables (bit-for-bit OFF baseline); SG_HARD=1 / SG_MOVE_ADMIT=1 still work for A/B.  (line 53)
 SAME_GROUP_SOFT_A_EXEMPT_SKUS = ["1225170015012LSTL0"]   # ← EXCEPTION to SAME_GROUP_SOFT_A: these SKUs are EXEMPT from the one-SKU→one-group rule and may be built on ANY allowable machine across groups (incl. simultaneously in different groups the same shift). All SAME_GROUP penalties/HARD guards (home-pen, deliberate move-gate, same-shift-multi-group, SG_HARD drop) are bypassed for a listed SKU; every other constraint (demand cap, inch-lock, mould feasibility, CT) still applies. Env SG_EXEMPT_SKUS (comma-separated) overrides.  (line 54)
@@ -86,12 +95,13 @@ if DELIVERY_DATE_ALL_SOFT_RULES_RELAXED and PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULE
         "bc_config: DELIVERY_DATE_ALL_SOFT_RULES_RELAXED and "
         "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED are MUTUALLY EXCLUSIVE — enable only ONE.")
 # SNAPSHOT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
-# tables carry a `date` column. The opening snapshot is ALWAYS taken from the START-OF-MONTH row
-# (f"{PLAN_MONTH}-01"), regardless of the actual plan-start day: e.g. a plan starting 2026-08-21 still
-# seeds from the 2026-08-01 snapshot (if the DB holds both 08-01 and 08-21 rows, the 08-01 one wins).
-# The real PLAN dates (PLAN_START / PLANNING_DAYS) are UNCHANGED — only the snapshot source is
-# start-of-month. Env overridable. A 1st-of-month start is already "-01", so local runs stay identical.
-PLAN_DATE            = os.environ.get("PLAN_DATE")            or f"{PLAN_MONTH}-01"
+# tables carry a `date` column. The opening snapshot is taken from the PLAN-START DATE itself, so a
+# mid-month plan seeds from the plant's REAL state on that day: a plan starting 2026-09-03 seeds from
+# the 2026-09-03 snapshot (not 2026-09-01). A 1st-of-month start is already "-01", so full-month runs
+# are unchanged / bit-for-bit. If the exact date has no running-moulds rows, connection._resolve_snapshot
+# falls back to the NEAREST PRIOR date in the table (then to SNAPSHOT_FALLBACK_MONTH) — the plant does
+# not load a snapshot for every calendar day. Env `PLAN_DATE` overrides.
+PLAN_DATE            = os.environ.get("PLAN_DATE")            or PLAN_START.strftime("%Y-%m-%d")
 # Fallback month for the opening snapshot: if the requested plan_month has NO running-moulds rows
 # for its "-01" date, running-moulds + opening GT + opening carcass ALL fall back to this month's
 # "-01" snapshot together (see connection._resolve_snapshot). The PLAN dates stay as entered.

@@ -886,11 +886,12 @@ def _sql(engine, q: str) -> pd.DataFrame:
 # ── opening-snapshot date resolver (start-of-month + fallback) ─────────────────────────
 # Decides ONE effective snapshot date used by ALL opening-state queries (running-moulds +
 # opening GT + opening carcass) so they seed from the SAME date and fall back TOGETHER.
-#   • Start-of-month: the snapshot is always taken from f"{PLAN_MONTH}-01", regardless of the
-#     actual plan-start day (the real plan dates PLAN_START/PLANNING_DAYS stay as entered; only
-#     the snapshot source is start-of-month).
-#   • Fallback: if Daily_Running_Moulds (RUNNING_MOULDS_TABLE) has NO rows for that "-01" date,
-#     running-moulds + GT + carcass ALL fall back to SNAPSHOT_FALLBACK_MONTH's "-01" snapshot.
+#   • Plan-start date: the snapshot is taken from PLAN_DATE (= the plan-start day), so a mid-month
+#     plan seeds from the plant's REAL state that day (e.g. start 2026-09-03 → the 09-03 snapshot).
+#     A 1st-of-month start resolves to "-01" exactly as before (full-month runs unchanged).
+#   • Fallback: exact date missing → NEAREST PRIOR date (<= requested) in RUNNING_MOULDS_TABLE;
+#     if none exists at all → SNAPSHOT_FALLBACK_MONTH's "-01". running-moulds + GT + carcass
+#     always fall back TOGETHER (they all read the single PLAN_DATE global set here).
 # It rebinds the module-global PLAN_DATE; every snapshot query below reads PLAN_DATE, so setting
 # it here steers all of them at once. The decision is cached (keyed on the UNMUTATED requested
 # PLAN_MONTH) so the DB COUNT runs once and re-entrant calls are free; a new run for a different
@@ -899,13 +900,23 @@ _SNAPSHOT_RESOLVED = None   # (requested_month, effective_date, effective_month)
 
 def _resolve_snapshot(engine):
     """Resolve + cache the effective opening-snapshot date; rebind module-global PLAN_DATE.
-    Returns the effective 'YYYY-MM-01' date string."""
+
+    Resolution order for the REQUESTED date (= PLAN_DATE, i.e. the plan-start day):
+      1. exact date present in RUNNING_MOULDS_TABLE  → use it (mid-month supported);
+      2. else NEAREST PRIOR date (<= requested) in the same month → use it
+         (the plant does not load a snapshot every calendar day);
+      3. else nearest prior date in ANY month        → use it;
+      4. else SNAPSHOT_FALLBACK_MONTH's "-01".
+    Returns the effective 'YYYY-MM-DD' date string.
+    """
     global _SNAPSHOT_RESOLVED, PLAN_DATE, RUNNING_MOULDS_MONTH
-    requested_month = PLAN_MONTH
-    if _SNAPSHOT_RESOLVED is not None and _SNAPSHOT_RESOLVED[0] == requested_month:
+    req_date = PLAN_DATE or f"{PLAN_MONTH}-01"
+    # cache keyed on the REQUESTED DATE (not the month) so two mid-month runs in one
+    # process for the same month cannot reuse each other's snapshot.
+    if _SNAPSHOT_RESOLVED is not None and _SNAPSHOT_RESOLVED[0] == req_date:
         return _SNAPSHOT_RESOLVED[1]
-    req_date = f"{requested_month}-01"
-    eff_month, eff_date = requested_month, req_date
+    eff_date = req_date
+    eff_month = str(req_date)[:7]
     try:
         n = int(_sql(engine,
             f"SELECT COUNT(*) AS n FROM {DB}.{RUNNING_MOULDS_TABLE} "
@@ -914,16 +925,29 @@ def _resolve_snapshot(engine):
         print(f"[snapshot] resolver COUNT failed ({exc}); using requested {req_date}")
         n = 1
     if n == 0:
-        eff_month = SNAPSHOT_FALLBACK_MONTH
-        eff_date  = f"{SNAPSHOT_FALLBACK_MONTH}-01"
-        print(f"[snapshot] plan_month {requested_month} has no running-moulds "
-              f"→ FALLBACK to {SNAPSHOT_FALLBACK_MONTH} snapshot ({eff_date})")
+        prior = None
+        try:                                                     # nearest prior date <= requested
+            _p = _sql(engine,
+                f"SELECT MAX(date) AS d FROM {DB}.{RUNNING_MOULDS_TABLE} "
+                f"WHERE date <= '{req_date}'")["d"].iloc[0]
+            prior = None if _p is None else str(_p)[:10]
+        except Exception as exc:
+            print(f"[snapshot] nearest-prior lookup failed ({exc})")
+        if prior:
+            eff_date, eff_month = prior, prior[:7]
+            print(f"[snapshot] requested {req_date} has no running-moulds "
+                  f"→ NEAREST PRIOR snapshot {eff_date}")
+        else:
+            eff_month = SNAPSHOT_FALLBACK_MONTH
+            eff_date  = f"{SNAPSHOT_FALLBACK_MONTH}-01"
+            print(f"[snapshot] requested {req_date} has no running-moulds and no prior date "
+                  f"→ FALLBACK to {SNAPSHOT_FALLBACK_MONTH} snapshot ({eff_date})")
     else:
-        print(f"[snapshot] plan_month {requested_month} → snapshot {eff_date} "
+        print(f"[snapshot] requested {req_date} → snapshot {eff_date} "
               f"({n} running-moulds rows)")
     PLAN_DATE = eff_date                    # steers all 9 snapshot queries (they read this global)
     RUNNING_MOULDS_MONTH = eff_month        # effective plan_month (cosmetic; unused downstream)
-    _SNAPSHOT_RESOLVED = (requested_month, eff_date, eff_month)
+    _SNAPSHOT_RESOLVED = (req_date, eff_date, eff_month)
     return eff_date
 
 def _load_cycle_times(engine) -> dict:

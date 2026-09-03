@@ -539,9 +539,13 @@ _BLD_SEED_PIN_D1A = _BLD_ACTUAL_SEED and os.environ.get(
 # emit CARCASS rows; GT machines add to gt_inventory. Default ON when the file exists;
 # PLANT_2DAY_REPLAY=0 reverts bit-for-bit. Supersedes the Day-1 Shift-A seed pin on days 1-2.
 _PLANT_2DAY_FILE = str(getattr(_bc_cfg, "PLANT_2DAY_SCHEDULE_FILE", "") or "")
+# MID-MONTH GUARD: the schedule file's `Day` column is a PLAN-DAY index (1,2) describing the
+# month's first two days. On a mid-month start, plan-day 1 is NOT the 1st, so replaying it would
+# stamp the 1st-2nd's plant schedule onto the start date. Only replay for a 1st-of-month start.
 _PLANT_2DAY_REPLAY = (
     os.environ.get("PLANT_2DAY_REPLAY", "1") != "0"
-    and bool(_PLANT_2DAY_FILE) and os.path.exists(_PLANT_2DAY_FILE))
+    and bool(_PLANT_2DAY_FILE) and os.path.exists(_PLANT_2DAY_FILE)
+    and int(getattr(getattr(_bc_cfg, "PLAN_START", None), "day", 1) or 1) == 1)
 _PLANT_2DAY_DAYS = 2                       # replay covers plan days 1..2 (all shifts)
 _PLANT_2DAY_BY_DS: dict = None             # {(day:int, shift:str): [(machine, sku, qty), ...]} — lazy
 
@@ -658,6 +662,50 @@ def _load_actual_seed(path: str) -> dict[str, str]:
             continue
         seed[_m] = _sku
     return seed
+
+
+def _derive_seed_from_plant_2day(path: str = None) -> dict[str, str]:
+    """MID-MONTH carry-in: derive {Machine: SKUCode} = each building machine's SKU at the
+    END of the plant's last replayed day, from PLANT_2DAY_SCHEDULE_FILE.
+
+    Why this exists: on a mid-month start the plant has already run days 1..K and the plan
+    begins at day K+1, which must CONTINUE what each machine was building — not start free
+    and not replay days 1..K (their production is already deducted from demand). The
+    static day-1 seed file is the WRONG state for that (it is the state before those days
+    ran). This derives the correct carry-in straight from the plant schedule, so no
+    hand-made file is needed and it stays correct when the plant file is refreshed.
+
+    Per machine: take its LAST row on the MAX `Day` present (shift order A<B<C, and the
+    last row within that shift), i.e. the SKU it ends the plant window on.
+    Returns {} if the file is absent/unreadable (caller falls back to the seed file).
+    """
+    path = path or _PLANT_2DAY_FILE
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        _d = pd.read_excel(path)
+    except Exception as _e:
+        print(f"  [Rolling] PLANT_2DAY carry-in: load FAILED ({_e}) → falling back to seed file")
+        return {}
+    _cols = {str(c).strip().lower(): c for c in _d.columns}
+    _mc, _sc = _cols.get("machine"), _cols.get("skucode") or _cols.get("sku code")
+    _dc, _sh = _cols.get("day"), _cols.get("shift")
+    if not all((_mc, _sc, _dc, _sh)):
+        print(f"  [Rolling] PLANT_2DAY carry-in: unexpected columns {list(_d.columns)} → skipped")
+        return {}
+    _d = _d.copy()
+    _d["_ord"] = _d[_sh].astype(str).str.strip().str.upper().map({"A": 0, "B": 1, "C": 2}).fillna(0)
+    _last_day = pd.to_numeric(_d[_dc], errors="coerce").max()
+    _d = _d[pd.to_numeric(_d[_dc], errors="coerce") == _last_day]
+    _d = _d.reset_index().sort_values(["_ord", "index"])          # stable: shift, then row order
+    out: dict[str, str] = {}
+    for _, r in _d.iterrows():                                     # later rows overwrite → last wins
+        _m, _s = str(r[_mc]).strip(), str(r[_sc]).strip()
+        if _m and _m.lower() != "nan" and _s and _s.lower() != "nan":
+            out[_m] = _s
+    print(f"  [Rolling] PLANT_2DAY carry-in: derived {len(out)} machine→SKU from end of plant "
+          f"day {int(_last_day)} ({os.path.basename(path)})")
+    return out
 
 # EXPERIMENT: captive-first ordering. A captive building machine (eligible for
 # exactly ONE SKU, e.g. 7301 -> only LSTL0) sits idle whenever flexible machines
@@ -9453,7 +9501,16 @@ def run_rolling_pipeline(
     _seed_gt: dict[str, str] = {}                     # GT machines actually seeded (for inch override below)
     _seed_s1: dict[str, str] = {}                     # Stage-1 machines actually seeded
     if _BLD_ACTUAL_SEED and initial_state is None:
-        _sd = _load_actual_seed(_BLD_ACTUAL_SEED_FILE)
+        # MID-MONTH: when the plan does NOT start on the 1st, the plant has already run the
+        # first days and the replay is off (its Day column is a plan-day index) — so the
+        # carry-in state is the END of the plant's last replayed day, derived from
+        # PLANT_2DAY_SCHEDULE_FILE. Falls back to the static seed file if that is unavailable.
+        # A 1st-of-month start keeps the static Day-1 seed exactly as before (bit-for-bit).
+        _sd = {}
+        if int(getattr(plan_start, "day", 1) or 1) != 1:
+            _sd = _derive_seed_from_plant_2day()
+        if not _sd:
+            _sd = _load_actual_seed(_BLD_ACTUAL_SEED_FILE)
         _n_seed = _n_drop_allow = _n_drop_dem = 0
         for _m, _sku in _sd.items():
             _m = str(_m); _sku = str(_sku)

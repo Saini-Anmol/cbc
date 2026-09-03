@@ -216,11 +216,11 @@ def _set_plan_month(plan_start) -> None:
     binds the value (both already-imported and lazily-imported later).
     """
     pm = plan_start.strftime("%Y-%m")
-    pd_ = f"{pm}-01"                                 # START-OF-MONTH snapshot key for the `date`-column ETL
-    #   The opening snapshot (running-moulds + opening GT/carcass) is ALWAYS taken from the 1st of the
-    #   plan's month, regardless of the actual plan-start day (the real plan dates stay as entered).
-    #   A later _resolve_snapshot(engine) may redirect this to the fallback month if the requested
-    #   month has no running-moulds rows.
+    pd_ = plan_start.strftime("%Y-%m-%d")            # PLAN-START-DATE snapshot key for the `date`-column ETL
+    #   The opening snapshot (running-moulds + opening GT/carcass) is taken from the PLAN-START DAY,
+    #   so a mid-month cloud plan seeds from the plant's real state that day. A 1st-of-month start
+    #   resolves to "-01" exactly as before. A later _resolve_snapshot(engine) redirects this to the
+    #   nearest PRIOR snapshot date (then the fallback month) when the exact date has no rows.
     os.environ["PLAN_MONTH"] = pm
     os.environ["RUNNING_MOULDS_MONTH"] = pm
     os.environ["PLAN_DATE"] = pd_
