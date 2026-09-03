@@ -352,6 +352,35 @@ _STICKY_HANDOFF_LOCK = os.environ.get(
     "STICKY_HANDOFF_LOCK",
     "1" if getattr(_bc_cfg, "STICKY_HANDOFF_LOCK", False) else "0") != "0"
 
+# ── PLANT_SET_LOCK: each GT machine committed to its plant Days-1-2 SKU SET (day 3+) ──────
+# From day 3 on, a GT-producing machine (VMI/BJ/Unistage/PS + Stage-2) may build ONLY the
+# SKUs the plant ran on it in Days 1-2 (its 1-3 SKUs) — fed first, rotating among them, never
+# abandoned — until every one of those SKUs is demand-complete, after which the machine is
+# RELEASED to its full allowable matrix. Spare/idle capacity (Phase C) still serves other
+# SKUs. Stage-1 is EXCLUDED (its carcass auto-follows the Stage-2 SKUs). Days 1-2 are the
+# plant replay (assigner bypassed). PLANT_SET_LOCK=0 → empty set → identity, bit-for-bit OFF.
+_PLANT_SET_LOCK = os.environ.get(
+    "PLANT_SET_LOCK",
+    "1" if getattr(_bc_cfg, "PLANT_SET_LOCK", False) else "0") != "0"
+# STARVING-PRESS CO BYPASS: allow a SAME-INCH building changeover past the 30%-of-remaining CO-cost
+# guard when the target SKU's curing presses are RUNNING but STARVED (live draw, no GT on hand or
+# built this shift, demand remaining). Otherwise a machine with a half-used shift idles its residual
+# minutes rather than pay a cheap same-inch CO to feed its own empty presses (e.g. 7503→TUHL0-73).
+# Same-inch only + demand/curable-capped → no waste-GT risk. Env CO_STARVE_BYPASS=0 reverts.
+_CO_STARVE_BYPASS = os.environ.get(
+    "CO_STARVE_BYPASS",
+    "1" if getattr(_bc_cfg, "CO_STARVE_BYPASS", True) else "0") != "0"
+# SPARE-RELEASE threshold (units): a locked machine may ALSO build other curing-drawn SKUs in a
+# shift once its plant-set SKUs can no longer use a meaningful chunk of its time — i.e. their best
+# residual draw-deficit is below this many units (a machine can't fill a real campaign with them
+# because other machines already feed them). The plant SKU is NEVER removed (stays the committed
+# primary, rebuilt whenever it regains real draw); only the machine's IDLE time goes to others.
+# Fixes the single-heavily-shared-never-completing-SKU strand (e.g. 7106 → SUNE1). 0 → old strict
+# gate (spare only when plant deficit is exactly 0). Env PLANT_SPARE_MIN_UNITS overrides.
+_PLANT_SPARE_MIN_UNITS = float(os.environ.get(
+    "PLANT_SPARE_MIN_UNITS", str(getattr(_bc_cfg, "PLANT_SPARE_MIN_UNITS",
+                                         getattr(_bc_cfg, "MIN_CAMPAIGN_UNITS", 40)))))
+
 # ── Idle-recoverability diagnostic (env IDLE_DIAG=1, read-only, plan-neutral) ──
 # For each (machine, shift) with meaningful idle time, decide whether a REACHABLE
 # SKU (allowable + in ±2 band + dwell-OK) with a live press draw and a GT deficit
@@ -581,6 +610,32 @@ def _load_plant_2day_schedule() -> dict:
     _nmach = len({m for v in out.values() for (m, _, _) in v})
     print(f"  [Plant2Day] loaded {_nrows} plant rows, {_nmach} machines, days 1-{_PLANT_2DAY_DAYS} "
           f"(replay {'ON' if _PLANT_2DAY_REPLAY else 'OFF'})")
+    return out
+
+
+_MACHINE_PLANT_SET: dict = None
+
+
+def _get_machine_plant_set() -> dict:
+    """PLANT_SET_LOCK: {GT-machine: set(SKUCodes it built in the plant Days-1-2 schedule)}.
+
+    Stage-1 machines are EXCLUDED (their carcass auto-follows the Stage-2 SKUs). Returns an
+    EMPTY dict when the lock is OFF or the plant schedule is absent → the assigner's plant-set
+    gate is then identity (bit-for-bit OFF). Cached at module scope; iterated deterministically."""
+    global _MACHINE_PLANT_SET
+    if _MACHINE_PLANT_SET is not None:
+        return _MACHINE_PLANT_SET
+    out: dict = {}
+    if _PLANT_SET_LOCK:
+        for (_d, _sh), _rows in sorted(_load_plant_2day_schedule().items()):
+            for (_m, _s, _q) in _rows:
+                _mk = str(_m)
+                if _mk in _S1_MACHINES:
+                    continue                       # Stage-1 auto-follows Stage-2
+                out.setdefault(_mk, set()).add(str(_s))
+        print(f"  [PlantSetLock] ON — {len(out)} GT machines pinned to their Days-1-2 plant SKU set "
+              f"(sizes: {sorted({len(v) for v in out.values()})})")
+    _MACHINE_PLANT_SET = out
     return out
 
 
@@ -4668,6 +4723,7 @@ def _assign_building_shift(
     sku_grp_target: dict | None = None,            # SG_DELIB: {sku: frozenset(allowed groups)} (deliberate) or None
     sku_cur_group: dict | None = None,             # SG_DELIB: {sku: current finer group} (mutable)
     sku_last_group_move: dict | None = None,       # SG_DELIB: {sku: day of last group MOVE} (cooldown)
+    machine_plant_set: dict | None = None,         # PLANT_SET_LOCK: {GT-machine: set(plant Days-1-2 SKUs)} or None
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -5251,6 +5307,47 @@ def _assign_building_shift(
                 _sku_shift_machs[sku].add(m)
                 _sku_shift_qty[sku] += qty
 
+        # ── PLANT_SET_LOCK helpers: a GT machine is restricted to its plant Days-1-2 SKU set
+        # until that set is demand-complete, then released. day<=2 = replay (never here). ────
+        _mps = machine_plant_set or {}
+        # SOLE-BUILDER orphans: demand SKUs whose ONLY allowable building machines are ALL
+        # plant-locked to OTHER SKUs (the SKU is in none of their plant sets). Under the strict
+        # spare gate no machine ever builds them → they starve (e.g. STMX0 / TUHL0(75)/(77)
+        # allowable only on 7502+7503). These are allowed through the plant gate as spare.
+        _sole_builder_skus: set = set()
+        if _PLANT_SET_LOCK and day > _PLANT_2DAY_DAYS and _mps:
+            _sku_feeders: dict = defaultdict(set)
+            for _mm, _sk_set in machine_skus.items():
+                for _sk in _sk_set:
+                    _sku_feeders[_sk].add(str(_mm))
+            for _sk, _feeds in _sku_feeders.items():
+                if _feeds and all(_f in _mps and _mps[_f] and _sk not in _mps[_f] for _f in _feeds):
+                    _sole_builder_skus.add(_sk)
+        def _plant_set_done(_m) -> bool:
+            _ps = _mps.get(str(_m))
+            if not _ps:
+                return True
+            return all(demand_remaining.get(_s, 0) <= 0 for _s in _ps)
+        def _plant_ok(_m, _sku) -> bool:
+            # PLANT-FIRST, SPARE→OTHERS: a plant-set SKU is always allowed (fed first, never removed);
+            # a NON-plant SKU is allowed only as SPARE — when no plant-set SKU still needs building
+            # this shift (all their per-shift draw is met).
+            if not (_PLANT_SET_LOCK and day > _PLANT_2DAY_DAYS):
+                return True
+            _ps = _mps.get(str(_m))
+            if not _ps or _plant_set_done(_m):
+                return True
+            if _sku in _ps:
+                return True
+            # SOLE-BUILDER OVERRIDE: a SKU that is building-allowable ONLY on plant-locked machines
+            # (no free builder anywhere) would otherwise be stranded by every such machine's lock —
+            # e.g. STMX0 / TUHL0 allowable ONLY on 7502+7503, both of which are plant-locked to OTHER
+            # SKUs. Let a plant-locked machine build such a sole-builder SKU as spare so it isn't
+            # orphaned. Bounded by no-waste-GT (curable ceiling) as usual.
+            if _sku in _sole_builder_skus:
+                return True
+            return not any(_defc(_p, _buf_of(_m)) > 0 for _p in _ps)
+
         # ── Phase A: continuation anchor (no CO) ──
         # BLD_SEED_STICKY: process a sticky-seed machine (still on its seed SKU, within the
         # sticky window) BEFORE its captive-max peers, so it claims its seed SKU's draw-bounded
@@ -5264,11 +5361,13 @@ def _assign_building_shift(
             s = stg[m]; buf = _buf_of(m); rate = s["rate"]
             eligible = machine_skus.get(m, set()); dom = s["dom"]
             cur = s["cur_sku"]
+            if cur and not _plant_ok(m, cur):
+                cur = ""; s["cur_sku"] = ""   # PLANT_SET_LOCK: drop a non-plant carryover → re-seed from the set
             # seed empty machine with a dom-inch-preferred deficit SKU (== "start")
             if not cur:
                 cands = [x for x in eligible if _defc(x, buf) > 0
                          and not _fixed_esc_block(m, sku_inch.get(x, ""), "")
-                         and _sku_revert_ok(m, x)]
+                         and _sku_revert_ok(m, x) and _plant_ok(m, x)]
                 if cands:
                     # DELIVERY_PRIORITY: a behind committed SKU seeds an empty machine first
                     # (EDF), still dom-inch-filtered. (1,0.0) constant when off → identity.
@@ -5365,9 +5464,15 @@ def _assign_building_shift(
             # committed SXC1T/TUNE6 when they fall behind pace to their deadline). Only fires when a
             # committed SKU is AT RISK (via _delivery_relax) — not for on-pace SKUs. EDF ordering
             # comes from _bld_prio; allowable/tooling + demand cap + mould feasibility unchanged.
+            # A machine plant-locked to `cur` cannot actually be CO'd onto the committed SKU
+            # (its plant set forbids the switch), so preempting it just idles it (it abandons cur
+            # AND can't build the committed SKU — e.g. 7106 locked to SUNE1 while SXC1T/TUNE6 are
+            # at-risk). Only preempt if the machine can REACH a committed SKU under the plant-lock
+            # (_plant_ok). PLANT_SET_LOCK off → _plant_ok always True → bit-for-bit prior behaviour.
             _preempt_delivery = (_ANY_DELIVERY_RELAX and _prio_on_bld
                                  and not _delivery_relax(cur)
-                                 and any(_delivery_relax(x) for x in machine_skus.get(m, set())))
+                                 and any(_delivery_relax(x) and _plant_ok(m, x)
+                                         for x in machine_skus.get(m, set())))
             _room = (0.0 if _preempt_delivery else
                      max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0) - _woc.get(cur, 0.0))
                      if (_cap_max or _pin_d1a_m) else _defc(cur, GT_SHELF_LIFE_SHIFTS) if _sticky_now
@@ -5503,6 +5608,8 @@ def _assign_building_shift(
                 buf = _buf_of(m); rate = s["rate"]; dom = s["dom"]
                 cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
                 for sku in machine_skus.get(m, set()):
+                    if not _plant_ok(m, sku):
+                        continue   # PLANT_SET_LOCK: restrict to the plant Days-1-2 set until it's demand-complete
                     if sku == cur and not _GLOBAL_SCORE_V2:
                         continue   # V2: fold continuation into the pool as a CO=0 candidate
                     _dlvr = _delivery_relax(sku)   # delivery-date SKU → relax soft rules (keep allowable)
@@ -5558,6 +5665,15 @@ def _assign_building_shift(
                         continue
                     is_urgent = (sku in co_target_skus and projected_gt.get(sku, 0.0) == 0
                                  and demand_remaining.get(sku, 0.0) > 0)
+                    # STARVING-PRESS bypass: same-inch CO onto a SKU whose curing presses are RUNNING
+                    # but STARVED (live draw, no GT on hand/built this shift, demand left). Keyed on
+                    # LIVE starvation (not planned-CO membership like is_urgent), so a machine feeds
+                    # its own empty presses instead of idling its residual minutes.
+                    is_starved = (_CO_STARVE_BYPASS and to_inch == cur_inch
+                                  and shift_cure_demand.get(sku, 0.0) > 0
+                                  and gt_inventory.get(sku, 0.0) <= 0
+                                  and projected_gt.get(sku, 0.0) <= 0
+                                  and demand_remaining.get(sku, 0.0) > 0)
                     _flex_off_ok = (m in _INCH_FLEX_MACHINES and to_inch != dom
                                     and s["primary_done"])
                     # With the client inch rules a diff-inch move has already passed
@@ -5565,7 +5681,8 @@ def _assign_building_shift(
                     # the 30% cost guard must not block it — the machine would idle.
                     if _INCH_RULES_ENABLED and to_inch != cur_inch:
                         _flex_off_ok = True
-                    if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok and not _dlvr:
+                    if (cost > 0.30 * s["remaining"] and not is_urgent and not is_starved
+                            and not _flex_off_ok and not _dlvr):
                         continue
                     avail = s["remaining"] - cost
                     _ra = _bld_qty_per_shift(m, sku) / SHIFT_MINS   # per-SKU CT rate
@@ -11571,6 +11688,7 @@ def run_rolling_pipeline(
                     sku_grp_target=_sku_grp_target,   # SG_DELIB: deliberate target group SETS
                     sku_cur_group=_sku_cur_group,     # SG_DELIB: current group per SKU (mutable)
                     sku_last_group_move=_sku_last_group_move,  # SG_DELIB: last group-move day (cooldown)
+                    machine_plant_set=_get_machine_plant_set(),  # PLANT_SET_LOCK: plant Days-1-2 SKU set per GT machine
                 )
 
             # ps3/ps4 hard monthly cap: clamp this shift's ps build to the remaining room so the

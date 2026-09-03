@@ -93,6 +93,8 @@ CLOUD_CONFIG: dict = {
     "INCH_HIST_LOCK_MAX_INCHES":              3,
     "INCH_HIST_LOCK_STAGE1":                  False,  # S1 stays demand-optimal (carcass-FEASIBLE)
     "FIXED_ESCAPE_ENABLED":                   False,  # Lever B REJECTED (−2,572 net, 3 mo) — kept off
+    "PLANT_SET_LOCK":                         True,   # plant-follow: day3+ each GT machine commits to its Days-1-2 plant SKU set (+ sole-builder override). Pinned for cloud=local durability.
+    "CO_STARVE_BYPASS":                       True,   # same-inch CO past the 30% guard to feed a machine's own STARVED presses. Pinned for cloud=local durability.
     # ── Delivery-date / priority-flag committed-delivery SKUs (top ★ toggle) ──
     # INERT on cloud until jkt_demand carries priorityFlag/deliveryDate + read_db selects
     # them. Sub-levers (DP_ACQUIRE/DP_RESERVE/DP_MOULDCAP/DP_PACE_MARGIN/DP_BLD) are
