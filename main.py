@@ -97,8 +97,12 @@ CLOUD_CONFIG: dict = {
     # INERT on cloud until jkt_demand carries priorityFlag/deliveryDate + read_db selects
     # them. Sub-levers (DP_ACQUIRE/DP_RESERVE/DP_MOULDCAP/DP_PACE_MARGIN/DP_BLD) are
     # module-level env defaults in the engine (adopted "full mould-cap") — see the NOTE below.
-    "DELIVERY_PRIORITY_ENABLED":              DELIVERY_PRIORITY,
-    "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND":  True,
+    # Merged delivery toggles (mutually exclusive — the feature is ON iff one is True; the old
+    # DELIVERY_PRIORITY_ENABLED master is merged away). MONTHEND mode preserves the old
+    # UNDATED→month-end commitment; DATE relaxation off to avoid the conflict. DELIVERY_PRIORITY
+    # (the DB impPriorityFlag) still gates whether the demand columns are read at all.
+    "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED": bool(DELIVERY_PRIORITY),
+    "DELIVERY_DATE_ALL_SOFT_RULES_RELAXED":          False,
     # ── Curing CO controls ──────────────────────────────────────────────
     "CO_CLASS_B_THRESHOLD":                   0.8,
     "CURING_CO_CHANGEOVER_MINS":              480,    # match bc_config (parity)
@@ -166,7 +170,9 @@ def _apply_run_cfg(run_cfg: dict) -> None:
     globals. mouldAvailability and the priority weightages are v1-dormant.
     """
     b2c_pipeline.MAX_CHANGEOVERS_PER_DAY = int(run_cfg["max_co_per_day"])
-    curing_consumption_dynamic.ConsumptionConfig.PRESS_EFFICIENCY = float(run_cfg["press_efficiency"])
+    # Press efficiency is the PLANT DIGIT-BASED constant (4-digit 0.95 / 5-digit 0.94), the
+    # single source in curing_consumption_dynamic.ConsumptionConfig — NOT overridden by the DB
+    # per-run param, so cloud == local on efficiency. (jkt_plan_params.efficiency is ignored here.)
     # Plant holidays (jkt_holiday_calendar) → the engine reads bc_config.PLANT_HOLIDAYS at
     # runtime; empty list = holiday-free run (bit-for-bit identical to no-holiday).
     _hols = list(run_cfg.get("holidays", []) or [])

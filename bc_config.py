@@ -50,6 +50,41 @@ BUILDING_MATRIX_FILE = os.path.join(INPUT_DIR, "last_building_a_ct.xlsx")   # �
 PM_MTC_ENABLED = os.environ.get("PM_MTC", "1") != "0"   # ← TOGGLE PM/MTC maintenance downtime ON(1)/OFF(0)  (line 50)
 DAY1_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day1_seed_from_plant.xlsx")   # ← Day-1 building seed (plant-derived): 2 cols (Machine ID, SKU Code)  (line 51)
 STICKY_HANDOFF = True; STICKY_HANDOFF_LOCK = False   # ← Day2→Day3 handoff LOCK ON: each GT machine keeps its end-of-day-2 SKU on day-3 ShiftA, excluded from Phase B/C that shift  (line 52)
+SAME_GROUP_SOFT_A = True   # ← SOFT-A group-allocation DEFAULT (b2c_pipeline.py): SAME_GROUP soft "one SKU→one machine group" rule ON, but SOFT (SG_HARD=0, foreign builds allowed rather than hard-dropped); same-shift multi-group guard stays HARD (SG_SAMESHIFT_HARD, rule 3); deliberate cross-group move-gate stays OFF (SG_MOVE_ADMIT). Env SAME_GROUP=0 fully disables (bit-for-bit OFF baseline); SG_HARD=1 / SG_MOVE_ADMIT=1 still work for A/B.  (line 53)
+SAME_GROUP_SOFT_A_EXEMPT_SKUS = ["1225170015012LSTL0"]   # ← EXCEPTION to SAME_GROUP_SOFT_A: these SKUs are EXEMPT from the one-SKU→one-group rule and may be built on ANY allowable machine across groups (incl. simultaneously in different groups the same shift). All SAME_GROUP penalties/HARD guards (home-pen, deliberate move-gate, same-shift-multi-group, SG_HARD drop) are bypassed for a listed SKU; every other constraint (demand cap, inch-lock, mould feasibility, CT) still applies. Env SG_EXEMPT_SKUS (comma-separated) overrides.  (line 54)
+MIN_CARCASS_QTY = 10   # ← HARD RULE: no carcass build < this many units per (Stage-1 machine, SKU, shift). When shift over-production would leave a sub-MIN carcass fragment it is NOT built (dropped); the Stage-2 GT is then made only to the carcass that IS available (GT clamps down), and curing derives from the reduced GT — so carcass/GT/curing stay in sync and R5 (GT≤carcass) holds. Enforced at the Stage-2 carcass gate (b2c_pipeline.py). Env CARCASS_MIN_QTY overrides; CARCASS_MIN_ENFORCE=0 reverts bit-for-bit.  (line 55)
+# ══════════════════════════════════════════════════════════════════════════════
+# ★ DELIVERY / PRIORITY (committed-delivery) TOGGLES — all together, authoritative (line 56)
+# ------------------------------------------------------------------------------
+#  DELIVERY_PRIORITY_ENABLED
+#      Master switch. ON = read the demand sheet's "Priority Flag" + "Delivery Date" columns
+#      and treat matching SKUs as committed. OFF = feature fully off (bit-for-bit baseline).
+#
+#  DELIVERY_DATE_ALL_SOFT_RULES_RELAXED   (governs SKUs that HAVE a Delivery Date)
+#      A dated SKU is delivered by its date, EDF. Soft building rules (inch-lock, dwell,
+#      SAME_GROUP, 30%-CO-cost + per-shift-CO-cap guards, 4-SKU/day cap, min-campaign, Phase-C
+#      risk gate) + machine preemption are RELAXED **only when the SKU is AT RISK** of missing
+#      the date under normal rules — i.e. it has fallen behind the linear pace to its deadline.
+#      While on pace, normal optimisation is used (no relaxation). Keeps allowable/tooling +
+#      demand cap + mould feasibility. Also = the commitment scope: undated flags do NOT commit.
+#
+#  PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED   (governs FLAG-only, UNDATED SKUs)
+#      A Priority-Flag SKU with NO date must be completed by MONTH-END. Same at-risk logic:
+#      relax the soft rules ONLY when it is at risk of missing month-end; otherwise normal rules.
+#      This flag ALSO controls commitment scope for undated flags (ON → undated flags commit to
+#      month-end; OFF → undated flags stay normal SKUs).
+#
+#  The feature is ACTIVE iff EITHER toggle below is ON (they merge in the old master
+#  DELIVERY_PRIORITY_ENABLED — no separate enable flag any more). BOTH OFF = feature off.
+#  MUTUAL EXCLUSIVITY: the two toggles may NOT both be ON — test one mode at a time.
+#      Enforced below (and again in b2c_pipeline after cloud config applies).
+# ══════════════════════════════════════════════════════════════════════════════
+DELIVERY_DATE_ALL_SOFT_RULES_RELAXED          = True   # dated-SKU relaxation (at-risk-only); ON also = feature enabled in DATE mode
+PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED = False   # flag-only/undated → month-end relaxation (at-risk-only); ON also = feature enabled in MONTHEND mode
+if DELIVERY_DATE_ALL_SOFT_RULES_RELAXED and PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED:
+    raise ValueError(
+        "bc_config: DELIVERY_DATE_ALL_SOFT_RULES_RELAXED and "
+        "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED are MUTUALLY EXCLUSIVE — enable only ONE.")
 # SNAPSHOT-DATE key ("YYYY-MM-DD") — the running-moulds / gt_inventory_manual / carcass_inventory_manual
 # tables carry a `date` column. The opening snapshot is ALWAYS taken from the START-OF-MONTH row
 # (f"{PLAN_MONTH}-01"), regardless of the actual plan-start day: e.g. a plan starting 2026-08-21 still
@@ -172,8 +207,8 @@ def out_path(name: str) -> str:
 #   Env DELIVERY_PRIORITY=0 also forces it off. For the CLOUD path, flip the matching
 #   top toggle in main.py (CLOUD_CONFIG) instead — editing this file does not affect cloud.
 # ══════════════════════════════════════════════════════════════════════════════
-DELIVERY_PRIORITY_ENABLED             = False
-DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = False
+# DELIVERY / PRIORITY toggles are defined at line 56 (authoritative ★ block). Do NOT re-assign
+# them here (a later assignment would override line 56 and skip the mutual-exclusivity check).
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ FEATURE TOGGLE — RUNNER-OUT DAY-1 CHANGEOVER ★
@@ -964,8 +999,9 @@ CONC_STARV_SHIFTS = float(os.environ.get("CONC_STARV_SHIFTS", "1.0"))
 # Default ON but INERT (bit-for-bit) when no priority data is present (June, cloud
 # jkt_demand which has no such columns). Env DELIVERY_PRIORITY=0 forces identity
 # everywhere. See b2c_pipeline._build_priority_deadline_map.
-# >>> The master toggle DELIVERY_PRIORITY_ENABLED (+ DELIVERY_PRIORITY_UNDATED_TO_MONTHEND)
-#     is defined at the TOP of this file (★ FEATURE TOGGLE block) so it is easy to find/flip.
+# >>> The toggles DELIVERY_PRIORITY_ENABLED / DELIVERY_DATE_ALL_SOFT_RULES_RELAXED /
+#     PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED are defined at the TOP of this file
+#     (★ DELIVERY / PRIORITY TOGGLES block, line 56) so they are easy to find/flip.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. CURING SIMULATION  →  curing_b2c.py
@@ -995,6 +1031,10 @@ CURING_PRESS_COUNT = 170
 # moulds). All new presses are client-confirmed ready for production. Env IDLE_PRESS_ACT=0
 # reverts. Logic in b2c_pipeline.py.
 IDLE_PRESS_ACTIVATE_ENABLED = (os.environ.get("IDLE_PRESS_ACT", "1") != "0")
+# Supply-aware cold-start (default ON): a roster press absent from the Day-0 snapshot is
+# cold-started only when Building can feed its target SKU (per-SKU marginal test); otherwise it is
+# DEFERRED and retried on a later working day. =False → blind Day-1 activate-all (bit-for-bit).
+IDLE_PRESS_SUPPLY_AWARE = (os.environ.get("IDLE_PRESS_SUPPLY_AWARE", "1") != "0")
 
 # ── Curing press changeover times ────────────────────────────────────────────
 # A curing press CO occupies 2 consecutive shifts:

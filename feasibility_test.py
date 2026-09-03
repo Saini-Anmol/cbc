@@ -290,6 +290,24 @@ def load_sources():
         return {"MG": dict(getattr(bp, "_MACHINE_GROUP", {})), "inch_set": _isets}
     _try("bld", _bld_helpers)
 
+    # Days-1-2 PLANT REPLAY exemption (R1B/R3B/R4): `_PLANT_2DAY_REPLAY` (b2c_pipeline, default
+    # ON) makes building replay the plant's EXACT day-0 snapshot for the plan's first
+    # `_PLANT_2DAY_DAYS` calendar days — a client hard rule (CLAUDE.md §22), not our scheduling
+    # plan's allowable/CT/inch-lock choice. A handful of the plant's real pairs (e.g. 7003 →
+    # a 17" SKU, 7803/8501 → a 14" SKU) sit outside our historical inch-lock / allowable data,
+    # so R1B/R3B/R4 (which audit OUR planning logic) would false-flag literal plant history.
+    # Skip those 3 rules for rows dated within the replay window ONLY; day>=3 (and any run
+    # where replay is OFF) is fully audited as before. Mirrors b2c_pipeline's own enablement
+    # check (env PLANT_2DAY_REPLAY + schedule-file existence) so the skip window never drifts
+    # out of sync with what the pipeline actually replayed.
+    def _replay_dates():
+        import b2c_pipeline as bp
+        if not getattr(bp, "_PLANT_2DAY_REPLAY", False):
+            return set()
+        n = int(getattr(bp, "_PLANT_2DAY_DAYS", 2))
+        return {(SRC["plan_start"] + timedelta(days=_d)).strftime("%Y-%m-%d") for _d in range(n)}
+    _try("replay_dates", _replay_dates)
+
     # building CT from the CSV ONLY (R1) — per (SKU Code, machine), seconds. No 0.94.
     def _bld_ct_csv():
         path = ARGS.bld_ct_file or getattr(bc, "BLD_CT_FILE", os.path.join("data", "input", "Cycle_time_Building.xlsx"))
@@ -616,14 +634,20 @@ def parse_building(path):
             continue
         qty = num(r.get("Qty"))
         co = num(r.get("CO_Mins"))
+        _dt = dstr(r.get("Date"))
         rows.append({
-            "date": dstr(r.get("Date")), "shift": str(r.get("Shift", "")).strip(),
+            "date": _dt, "shift": str(r.get("Shift", "")).strip(),
             "machine": m, "sku": str(r.get("SKUCode", "")).strip(), "qty": qty,
             "co": co, "cotype": cotype, "group": mgroup(m),
             "_start": pd.to_datetime(r.get("StartTime"), errors="coerce"),
             "_end": pd.to_datetime(r.get("EndTime"), errors="coerce"),
             "is_carcass": cotype == "carcass",
             "is_co": (cotype in ("same_size_CO", "diff_size_CO")) or (co > 0 and qty == 0 and cotype != "carcass"),
+            # Days-1-2 plant-replay row (see `_replay_dates` in load_sources) — exempt from
+            # R1B/R3B/R4 only (those 3 rules audit OUR plan's allowable/CT/inch-lock choices;
+            # a replay row is literal plant history, not our choice). Empty set when replay
+            # is OFF, so this is always False (bit-for-bit no-op) on a non-replay run.
+            "is_replay": _dt in (SRC.get("replay_dates") or set()),
         })
     for x in rows:
         x["is_prod"] = (not x["is_co"]) and (not x["is_carcass"]) and x["qty"] > 0
@@ -729,6 +753,8 @@ def r1_r18_building_ct(bld):
     for r in bld:
         if not r["is_prod"] and not r["is_carcass"]:
             continue
+        if r.get("is_replay"):     # plant-exact Days-1-2 row — see `_replay_dates`
+            continue
         n += 1
         ct = ctmap.get((r["sku"], r["machine"]))
         if ct is None:
@@ -789,6 +815,54 @@ def r1_r12_r18_curing_ct(cur):
     rule_result("R1C", "Curing CT = DB Cure Time / 0.94 matches sheet", n)
     rule_result("R12", "Missing curing CT falls back to default 17.0", n)
     rule_result("R18C", "Curing (Qty/2) x CT matches total production time PER PRESS", len(press_prodmin))
+
+    # ── R20C: CONTINUOUS cure-cycle reconciliation across shifts (PLANT RULE) ──────────
+    # Curing is continuous: a press running the SAME SKU across CONSECUTIVE full shifts is
+    # reconciled against CUMULATIVE runtime — its cured cycles over an adjacent same-SKU run must
+    # equal floor(Σ available_min / ct)·cavities, NOT be capped at Σ floor(480/ct) (per-shift
+    # flooring) NOR exceed the continuous ceiling. The UPPER bound (cured ≤ continuous ceiling) is
+    # the unambiguous hard check — a run over it means production exceeds physical continuous
+    # capacity (a reconciliation error). (Under-production is legitimately GT/demand-limited and is
+    # indistinguishable from a reset in the output, so it is reported informationally, not failed.)
+    _SORD = {"A": 0, "B": 1, "C": 2}
+    _dates20 = sorted({r["date"] for r in cur if r["is_prod"]})
+    _dmap20 = {d: i for i, d in enumerate(_dates20)}
+    def _gidx20(r):
+        return _dmap20.get(r["date"], 0) * 3 + _SORD.get(r["shift"], 0)
+    _byp20 = defaultdict(list)
+    for r in cur:
+        if r["is_prod"] and (r.get("co", 0) or 0) == 0 and (r.get("clean", 0) or 0) == 0:
+            _byp20[r["press"]].append(r)
+    SM20 = SRC["SHIFT_MINS"]
+    n20 = 0; _n20_under = 0
+    for p, rows in _byp20.items():
+        rows.sort(key=_gidx20)
+        i = 0
+        while i < len(rows):
+            j = i
+            while (j + 1 < len(rows) and rows[j + 1]["sku"] == rows[i]["sku"]
+                   and _gidx20(rows[j + 1]) == _gidx20(rows[j]) + 1):
+                j += 1
+            run = rows[i:j + 1]; i = j + 1
+            if len(run) < 2:
+                continue
+            ct = run[0]["ct_sheet"] if not np.isnan(run[0]["ct_sheet"]) else ctmap.get(run[0]["sku"], dflt)
+            if ct <= 0:
+                continue
+            n20 += 1
+            N = len(run)
+            expected = int(N * SM20 / ct) * cav          # continuous cumulative ceiling
+            actual = sum(rr["qty"] or 0 for rr in run)
+            if actual > expected + cav:                  # over the continuous ceiling → HARD fail
+                add("R20C", "cumulative cured over a same-SKU run EXCEEDS the continuous ceiling floor(Σtime/CT) — reconciliation error",
+                    run[0]["date"], f"{N}sh", p, run[0]["sku"], actual, round(ct, 1),
+                    expected=f"<= {expected} (continuous ceiling)", actual=actual)
+            elif actual < expected - cav:                # under: GT/demand-limited OR reset (ambiguous) → informational
+                _n20_under += 1
+    if _n20_under:
+        print(f"  [R20C] {_n20_under} same-SKU run(s) cured below the continuous ceiling "
+              f"(GT/demand-limited or a per-shift reset — indistinguishable in the output; informational).")
+    rule_result("R20C", "Continuous cure-cycle reconciliation (cured <= continuous ceiling, cross-shift)", n20)
 
 
 def r2_building_co(bld_path):
@@ -884,6 +958,8 @@ def r3_building_allow(bld):
             continue
         if not r["sku"] or r["sku"].upper() == "CHANGEOVER":
             continue
+        if r.get("is_replay"):     # plant-exact Days-1-2 row — see `_replay_dates`
+            continue
         n += 1
         elig = allow.get(r["sku"])
         if elig is None:
@@ -930,6 +1006,8 @@ def r4_inch(bld):
     n = 0
     for r in bld:
         if not r["is_prod"] or r["machine"] in S1_MACHINES:
+            continue
+        if r.get("is_replay"):     # plant-exact Days-1-2 row — see `_replay_dates`
             continue
         allowed = inch_sets.get(r["machine"])
         if not allowed:
@@ -1017,14 +1095,22 @@ def r11_r15_capacity(bld, cur):
                     expected=f"<={smin}", actual=round(tot, 1))
     # Curing: kind = co / clean / prod
     cagg = defaultdict(lambda: {"prod": 0.0, "co": 0.0, "clean": 0.0})
+    cagg_ct = defaultdict(float)   # (press,d,s) -> max prod-SKU CT (one straddling-cycle tol for R11C)
     for r in cur:
         kind = "co" if r["is_co"] else ("clean" if r["is_clean"] else "prod")
+        _ctp = (r["ct_sheet"] if not np.isnan(r["ct_sheet"]) else SRC["DEFAULT_CURE_CT"]) if kind == "prod" else 0.0
         for (d, s, mins) in _shift_segments(r["_start"], r["_end"]):
             cagg[(r["press"], d, s)][kind] += mins
+            if kind == "prod":
+                cagg_ct[(r["press"], d, s)] = max(cagg_ct[(r["press"], d, s)], _ctp)
     for (p, d, s), a in cagg.items():
         tot11 = a["prod"] + a["co"]
         tot15 = a["prod"] + a["co"] + a["clean"]
-        if tot11 > smin + 1.0:
+        # R11C: a continuous cure cycle may legitimately straddle the shift boundary, so a shift's
+        # Prod can be floor((480+carry)/ct)*2 whose minutes slightly exceed 480. Tolerate ONE
+        # straddling cycle = +1*CT of the producing SKU before flagging.
+        r11_tol = smin + max(1.0, cagg_ct.get((p, d, s), 0.0))
+        if tot11 > r11_tol:
             add("R11C", "curing Prod+CO in a REAL shift exceed 480", d, s, p, prod=round(a["prod"], 1),
                 co=round(a["co"], 1), clean=round(a["clean"], 1), expected=f"<={smin}", actual=round(tot11, 1))
         if tot15 > smin + 1.0:
@@ -1280,13 +1366,16 @@ def r17_mould(cur, cur_path):
                     add("R17", "SKU run on a press but has <2 eligible moulds (structural)",
                         r["date"], r["shift"], r["press"], r["sku"], r["qty"],
                         expected=">=2 eligible moulds", actual=len(sku_moulds.get(r["sku"], set())))
-    # per-shift exact bipartite feasibility (2 slots/press)
-    shifts = defaultdict(list)   # (date,shift) -> list of (press,sku)
+    # per-shift exact bipartite feasibility (2 slots/press). Dedupe to UNIQUE (press,sku)
+    # per shift: a press that produces in a shift contributes exactly ONE (press,sku) pair -> 2
+    # mould slots, regardless of how many display rows a continuous-cure split into (e.g. 30+2).
+    shifts = defaultdict(set)   # (date,shift) -> set of UNIQUE (press,sku)
     for r in cur:
         if r["is_prod"] and r["qty"] > 0:
-            shifts[(r["date"], r["shift"])].append((r["press"], r["sku"]))
+            shifts[(r["date"], r["shift"])].add((r["press"], r["sku"]))
     n_infeasible = 0
-    for (d, s), pairs in sorted(shifts.items()):
+    for (d, s), pairset in sorted(shifts.items()):
+        pairs = sorted(pairset)   # deterministic order
         slots = []
         for p, sku in pairs:
             slots.append((p, sku)); slots.append((p, sku))   # 2 moulds/press

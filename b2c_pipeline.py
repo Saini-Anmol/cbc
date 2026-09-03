@@ -54,7 +54,7 @@ import pandas as pd
 import bc_config
 from curing_consumption_dynamic import (
     run_dynamic_consumption, ConsumptionConfig, COScheduler, _SURPLUS_RELEASE_ENABLED,
-    press_efficiency as _press_efficiency, _PRESS_EFF_BY_DIGIT,
+    press_efficiency as _press_efficiency,
 )
 from building_b2c import run_from_database_b2c
 from curing_b2c import run_curing_b2c
@@ -196,10 +196,11 @@ def _sku_group_of(machine: str) -> str:
 # group and is never a home for a GT SKU).
 _SG_GT_GROUPS = frozenset(("PS", "MAXX", "EXIUM", "BJ", "US", "STAGE2"))
 
-# Toggle (env SAME_GROUP=1, or bc_config.SAME_GROUP_SOFT). DEFAULT OFF → bit-for-bit.
+# Toggle (env SAME_GROUP=1/0, or bc_config.SAME_GROUP_SOFT_A). DEFAULT ON (SOFT-A adopted
+# 2026-09): SAME_GROUP=0 fully reverts to the bit-for-bit OFF baseline.
 _SAME_GROUP_SOFT = os.environ.get(
     "SAME_GROUP",
-    "1" if getattr(_bc_cfg, "SAME_GROUP_SOFT", False) else "0") != "0"
+    "1" if getattr(_bc_cfg, "SAME_GROUP_SOFT_A", True) else "0") != "0"
 # Penalty WEIGHT (rank levels a cross-group pair is demoted). Default 1 = one soft rank.
 # 0 → inert even when the toggle is on (home == cross == 0).
 _SAME_GROUP_PEN = int(os.environ.get(
@@ -212,6 +213,92 @@ _SAME_GROUP_PEN = int(os.environ.get(
 # SKU behind a home one (still bounded: it never crosses the inch band or the RI/NRI tier,
 # and a home machine with no free capacity is simply absent from the pool → cross is taken).
 _SG_STRONG = os.environ.get("SG_STRONG", "0") != "0"
+
+# EXCEPTION list (bc_config.SAME_GROUP_SOFT_A_EXEMPT_SKUS, env SG_EXEMPT_SKUS override):
+# SKUs that are EXEMPT from the whole SAME_GROUP rule — they may be built on ANY allowable
+# machine across groups (incl. simultaneously in different groups the same shift). Every
+# SAME_GROUP gate/penalty short-circuits to neutral for a listed SKU (home-pen 0, move-pen 0,
+# no HARD same-shift/purity drop); all other constraints (demand cap, inch-lock, mould, CT)
+# still apply. Empty → no exemption (bit-for-bit).
+_SG_EXEMPT_SKUS: set = set(
+    s.strip() for s in os.environ.get(
+        "SG_EXEMPT_SKUS",
+        ",".join(getattr(_bc_cfg, "SAME_GROUP_SOFT_A_EXEMPT_SKUS", []) or [])
+    ).split(",") if s.strip())
+if _SG_EXEMPT_SKUS:
+    print(f"  [SAME_GROUP] {len(_SG_EXEMPT_SKUS)} SKU(s) EXEMPT from the group rule "
+          f"(any allowable machine): {', '.join(sorted(_SG_EXEMPT_SKUS))}")
+
+# ── DELIBERATE + STABLE per-SKU group allocation (extends SAME_GROUP) ───────────────
+# When SAME_GROUP is ON, this sub-mode (SG_DELIBERATE, default ON) REPLACES the old soft
+# _group_pen tiebreak with a DELIBERATE, STABLE group assignment:
+#   1. each GT SKU gets a deliberate TARGET group SET (_best_group / _compute_grp_targets):
+#      the single group whose monthly capacity completes the SKU's remaining demand; if none
+#      suffices, the MINIMAL completing SET (high-demand SKUs like LSTL0/SUNE1).
+#   2. a pair (machine, sku) whose finer group is IN the SKU's target set costs 0; a pair
+#      OUTSIDE it is a cross-group MOVE, admitted (penalty waived) only when the SKU is
+#      genuinely starving in its target AND a per-SKU cooldown has elapsed (hysteresis) —
+#      else it is deprioritized by _HYST_BIG so the pair loses (stable, no per-shift churn).
+#      An admitted move ADDS the new group to the SKU's target set (permanently sanctioned →
+#      no ping-pong) and stamps the move day.
+#   3. a HARD guard forbids the same SKU being produced in >1 group in the SAME shift.
+# SG_DELIBERATE=0 → the old soft-tiebreak SAME_GROUP behaviour (still gated by SAME_GROUP).
+# SAME_GROUP=0 → the whole feature is inert (bit-for-bit).
+_SG_DELIB = _SAME_GROUP_SOFT and (os.environ.get("SG_DELIBERATE", "1") != "0")
+# DELIBERATE MOVE-GATE master (env SG_MOVE_ADMIT, default OFF). When OFF, a SKU NEVER changes
+# its frozen target group set at runtime → maximum stability (distinct-group = frozen set size,
+# ≈1 except the minimal-SET mega-SKUs) at the accepted coverage cost (priority #7). When ON, a
+# cross-group MOVE may be admitted by the hysteresis below (dead-band + structural-gap + cooldown)
+# — a relief valve for SLACK months where recovering coverage is worth an occasional 2nd group.
+_SG_MOVE_ADMIT = os.environ.get("SG_MOVE_ADMIT", "0") != "0"
+# Dead-band: a cross-group move is admitted only if the SKU's target group is failing to feed
+# it — projected GT below (1 + band)·this-shift-draw. Larger band → moves fire more readily.
+_SG_MOVE_BAND = float(os.environ.get("SG_MOVE_BAND", str(getattr(_bc_cfg, "SG_MOVE_BAND", 0.15))))
+# Cooldown: min days between successive group MOVES for one SKU (anti-ping-pong).
+_SG_MOVE_COOLDOWN_DAYS = int(os.environ.get(
+    "SG_MOVE_COOLDOWN_DAYS", str(getattr(_bc_cfg, "SG_MOVE_COOLDOWN_DAYS", 3))))
+# STRUCTURAL move trigger: a deliberate cross-group move is admitted only when the SKU's
+# TARGET group is falling structurally behind — its cumulative monthly gap (demand_remaining
+# − projected GT) exceeds this many shifts of its current draw (i.e. the group cannot keep
+# up), NOT merely momentary per-shift starvation. Larger → moves fire less readily. 9 = ~3
+# working days behind. This is what keeps distinct-group ≈ 1 (moves are rare + deliberate).
+_SG_MOVE_GAP_SHIFTS = float(os.environ.get(
+    "SG_MOVE_GAP_SHIFTS", str(getattr(_bc_cfg, "SG_MOVE_GAP_SHIFTS", 9.0))))
+# Group-capacity DERATE for the _best_group completability test: a single group is judged able
+# to complete a SKU only if its DERATED monthly building capacity ≥ remaining demand. Raw
+# floor(shift/ct)·shifts overstates deliverable output (COs, contention with the group's other
+# SKUs, curing-draw limits), so a mega-SKU that no group can really finish alone would wrongly
+# read as single-group-completable. 0.55 cleanly separates the two 65-69k mega-SKUs (→ minimal
+# SET) from the ≤45k rest (→ single group). 1.0 = raw (no derate).
+_SG_GRP_CAP_DERATE = float(os.environ.get(
+    "SG_GRP_CAP_DERATE", str(getattr(_bc_cfg, "SG_GRP_CAP_DERATE", 0.55))))
+# INCH-AWARE stable target sizing (env SG_INCH_AWARE, default ON). "Prefer 1 group, add a stable
+# 2nd group only when genuinely needed." The plain completability test in _compute_grp_targets
+# sizes a group's capacity against ONE SKU's demand — it ignores INCH CONTENTION (all SKUs on an
+# inch share that group's inch-locked machines), so on an oversubscribed inch (13"/15") a group
+# looks "sufficient", gets locked, then saturates while sibling groups idle (measured −26.6k on
+# Sept). Inch-aware sizing instead credits each SKU its DEMAND-PROPORTIONAL SHARE of a group's
+# capacity (share = cap[g]·min(1, demand_s / Σdemand of inch SKUs competing for g)); a SKU on an
+# oversubscribed inch then needs ≥2 groups → gets a STABLE 2-group target UP-FRONT (frozen at day
+# 3, no ping-pong, no runtime move-gate). Non-saturated inches still resolve to 1 group.
+_SG_INCH_AWARE_TARGETS = os.environ.get("SG_INCH_AWARE", "1") != "0"
+# HARD group purity: a non-admitted cross-group pair is DROPPED from the candidate pool (the
+# machine idles rather than build a foreign SKU) — the faithful realization of "one group at
+# a time" (priority #7: stable groups even at a coverage cost). DEFAULT OFF (SOFT-A adopted
+# 2026-09): keeps only the _HYST_BIG soft penalty (foreign builds allowed when a machine has
+# no in-target deficit SKU → some oversubscription spill, higher coverage). SG_HARD=1 restores
+# the hard-drop behavior for A/B.
+_SG_HARD = os.environ.get("SG_HARD", "0") != "0"
+# SAME-SHIFT purity guard (env SG_SAMESHIFT_HARD, DEFAULT True = current hard behavior).
+# The HARD no-two-groups-same-shift guard forbids a SKU being produced in >1 finer group in
+# the SAME shift (invariant #3, enforced by the `_shift_grp` skip in Phase-B/C). When relaxed
+# (=0), an IDLE machine may build a foreign-group SKU even when that SKU is already building in
+# its home group this shift — the "Soft-B" idle-avoidance path (recovers coverage at the cost
+# of allowing a SKU in 2 groups within one shift). Home group is STILL preferred via the
+# _sg_move_pen scoring penalty (a cross build only wins when it avoids an idle machine, never
+# gratuitously). Downstream of PM/MTC/demand-cap/inch/allowable filters; day>2 only (rides
+# _sg_delib, which is False for the Days-1-2 plant replay). SAME_GROUP=0 → inert (bit-for-bit).
+_SG_SAMESHIFT_HARD = os.environ.get("SG_SAMESHIFT_HARD", "1") != "0"
 
 # ── Machine-level CONTINUATION stickiness (the CORE of the same-group feature) ──────
 # Eliminates avoidable building changeovers caused by SKU MIGRATION across machines:
@@ -1063,6 +1150,19 @@ _CARCASS_CONSOLIDATE = os.environ.get("CARCASS_CONSOLIDATE",
 _CARCASS_CONSOLIDATE_MIN = int(os.environ.get("CARCASS_CONSOLIDATE_MIN",
                               getattr(_bc_cfg, "CARCASS_CONSOLIDATE_MIN", 40)))
 
+# ── Carcass FINAL shift-cap enforcement (residual cumulative-rounding fix) ───────────
+# After every fold/split, a residual cumulative-rounding artifact can leave a carcass
+# row's Qty 1-2 units ABOVE the strict floor(shift_free_min*60/ct) capacity of its OWN
+# (machine, date, shift) — the boundary-split's LAST segment of a multi-shift block is
+# assigned `qty_floor - already_assigned`, inheriting the flooring loss of every earlier
+# segment. This lever re-caps every carcass row at its strict physical floor and moves
+# any excess to a SAME (machine, date, SKU) sibling row on ANOTHER shift of the SAME
+# calendar day that has spare room (carcass 1-day shelf); a residual with no same-day
+# home is dropped from the display (never touches gt_inventory/cured/built) and
+# reported. Display-only, KPI-neutral, deterministic. Default ON; CARCASS_SHIFT_CAP=0
+# reverts bit-for-bit (pre-existing rounding artifact returns).
+_CARCASS_SHIFT_CAP_ENFORCE = os.environ.get("CARCASS_SHIFT_CAP", "1") != "0"
+
 # ── Shift-contained building CO (client hard rule) — a building CO must START and FINISH
 # within one shift (07:00-15:00 / 15:00-23:00 / 23:00-07:00); it may never cross a boundary.
 # ON (default): a CO that would cross is deferred to the next shift's start. OFF reverts
@@ -1387,6 +1487,136 @@ def _pm_relocate_curing_rows(rows):
         print(f"  [PM_MTC] no-overlap: relocated {_moved} curing row(s) out of maintenance windows")
     return _out
 
+def _pm_relocate_carcass_rows(rows):
+    """POST-PROCESS (env PM_MTC_NO_OVERLAP, ON with PM_MTC): after carcass rows are shift-split
+    AND shift-capacity-capped, move every Stage-1 CARCASS (CO_Type=='carcass', Qty>0) row whose
+    [StartTime,EndTime] straddles its machine's PM/MTC window into the shift's FREE
+    (non-maintenance) sub-interval(s) — quantity unchanged. Mirrors `_pm_relocate_curing_rows`
+    for the building carcass rows (GT building already clips at production time via `_mdown`;
+    carcass rows are rendered post-plan and only had their QTY reduced for maintenance, never
+    their time span, so the emitted StartTime→EndTime could still bleed into a window). The Qty
+    was already capped to the free minutes upstream (`_avail_for_sku`/`_enforce_carcass_shift_cap`
+    both subtract PM), so the run always fits the total free time; if it exceeds the LARGEST single
+    free block it is SPLIT across free intervals (Qty apportioned by placed minutes, integer,
+    remainder to the last slice). Display-only / KPI-neutral (carcass not in gt_inventory; per-
+    (machine,date,SKU,shift) Qty total preserved EXACTLY). A row that already clears its windows is
+    left byte-identical. OFF → not called."""
+    if not (_PM_MTC_NO_OVERLAP and _BLD_DOWN):
+        return rows
+    def _p(s):
+        try:
+            return datetime.strptime(str(s), "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return None
+    _out = []
+    _moved = 0
+    for r in rows:
+        if r.get("CO_Type") != "carcass" or str(r.get("SKUCode")) == "CHANGEOVER":
+            _out.append(r); continue
+        try:
+            _q = int(round(float(r.get("Qty", 0) or 0)))
+        except (TypeError, ValueError):
+            _q = 0
+        _wins = _BLD_DOWN.get(str(r.get("Machine", "")))
+        _st = _p(r.get("StartTime")); _en = _p(r.get("EndTime"))
+        if _q <= 0 or not _wins or _st is None or _en is None or _en <= _st:
+            _out.append(r); continue
+        _sh_s, _sh_e = _pm_shift_of_bounds(_st)
+        if _down_mins(_wins, _sh_s, _sh_e) <= 0 or _down_mins(_wins, _st, _en) <= 1e-6:
+            _out.append(r); continue                       # no maintenance / no actual straddle
+        _ct = _bld_ct_sec(str(r.get("Machine", "")), str(r.get("SKUCode")))
+        _free = _free_intervals(_wins, _sh_s, _sh_e)
+        _total_free = sum((b - a).total_seconds() / 60.0 for a, b in _free)
+        _dur = (_en - _st).total_seconds() / 60.0
+        if _total_free <= 0 or _ct <= 0:
+            _out.append(r); continue
+        _rem = min(_dur, _total_free)
+        _placed = []                                       # (start_dt, mins) chronological
+        for a, b in _free:
+            if _rem <= 1e-6:
+                break
+            _take = min((b - a).total_seconds() / 60.0, _rem)
+            if _take > 1e-6:
+                _placed.append((a, _take)); _rem -= _take
+        if len(_placed) == 1:
+            _a, _m = _placed[0]
+            _nr = dict(r)
+            _nr["StartTime"] = _fmt_dt(_a)
+            _nr["EndTime"]   = _fmt_dt(_a + timedelta(minutes=min(_m, _q * _ct / 60.0)))
+            _out.append(_nr); _moved += 1
+        else:
+            _sum_m = sum(m for _, m in _placed) or 1.0
+            _assigned = 0
+            for _i, (_a, _m) in enumerate(_placed):
+                _qi = int(_q * _m / _sum_m) if _i < len(_placed) - 1 else _q - _assigned
+                _assigned += _qi
+                if _qi <= 0:
+                    continue
+                _nr = dict(r)
+                _nr["Qty"]       = _qi
+                _nr["StartTime"] = _fmt_dt(_a)
+                _nr["EndTime"]   = _fmt_dt(_a + timedelta(minutes=min(_m, _qi * _ct / 60.0)))
+                _out.append(_nr)
+            _moved += 1
+    if _moved:
+        print(f"  [PM_MTC] no-overlap: relocated {_moved} carcass row(s) out of maintenance windows")
+    return _out
+
+def _enforce_carcass_min_qty(rows):
+    """HARD min-carcass floor on the DISPLAY rows (env CARCASS_MIN_ENFORCE, MIN_CARCASS_QTY).
+    The gate already enforces ≥MIN on the BUILT carcass (and clamps GT/curing to it), but the
+    post-plan carcass RENDERER + shift-cap redistribution can re-slice a machine's day total into
+    a sub-MIN shift fragment (the 'over-production shifting' leftover). This folds every sub-MIN
+    carcass slice into the largest same-(machine, date, SKU) SIBLING that has spare shift capacity
+    — so the per-(machine, date, SKU) carcass TOTAL is preserved EXACTLY (GT ≤ carcass / R5 sync
+    untouched; carcass not in gt_inventory) and no carcass row < MIN is emitted. A sub-MIN slice
+    with no capacity-safe sibling that day is DROPPED (its units are genuinely unplaceable ≥MIN);
+    this is rare and display-only. Runs after _enforce_carcass_shift_cap. OFF → bit-for-bit."""
+    if not (_CARCASS_MIN_ENFORCE and _CARCASS_MIN_QTY > 0):
+        return rows
+    from collections import defaultdict as _dd
+    def _is_carc(r):
+        return r.get("CO_Type") == "carcass" and str(r.get("SKUCode")) != "CHANGEOVER"
+    def _pdt(s):
+        try:
+            return datetime.strptime(str(s), "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return None
+    _grp = _dd(list)                                   # (machine, date, sku) -> [rows]
+    for r in rows:
+        if _is_carc(r):
+            _grp[(str(r["Machine"]), str(r["Date"])[:10], str(r["SKUCode"]))].append(r)
+    _drop = set(); _moved = 0; _dropped_units = 0
+    for (_m, _dt0, _sk), _rs in _grp.items():
+        _ct = _bld_ct_sec(_m, _sk)
+        for _r in _rs:
+            _q = int(round(_r.get("Qty", 0) or 0))
+            if not (0 < _q < _CARCASS_MIN_QTY) or id(_r) in _drop:
+                continue
+            _recv = None
+            for _cand in sorted((x for x in _rs if x is not _r and id(x) not in _drop),
+                                 key=lambda x: -int(round(x.get("Qty", 0) or 0))):
+                _cs, _ce = _pdt(_cand.get("StartTime")), _pdt(_cand.get("EndTime"))
+                _span = (_ce - _cs).total_seconds() / 60.0 if (_cs and _ce) else 0.0
+                _add = (_q * _ct / 60.0) if _ct > 0 else 0.0
+                if _ct <= 0 or _span + _add <= SHIFT_MINS + 1e-6:
+                    _recv = _cand; break
+            if _recv is None:                          # nothing can absorb it ≥MIN → drop (rare)
+                _drop.add(id(_r)); _dropped_units += _q
+                continue
+            _recv["Qty"] = int(round(_recv.get("Qty", 0) or 0)) + _q
+            _cs = _pdt(_recv.get("StartTime"))
+            if _cs and _ct > 0:
+                _recv["EndTime"] = _fmt_dt(_cs + timedelta(minutes=int(round(_recv["Qty"])) * _ct / 60.0))
+            _drop.add(id(_r)); _moved += 1
+    if _drop:
+        rows = [r for r in rows if id(r) not in _drop]
+    if _moved or _dropped_units:
+        print(f"  [Stage-1 carcass] min-qty ≥{_CARCASS_MIN_QTY}: folded {_moved} sub-{_CARCASS_MIN_QTY} "
+              f"slice(s) into same-machine-day siblings"
+              + (f"; dropped {_dropped_units} unplaceable unit(s) (display-only)" if _dropped_units else ""))
+    return rows
+
 def _shift_of(_dt) -> str:
     """Shift letter from a datetime's hour: A 07-15, B 15-23, C 23-07."""
     _h = _dt.hour
@@ -1695,13 +1925,55 @@ _ONEWAY_KEEP_DOMINANT = os.environ.get("ONEWAY_KEEP_DOMINANT", "1") != "0"
 # priority insertion collapses to identity → bit-for-bit baseline. See the feature
 # block in bc_config.py and _build_priority_deadline_map below. Env DELIVERY_PRIORITY=0
 # forces OFF everywhere.
-_DELIVERY_PRIORITY_ENABLED = bool(getattr(_bc_cfg, "DELIVERY_PRIORITY_ENABLED", True))
-_DELIVERY_PRIORITY_UNDATED_TO_MONTHEND = bool(
-    getattr(_bc_cfg, "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND", True))
+# _DELIVERY_PRIORITY_ENABLED is now DERIVED (merged): the feature is enabled iff EITHER mode
+# toggle is on. Defined just below, after both are read. (env DELIVERY_PRIORITY=0 forces OFF.)
+# PRIORITY-FLAG month-end rule-relaxation (bc_config.PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED,
+# default OFF): governs FLAG-only (UNDATED) SKUs → commit to MONTH-END and relax soft rules ONLY
+# WHEN AT RISK of missing month-end. Also the commitment scope for undated flags (old
+# old undated→month-end commitment semantics, renamed).
+_PRIORITY_FLAG_MONTHEND_RELAX = bool(
+    getattr(_bc_cfg, "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED", False))
 # Building-side committed-delivery boost sub-toggle (bisection A/B; default ON). DP_BLD=0
 # drops the _bld_prio building boost + Phase-C risk-gate bypass, leaving only the Phase-0
 # CO levers. Used only when priority_deadline_map is non-empty.
 _DP_BLD = os.environ.get("DP_BLD", "1") != "0"
+# DELIVERY-DATE rule-relaxation (bc_config.DELIVERY_DATE_ALL_SOFT_RULES_RELAXED, env DELIVERY_RELAX,
+# default ON): governs DATED SKUs → relax ALL soft building rules on their ALLOWABLE machines
+# (inch-lock, dwell, SAME_GROUP, CO-cost + CO-per-shift-cap guards, 4-SKU/day cap, min-campaign,
+# Phase-C risk gate) + machine preemption ONLY WHEN AT RISK of missing the date (behind the linear
+# pace). Keeps allowable/tooling + demand cap + mould feasibility. See _delivery_relax().
+_DELIVERY_DATE_RELAX = (os.environ.get(
+    "DELIVERY_RELAX", "1" if bool(getattr(_bc_cfg, "DELIVERY_DATE_ALL_SOFT_RULES_RELAXED", True)) else "0") != "0")
+# The two relaxation MODES are mutually exclusive (re-checked here, so a cloud CLOUD_CONFIG that
+# sets both — applied before this import — is caught too, not only the bc_config import-time check).
+if _DELIVERY_DATE_RELAX and _PRIORITY_FLAG_MONTHEND_RELAX:
+    raise ValueError(
+        "DELIVERY_DATE_ALL_SOFT_RULES_RELAXED and PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED "
+        "are MUTUALLY EXCLUSIVE — enable only ONE (check bc_config / main.CLOUD_CONFIG / env DELIVERY_RELAX).")
+_ANY_DELIVERY_RELAX = _DELIVERY_DATE_RELAX or _PRIORITY_FLAG_MONTHEND_RELAX
+# Merged master enable: feature ON iff a mode toggle is ON (env DELIVERY_PRIORITY=0 forces OFF).
+_DELIVERY_PRIORITY_ENABLED = _ANY_DELIVERY_RELAX and (os.environ.get("DELIVERY_PRIORITY", "1") != "0")
+# Committed SKUs that carry a real Delivery Date (vs flag-only month-end). Populated once per run
+# by run_rolling_pipeline (mutated in place, so _assign_building_shift's _delivery_relax reads the
+# current set without threading it through every call site). DATE-mode vs MONTHEND-mode gating.
+_PRIO_DATED_SKUS: set = set()
+# Continuous cycle/unit carry across shifts (PLANT RULE, permanent ON) — the fractional cure
+# cycle / build unit is NOT reset at a shift boundary; it carries to the next shift while the
+# press/machine keeps running the same SKU, so a press cures the continuous cumulative
+# floor(Σtime/ct)·2 (e.g. LSTL0 ct 30.3 → 32/shift avg, the 30,32,32,… pattern), not per-shift
+# floor(480/ct)·2 = 30. A cycle that straddles a shift boundary is emitted as a small completion
+# row + the shift's main row; those are CONSOLIDATED per (press,date,shift,SKU) below so each
+# shift shows ONE row, and the per-shift feasibility rules (R17/R11C) validate the press's REAL
+# production (one press = 2 mould cavities/shift, one straddling cycle allowed), not per display row.
+_BLD_CYCLE_CARRY  = os.environ.get("BLD_CYCLE_CARRY", "1") != "0"
+_CURE_CYCLE_CARRY = os.environ.get("CURE_CYCLE_CARRY", "1") != "0"
+# CONTINUOUS BUILD CARRY (PLANT RULE — permanent): per-machine fractional UNITS carried from the
+# prior shift's flat-out continuation of the SAME SKU. Building is continuous, so a machine that
+# ran time-saturated on one SKU does NOT reset its fractional unit-time each shift — the leftover
+# finishes early next shift. {machine: (sku, fractional_units)}; carry-in used only if the machine
+# continues that SKU; carry-out set only when the continuation was TIME-bound (spent the whole
+# shift). Reset per run by run_rolling_pipeline. Analogous to the curing _cure_carry_min.
+_BLD_CARRY_UNITS: dict = {}
 # Lever A (FLEX_SCARCE_INCH, ADOPTED — default ON): among a FLEXIBLE machine's allowed
 # inches, prefer the SCARCEST (biggest live curing-draw shortfall) over same-inch
 # stickiness, so flex capacity feeds about-to-starve scarce inches (15"/13") the fixed
@@ -2009,6 +2281,18 @@ _STAGE2_CARCASS_GATE = (os.environ.get("STAGE2_CARCASS_GATE",
 # same-shift gate (measure only).
 _STAGE2_CARCASS_PREBUILD = os.environ.get("STAGE2_CARCASS_PREBUILD", "1") != "0"
 
+# ── HARD min-carcass-build rule (bc_config.MIN_CARCASS_QTY, default 10) ────────────
+# No carcass may be BUILT at < MIN per (Stage-1 machine, SKU, shift). When a shift's
+# over-production leaves a sub-MIN carcass fragment for a machine, that fragment is NOT
+# built (dropped from the bank + the display log); the Stage-2 GT is then made only to the
+# carcass that IS available (the gate's _take clamp reduces GT to the reduced bank), and
+# curing derives from the reduced GT — so carcass / GT / curing stay in sync (R5 GT≤carcass
+# holds). Enforced at the Stage-2 carcass gate, right before the GT clamp. Requires the gate.
+# CARCASS_MIN_ENFORCE=0 (or MIN_CARCASS_QTY≤0) → bit-for-bit baseline.
+_CARCASS_MIN_ENFORCE = (os.environ.get("CARCASS_MIN_ENFORCE", "1") != "0")
+_CARCASS_MIN_QTY = int(os.environ.get(
+    "CARCASS_MIN_QTY", str(getattr(_bc_cfg, "MIN_CARCASS_QTY", 10))))
+
 # ── Stage-1 building CHANGEOVER time (STAGE1_CO) ──────────────────────────────
 # Charge real building CO on the 15 Stage-1 carcass machines — same_size_CO = 60,
 # diff_size_CO = 180 (flat, all 15; already in BUILDING_CO_SAME/DIFF_SIZE via
@@ -2152,14 +2436,20 @@ _IDLE_PRESS_ACTIVATE = (os.environ.get("IDLE_PRESS_ACT",
 _FULL_PRESS_ROSTER = (os.environ.get("FULL_PRESS_ROSTER",
                       "1" if bool(getattr(_bc_cfg, "FULL_PRESS_ROSTER_ENABLED", False)) else "0") != "0")
 
-# NOTE (measured + REJECTED): a "dynamic supply-aware cold-start gate" that skips activating a
-# roster press when its target INCH's committed curing draw already exceeds building GT/day
-# (`_building_inch_capacity`) does NOT work. Committed curing draw ALWAYS vastly exceeds building
-# capacity (that is the entire starvation story), so the ceiling fires on every inch and over-skips
-# the HELPFUL cold-starts too. Measured net −20,685 vs activate-all (June −15,400 / Jul +1,896 /
-# Aug −1,921 / Sep −5,260). Activate-all is the best aggregate (cold-start is +31,520 net; it only
-# hurts July −4,479 via 15"/13" mould contention). July's harm is mould-pair contention, not
-# inch-supply saturation, so a building-capacity gate cannot isolate it. Kept activate-all.
+# SUPPLY-AWARE cold-start activation (bc_config.IDLE_PRESS_SUPPLY_AWARE, default ON): a roster
+# press absent from the Day-0 snapshot is cold-started ONLY when Building can realistically feed
+# its target SKU — otherwise it is DEFERRED and retried on a LATER working day when supply exists
+# (activation now runs every working day, not just Day 1). The gate is PER-SKU MARGINAL, not
+# inch-level: a prior INCH-level gate (skip when the target inch's committed curing draw exceeds
+# `_building_inch_capacity`) over-skipped every inch (committed draw always exceeds building
+# capacity — the starvation story) and measured net −20,685, so it was rejected. The per-SKU
+# marginal test instead asks "can building supply THIS extra press of THIS SKU" — the target must
+# (a) have eligible building machines and (b) not be curing-over-supplied vs building's per-SKU
+# feed. Deferral (not permanent skip) is the key difference. IDLE_PRESS_SUPPLY_AWARE=0 reverts to
+# the old blind Day-1 activate-all (bit-for-bit).
+_IDLE_PRESS_SUPPLY_AWARE = (os.environ.get("IDLE_PRESS_SUPPLY_AWARE",
+                            "1" if bool(getattr(_bc_cfg, "IDLE_PRESS_SUPPLY_AWARE", True)) else "0") != "0")
+_IDLE_PRESS_SUPPLY_MARGIN = float(os.environ.get("IDLE_PRESS_SUPPLY_MARGIN", "1.0"))
 
 # MONOTONICITY experiment — building-draw per-inch cap (env BLD_DRAW_CAP, default OFF). REJECTED.
 # Idea: clamp each inch's aggregate curing-draw signal (shift_cure_demand) passed to the building
@@ -3426,6 +3716,150 @@ def _consolidate_carcass_rows(carc_rows: list, sku_inch: dict) -> tuple:
     return out_rows, out_co
 
 
+def _enforce_carcass_shift_cap(rows: list, holiday_windows: "list | None" = None) -> tuple:
+    """FINAL carcass-row hard cap — fixes the residual cumulative-rounding artifact.
+
+    ROOT CAUSE: `_split_rows_at_shift_boundaries` apportions a multi-shift block's Qty
+    across its per-shift segments as `int(qty_floor * frac)` for every segment EXCEPT
+    the LAST, which gets the remainder `qty_floor - already_assigned` (so the per-row
+    total reconciles exactly). That remainder INHERITS the flooring loss of every
+    earlier segment (up to ~(#segments-1) units), so the last segment's Qty can exceed
+    its OWN shift's strict physical capacity by 1-2 units even though its own
+    [StartTime,EndTime] span never crosses a shift boundary (that was already fixed —
+    see the R11B/over-480-min fix in `_split_rows_at_shift_boundaries`/
+    `_consolidate_carcass_rows`). This is a SEPARATE, smaller artifact: over the row's
+    own strict floor(available_shift_min*60/ct), not over a whole shift's span.
+
+    For every carcass production row, computes:
+        available_shift_min = SHIFT_MINS(480) - PM/MTC downtime overlapping that
+            (machine, date, shift) - holiday downtime - any CO minutes the SAME
+            machine spent that SAME shift - any OTHER SKU's production minutes
+            already occupying that (machine, date, shift) (a machine can run >1 SKU
+            per shift after a same-shift CO)
+        cap = floor(available_shift_min * 60 / _bld_ct_sec(machine, sku))
+    The "OTHER SKU" term is read from a FROZEN pre-mutation snapshot of every row's
+    Qty, taken once up front — NOT the live (being-edited) Qty. This keeps the result
+    deterministic and order-independent (which (machine,date,sku) group is processed
+    first no longer changes the answer) and, since a frozen value is always >= the
+    OTHER sku's own eventual (possibly also capped-down) Qty, it is a conservative
+    (never-too-generous) budget: this fix can under-fill a shift by a few units versus
+    a perfectly joint-optimal packing, but can NEVER let two SKUs' rows in the same
+    shift jointly exceed SHIFT_MINS (verified: 0 new R11B/R15B violations after this
+    fix, vs 0 before — see the accompanying audit).
+
+    A row with Qty > cap is capped at `cap`; the excess is offered to a SIBLING row of
+    the SAME (machine, date, SKU) on ANOTHER shift of the SAME calendar day (carcass
+    1-day shelf -> same-day only) that has spare room (its own cap - its own Qty),
+    extending that sibling's EndTime to stay Qty*CT-consistent (R18B). Both the capped
+    donor row and any topped-up sibling have their EndTime re-derived from their
+    (unchanged) StartTime + Qty*CT so every row stays internally consistent. A residual
+    excess with no same-day home is a genuinely unbuildable unit that day -> DROPPED
+    from the display (carcass is NOT in gt_inventory -> never touches cured/built/
+    coverage) and reported.
+
+    Display-only, KPI-neutral, deterministic (all iteration over sorted keys).
+    Returns (rows, rows_over_before, dropped_total, dropped_by_day)."""
+    _hol = list(holiday_windows or [])
+
+    def _is_carc(r):
+        return r.get("CO_Type") == "carcass" and str(r.get("SKUCode")) != "CHANGEOVER"
+
+    def _is_co(r):
+        return (str(r.get("SKUCode")) == "CHANGEOVER"
+                and r.get("CO_Type") in ("same_size_CO", "diff_size_CO"))
+
+    # FROZEN pre-mutation snapshot: (machine,date,shift) -> CO minutes, and
+    # (machine,date,shift) -> [(sku, qty), ...] for every carcass production row. Used
+    # ONLY to compute each SKU's OTHER-sku budget below — never mutated, so the cap for
+    # one SKU never depends on the processing order of another SKU's fix this pass.
+    _frozen_co: dict = defaultdict(float)
+    _frozen_prod: dict = defaultdict(list)
+    for r in rows:
+        key = (str(r.get("Machine")), str(r.get("Date"))[:10], r.get("Shift"))
+        if _is_co(r):
+            _frozen_co[key] += float(r.get("CO_Mins", 0) or 0)
+        elif _is_carc(r):
+            _frozen_prod[key].append((str(r.get("SKUCode")), float(r.get("Qty", 0) or 0)))
+
+    def _shift_bounds(date, shift):
+        st = _shift_start_dt(date, shift)
+        return st, st + timedelta(minutes=SHIFT_MINS)
+
+    def _avail_for_sku(machine, date, shift, sku):
+        key = (machine, date, shift)
+        st, en = _shift_bounds(date, shift)
+        pm = _down_mins(_BLD_DOWN.get(str(machine)) or [], st, en)
+        hol = _down_mins(_hol, st, en)
+        other = 0.0
+        for s, q in _frozen_prod.get(key, ()):
+            if s == sku:
+                continue
+            ct2 = _bld_ct_sec(machine, s)
+            if ct2 > 0:
+                other += q * ct2 / 60.0
+        return max(0.0, SHIFT_MINS - pm - hol - _frozen_co.get(key, 0.0) - other)
+
+    def _cap(machine, date, shift, sku):
+        ct2 = _bld_ct_sec(machine, sku)
+        if ct2 <= 0:
+            return 0
+        return int(_avail_for_sku(machine, date, shift, sku) * 60.0 / ct2)
+
+    # group production rows by (machine, date, sku) for same-day redistribution
+    by_mds: dict = defaultdict(list)
+    for r in rows:
+        if _is_carc(r):
+            by_mds[(str(r.get("Machine")), str(r.get("Date"))[:10],
+                    str(r.get("SKUCode")))].append(r)
+
+    over_before = 0
+    dropped_total = 0
+    dropped_by_day: dict = defaultdict(int)
+    for (m, dt, sku), rs in sorted(by_mds.items()):
+        rs = sorted(rs, key=lambda r: str(r.get("Shift", "")))
+        ct = _bld_ct_sec(m, sku)
+        # caps are computed ONCE from the frozen snapshot (order-independent) — safe to
+        # precompute per row before any mutation in this group.
+        caps = {id(r): _cap(m, dt, r.get("Shift"), sku) for r in rs}
+        for r in rs:
+            q = int(round(r.get("Qty", 0) or 0))
+            c = caps[id(r)]
+            if q <= c:
+                continue
+            over_before += 1
+            excess = q - c
+            r["Qty"] = c
+            if ct > 0:
+                try:
+                    _rst = datetime.strptime(str(r["StartTime"]), "%Y-%m-%d %H:%M")
+                    _shend = _shift_bounds(dt, r.get("Shift"))[1]
+                    r["EndTime"] = _fmt_dt(min(_shend, _rst + timedelta(minutes=c * ct / 60.0)))
+                except Exception:
+                    pass
+            for other in rs:
+                if other is r or excess <= 0:
+                    continue
+                oc = caps[id(other)]
+                oq = int(round(other.get("Qty", 0) or 0))
+                spare = oc - oq
+                if spare <= 0:
+                    continue
+                take = min(spare, excess)
+                other["Qty"] = oq + take
+                if ct > 0:
+                    try:
+                        _ost = datetime.strptime(str(other["StartTime"]), "%Y-%m-%d %H:%M")
+                        _oshend = _shift_bounds(dt, other.get("Shift"))[1]
+                        other["EndTime"] = _fmt_dt(min(_oshend, _ost + timedelta(minutes=(oq + take) * ct / 60.0)))
+                    except Exception:
+                        pass
+                excess -= take
+            if excess > 0:
+                dropped_total += excess
+                dropped_by_day[dt] += excess
+    return rows, over_before, dropped_total, dict(dropped_by_day)
+
+
 def _daily_capacity_util(cure_shift_rows: list, bld_shift_rows: list,
                          press_stats: dict, planning_days: int) -> list:
     """Per-DAY capacity utilisation for the cloud jkt_plan_capacityUtilisation table
@@ -4172,6 +4606,7 @@ def _assign_building_shift(
     machine_db_skus: dict | None = None,         # INCH_STEP_DRIFT: {machine: un-stripped DB SKUs}
     lookahead_draw: dict | None = None,          # LOOKAHEAD_BUF: {sku: anticipated peak draw today}
     priority_deadline_map: dict | None = None,   # DELIVERY_PRIORITY: {sku: deadline_day} or None
+    priority_dated_skus: set | None = None,      # DELIVERY_PRIORITY: committed SKUs that HAVE a Delivery Date
     writeoff_cum: dict | None = None,            # R8B: cumulative expired GT per SKU (cap tightener)
     fwd_work_shifts: int | None = None,          # #2 NO-PERISH: working shifts inside the GT shelf window (None → full 9)
     bridge_shifts: int = 0,                      # #3 BRIDGE: consecutive holiday shifts imminent (0 → no bridge)
@@ -4182,6 +4617,9 @@ def _assign_building_shift(
     pacing_day_built: float = 0.0,                 # PACING: GT already built earlier today (prior shifts)
     pacing_day_skus: set | None = None,            # PACING: SKUs already built today (widen the active set)
     sku_home_group: dict | None = None,            # SAME_GROUP: {sku: home_group} or None (feature inert)
+    sku_grp_target: dict | None = None,            # SG_DELIB: {sku: frozenset(allowed groups)} (deliberate) or None
+    sku_cur_group: dict | None = None,             # SG_DELIB: {sku: current finer group} (mutable)
+    sku_last_group_move: dict | None = None,       # SG_DELIB: {sku: day of last group MOVE} (cooldown)
 ) -> dict:
     """
     Greedy per-SHIFT building assignment.
@@ -4219,6 +4657,22 @@ def _assign_building_shift(
             return True
         return _s not in machine_left_skus.get(str(_m), ())
     _sku_home = sku_home_group if sku_home_group is not None else {}
+    # ── SG_DELIB (deliberate + stable group allocation) local state ──────────────────
+    # Active only when SG_DELIB is on AND a target map was supplied (day 3+). OFF/None →
+    # every helper below is inert (returns 0 / no-op) → bit-for-bit.
+    _grp_tgt      = sku_grp_target      if sku_grp_target      is not None else {}
+    _grp_cur      = sku_cur_group       if sku_cur_group       is not None else {}
+    _grp_lastmove = sku_last_group_move if sku_last_group_move is not None else {}
+    _sg_delib = bool(_SG_DELIB and sku_grp_target is not None and day > _PLANT_2DAY_DAYS)
+
+    def _sg_multi_ok(_m: str, _s: str) -> bool:
+        """A SKU with a sanctioned MULTI-group TARGET SET (≥2 groups, frozen at day 3) may build in
+        ALL of its target groups — including SIMULTANEOUSLY in the same shift (planned parallel
+        multi-group, e.g. an oversubscribed-inch 13"/15" SKU whose one group saturates). So the
+        same-shift HARD guard is BYPASSED for a machine whose group is IN the SKU's multi-group
+        target. Stable / no ping-pong: the set is frozen, never widened at runtime."""
+        _t = _grp_tgt.get(_s)
+        return bool(_sg_delib and _t and len(_t) >= 2 and _sku_group_of(_m) in _t)
 
     def _group_pen(_m: str, _s: str) -> int:
         """SAME_GROUP soft penalty: 0 if machine `_m`'s finer group == SKU `_s`'s home
@@ -4226,13 +4680,69 @@ def _assign_building_shift(
         candidate when the lever is OFF → inserting it as a tuple slot is order-preserving
         (bit-for-bit). SOFT: it is only ever a LATE tiebreaker (after the deficit/urgency
         tiers), so a starving/urgent SKU is still built cross-group when its home group has
-        no free machine this shift — group purity never overrides demand or starvation."""
-        if not _SAME_GROUP_SOFT:
+        no free machine this shift — group purity never overrides demand or starvation.
+        DELIBERATE mode routes grouping through _sg_move_pen instead → this returns 0."""
+        if not _SAME_GROUP_SOFT or _sg_delib or _s in _SG_EXEMPT_SKUS:
             return 0
         _h = _sku_home.get(_s)
         if not _h:
             return 0
         return 0 if _sku_group_of(_m) == _h else _SAME_GROUP_PEN
+
+    def _sg_move_pen(_m: str, _s: str) -> int:
+        """DELIBERATE stable-group penalty for pair (machine, sku).
+          0  — the machine's finer group is IN the SKU's deliberate target set (sanctioned);
+          0  — a cross-group MOVE that the hysteresis ADMITS (SKU is starving in its target
+               AND the per-SKU cooldown has elapsed) — a deliberate group-level decision;
+          _HYST_BIG — every other cross-group pair (deprioritized so the pair loses → the
+               SKU stays in its assigned group; no per-shift churn / ping-pong).
+        Inert (0) unless deliberate mode is active and the SKU has a target set.
+        Exempt SKUs (SG_EXEMPT_SKUS) are unconstrained → always 0."""
+        if not _sg_delib or _s in _SG_EXEMPT_SKUS:
+            return 0
+        _tgt = _grp_tgt.get(_s)
+        if not _tgt:                       # no deliberate target → unconstrained (free)
+            return 0
+        _g = _sku_group_of(_m)
+        if _g in _tgt:                     # sanctioned group → no penalty
+            return 0
+        # cross-group MOVE: blocked unless the deliberate move-gate is enabled AND the SKU's
+        # target group is STRUCTURALLY behind — cumulative monthly gap > _SG_MOVE_GAP_SHIFTS
+        # shifts of draw AND starving THIS shift (dead-band) AND the per-SKU cooldown elapsed.
+        # Momentary per-shift lag alone is NOT enough (that keeps groups stable).
+        if not _SG_MOVE_ADMIT:
+            return _HYST_BIG
+        _draw = shift_cure_demand.get(_s, 0.0)
+        if _draw <= 0.0:
+            return _HYST_BIG
+        _proj = projected_gt.get(_s, 0.0)
+        _starving = _proj < _draw * (1.0 + _SG_MOVE_BAND)
+        _gap = demand_remaining.get(_s, 0.0) - _proj
+        _behind = _gap > _draw * _SG_MOVE_GAP_SHIFTS
+        _cool_ok = (day - _grp_lastmove.get(_s, -10**9)) >= _SG_MOVE_COOLDOWN_DAYS
+        if _starving and _behind and _cool_ok:
+            return 0                       # deliberate structural move admitted (waived)
+        return _HYST_BIG
+
+    def _sg_pair_blocked(_m: str, _s: str) -> bool:
+        """HARD group purity: True when pair (machine, sku) is a NON-admitted cross-group move
+        and SG_HARD is on → drop it from the candidate pool (machine idles rather than build a
+        foreign SKU). Inert when deliberate mode / SG_HARD is off."""
+        return bool(_sg_delib and _SG_HARD and _sg_move_pen(_m, _s) >= _HYST_BIG)
+
+    def _sg_move_commit(_m: str, _s: str) -> None:
+        """Record an ADMITTED cross-group move: sanction the new group permanently (add to
+        the SKU's target set → stable, no ping-pong) and stamp the move day (cooldown)."""
+        if not _sg_delib:
+            return
+        _tgt = _grp_tgt.get(_s)
+        if not _tgt:
+            return
+        _g = _sku_group_of(_m)
+        if _g in _tgt:
+            return
+        _grp_tgt[_s] = frozenset(_tgt | {_g})
+        _grp_lastmove[_s] = day
     machine_day_diff_co = machine_day_diff_co if machine_day_diff_co is not None else {}
     machine_day_co = machine_day_co if machine_day_co is not None else {}
     fixed_escape_used = fixed_escape_used if fixed_escape_used is not None else {}
@@ -4433,6 +4943,7 @@ def _assign_building_shift(
     # map → OFF/empty = bit-for-bit baseline. Reads projected_gt live so it stops
     # boosting a SKU already filled this shift (never overbuilds past the cap).
     _pdm_bld: dict = {str(k): int(v) for k, v in (priority_deadline_map or {}).items()}
+    _prio_dated_bld: set = {str(s) for s in (priority_dated_skus or _PRIO_DATED_SKUS)}  # committed SKUs WITH a Delivery Date
     _prio_on_bld = _DELIVERY_PRIORITY_ENABLED and _DP_BLD and bool(_pdm_bld)
     def _bld_prio(sku: str) -> tuple:
         if not _prio_on_bld:
@@ -4442,6 +4953,34 @@ def _assign_building_shift(
             return (1, 0.0)
         behind = demand_remaining.get(sku, 0.0) - projected_gt.get(sku, 0.0)
         return (0, float(dd)) if behind > 0 else (1, 0.0)
+
+    def _delivery_relax(sku: str) -> bool:
+        """AT-RISK soft-rule relaxation for a committed SKU (drives both the gate bypasses and the
+        Phase-A preemption). RELAX only when the SKU is at RISK of missing its target under normal
+        rules — i.e. it has fallen behind the linear pace to its deadline (built < demand·day/dd).
+        While on pace, returns False → normal optimisation + ordering priority only (no relaxation).
+        Split by SKU type + gated by the matching (mutually-exclusive) toggle:
+          • DATED SKU     → gated by DELIVERY_DATE_ALL_SOFT_RULES_RELAXED, pace toward its date.
+          • FLAG/UNDATED  → gated by PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED, pace toward month-end.
+        KEEPS allowable/tooling + demand cap + mould feasibility. Never fires once demand is met."""
+        if not _prio_on_bld:
+            return False
+        dd = _pdm_bld.get(sku)
+        if dd is None:
+            return False
+        _rem = demand_remaining.get(sku, 0.0)
+        if _rem <= 1e-9:                                   # demand met → nothing to relax
+            return False
+        # which mode governs this SKU, and is it enabled?
+        _is_dated = sku in _prio_dated_bld
+        if not (_DELIVERY_DATE_RELAX if _is_dated else _PRIORITY_FLAG_MONTHEND_RELAX):
+            return False
+        # AT-RISK = behind the linear build pace to the deadline `dd` (1-based plan day).
+        _orig = float((demand_dict or {}).get(sku, _rem))
+        if _orig <= 0 or day >= dd:                        # deadline reached/passed & still owed → relax
+            return True
+        _allowed_rem = _orig * (dd - day) / dd             # on-pace remaining by end of `day`
+        return _rem > _allowed_rem + 1e-9                  # behind pace → at risk → relax
 
     if _GLOBAL_ASSIGN_ENABLED:
         # ══ Global machine-SKU scoring assignment (supersedes per-machine greedy) ══
@@ -4771,7 +5310,18 @@ def _assign_building_shift(
                            and _MACHINE_GROUP.get(m, "") != "STAGE1")
             s["eff_buf"] = eff_buf                        # T2: stored for the Phase-B rotation gate
             _base_buf = buf if _RT_IMMINENT else eff_buf  # T2: Phase A builds only flat when RT_IMMINENT
-            _room = (max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0) - _woc.get(cur, 0.0))
+            # ── DELIVERY PREEMPTION ────────────────────────────────────────────────
+            # A machine ALLOWABLE for an AT-RISK committed SKU, whose CURRENT sku is NOT itself an
+            # at-risk committed SKU, ABANDONS its continuation (room→0) so Phase-B CO's it onto the
+            # committed SKU this shift (e.g. 7105/7106 drop the huge non-committed SUNE1 to build the
+            # committed SXC1T/TUNE6 when they fall behind pace to their deadline). Only fires when a
+            # committed SKU is AT RISK (via _delivery_relax) — not for on-pace SKUs. EDF ordering
+            # comes from _bld_prio; allowable/tooling + demand cap + mould feasibility unchanged.
+            _preempt_delivery = (_ANY_DELIVERY_RELAX and _prio_on_bld
+                                 and not _delivery_relax(cur)
+                                 and any(_delivery_relax(x) for x in machine_skus.get(m, set())))
+            _room = (0.0 if _preempt_delivery else
+                     max(0.0, demand_remaining.get(cur, 0.0) - projected_gt.get(cur, 0.0) - _woc.get(cur, 0.0))
                      if (_cap_max or _pin_d1a_m) else _defc(cur, GT_SHELF_LIFE_SHIFTS) if _sticky_now
                      else _defc(cur, _base_buf))
             # BLD_CURABLE_CAP: the captive-max / sticky / D1A-pin room can outrun the SKU's curing
@@ -4795,7 +5345,7 @@ def _assign_building_shift(
             # deeper horizon that DYN_BUFFER's per-SKU _dyn_H would otherwise cap short). OFF
             # or no live draw → _cont_room=0 → _room unchanged (bit-for-bit).
             if (_STICKY_MACHINE and cur and cur in eligible and not flex_reclaim
-                    and not (_cap_max or _sticky_now or _pin_d1a_m)
+                    and not (_cap_max or _sticky_now or _pin_d1a_m) and not _preempt_delivery
                     and demand_remaining.get(cur, 0.0) > 0
                     and shift_cure_demand.get(cur, 0.0) > 0):
                 _cont_b = min(_STICKY_CONT_SHIFTS, _pace_shelf)
@@ -4825,10 +5375,42 @@ def _assign_building_shift(
                 flex_reclaim = False        # keep it on its carried SKU (don't reclaim dominant)
                 if _STICKY_HANDOFF_LOCK:
                     _d1a_pin_lock.add(m)    # (optional) Phase B/C skip it → hard no-swap this shift
-            if cur in eligible and _room > 0 and not flex_reclaim:
+            # SG_DELIB HARD guard (Phase A): don't continue `cur` if another machine has
+            # already committed it THIS shift in a DIFFERENT finer group — release m to
+            # Phase B/C instead so the SKU stays in ONE group this shift (invariant #3).
+            _sg_cont_block = False
+            if _sg_delib and cur and cur not in _SG_EXEMPT_SKUS and not _sg_multi_ok(m, cur):
+                _mg_c = _sku_group_of(m)
+                # (i) SKU already committed to a different group this shift, OR
+                # (ii) HARD purity: m's group is not in cur's sanctioned target set.
+                if _sg_pair_blocked(m, cur):
+                    _sg_cont_block = True
+                else:
+                    for _mm in machines:
+                        if _mm == m:
+                            continue
+                        for (_cs, _cq, _ct) in stg[_mm]["campaigns"]:
+                            if _cq > 0 and _cs == cur and _sku_group_of(_mm) != _mg_c:
+                                _sg_cont_block = True
+                                break
+                        if _sg_cont_block:
+                            break
+            if cur in eligible and _room > 0 and not flex_reclaim and not _sg_cont_block:
                 _ra = _bld_qty_per_shift(m, cur) / SHIFT_MINS   # per-SKU CT rate
                 mins = min(s["remaining"], _room / _ra if _ra > 0 else s["remaining"])
-                qty = int(mins * _ra)
+                # CONTINUOUS BUILD CARRY (plant rule): use the EXACT (non-floored) unit rate and add
+                # the fractional unit carried from the prior shift IF this machine continued `cur`.
+                # Only carries OUT when this continuation is TIME-bound (spent the whole shift) —
+                # a demand/shelf-bound campaign has spare time, no in-progress unit at the boundary.
+                _ctsec_cur = _bld_ct_sec(m, cur)
+                _exact_u = (mins * 60.0 / _ctsec_cur) if _ctsec_cur > 0 else 0.0
+                _prevc   = _BLD_CARRY_UNITS.get(str(m)) if _BLD_CYCLE_CARRY else None
+                _carry_in_u = _prevc[1] if (_prevc and _prevc[0] == cur) else 0.0
+                _tot_u = _exact_u + _carry_in_u
+                qty = int(_tot_u) if _BLD_CYCLE_CARRY else int(mins * _ra)
+                _time_bound = mins >= s["remaining"] - 1e-6
+                if _BLD_CYCLE_CARRY:
+                    _BLD_CARRY_UNITS[str(m)] = (cur, (_tot_u - qty)) if (_time_bound and qty > 0) else (cur, 0.0)
                 _qc = _dyn_cap_qty(cur, qty)                    # bound overnight excess by 7k cap
                 if _qc != qty:
                     qty = _qc
@@ -4849,6 +5431,17 @@ def _assign_building_shift(
             pairs = []
             flex_m: dict = {}
             flex_s: dict = {}
+            # SG_DELIB HARD guard: which finer group each SKU is ALREADY committed to THIS
+            # shift (Phase-A continuations + earlier Phase-B picks). Recomputed each greedy
+            # iteration; a pair that would build the SKU in a DIFFERENT group is skipped →
+            # a SKU is never produced in >1 group in one shift (invariant #3). Inert when OFF.
+            _shift_grp: dict = {}
+            if _sg_delib:
+                for _mm in machines:
+                    _mg = _sku_group_of(_mm)
+                    for (_cs, _cq, _ct) in stg[_mm]["campaigns"]:
+                        if _cq > 0 and _cs not in _shift_grp:
+                            _shift_grp[_cs] = _mg
             for m in machines:
                 if m in _d1a_pin_lock:
                     continue   # BLD_SEED_PIN_D1A: hard-pinned machine keeps ONLY its seed build
@@ -4864,10 +5457,18 @@ def _assign_building_shift(
                 for sku in machine_skus.get(m, set()):
                     if sku == cur and not _GLOBAL_SCORE_V2:
                         continue   # V2: fold continuation into the pool as a CO=0 candidate
-                    if sku != cur and not _sku_revert_ok(m, sku):
+                    _dlvr = _delivery_relax(sku)   # delivery-date SKU → relax soft rules (keep allowable)
+                    if _sg_delib and sku not in _SG_EXEMPT_SKUS and not _dlvr and not _sg_multi_ok(m, sku):
+                        _cg = _shift_grp.get(sku)
+                        if (_SG_SAMESHIFT_HARD and _cg is not None
+                                and _cg != _sku_group_of(m)):
+                            continue   # SG_DELIB: SKU already built in another group this shift
+                        if _sg_pair_blocked(m, sku):
+                            continue   # SG_HARD: non-admitted cross-group pair → machine idles
+                    if sku != cur and not _sku_revert_ok(m, sku) and not _dlvr:
                         continue   # SKU_NO_REVERT: never re-build a SKU this machine has left
                     if sku != cur and not _plus3_direct_ok(
-                            m, sku_inch.get(cur, ""), sku_inch.get(sku, ""), buf):
+                            m, sku_inch.get(cur, ""), sku_inch.get(sku, ""), buf) and not _dlvr:
                         continue   # #2: two-hop through a productive intermediate, not a direct 8h +3
                     d = _defc(sku, buf)
                     if d <= 0:
@@ -4880,32 +5481,32 @@ def _assign_building_shift(
                             and _dyn_headroom() <= 0):
                         continue
                     # 4-SKU/day cap: skip a CO that would be the 5th distinct SKU today.
-                    if _sku_cap_blocks(m, sku, (c[0] for c in s["campaigns"])):
+                    if _sku_cap_blocks(m, sku, (c[0] for c in s["campaigns"])) and not _dlvr:
                         continue
                     to_inch = sku_inch.get(sku, "")
                     # ── Fixed-machine escape gate (Lever B): a fixed machine may reach an
                     # off-dominant inch only after its own inch is done, <= 1 diff-CO. ──
-                    if _fixed_esc_block(m, to_inch, cur_inch):
+                    if _fixed_esc_block(m, to_inch, cur_inch) and not _dlvr:
                         continue
                     # ── Client inch rules (Rule 1a no-revisit + Rule 2 band) ──
-                    if not _inch_gate(m, to_inch, cur_inch):
+                    if not _inch_gate(m, to_inch, cur_inch) and not _dlvr:
                         continue
                     # ── Leave gate: 5-day inch dwell OR deficit-done override ──
                     if (_INCH_RULES_ENABLED and to_inch != cur_inch
-                            and not _may_leave_inch(m, cur_inch, _defc, buf, rate)):
+                            and not _may_leave_inch(m, cur_inch, _defc, buf, rate) and not _dlvr):
                         continue
                     # ── Diff-size-CO amortization gate: block wasteful inch-hop churn ──
-                    if _DIFF_CO_GATE and to_inch != cur_inch and not _diff_co_ok(m, to_inch):
+                    if _DIFF_CO_GATE and to_inch != cur_inch and not _diff_co_ok(m, to_inch) and not _dlvr:
                         continue
                     # ── Part 2 JIT churn control: urgency margin + per-day budget + amortization ──
-                    if to_inch != cur_inch and not _jit_diff_ok(m, cur_inch, to_inch, buf):
+                    if to_inch != cur_inch and not _jit_diff_ok(m, cur_inch, to_inch, buf) and not _dlvr:
                         continue
                     if (m in (_SOFT_LOCK_MACHINES | _INCH_FLEX_MACHINES)
                             and to_inch != dom and not s["primary_done"]
                             and not _INCH_RULES_ENABLED):
                         continue
                     cost = 0.0 if (_GLOBAL_SCORE_V2 and sku == cur) else _co_cost(m, cur_inch, to_inch, from_sku=cur, to_sku=sku)
-                    if s["remaining"] - cost < MIN_CAMPAIGN_MINS:
+                    if s["remaining"] - cost < MIN_CAMPAIGN_MINS and not _dlvr:
                         continue
                     is_urgent = (sku in co_target_skus and projected_gt.get(sku, 0.0) == 0
                                  and demand_remaining.get(sku, 0.0) > 0)
@@ -4916,7 +5517,7 @@ def _assign_building_shift(
                     # the 30% cost guard must not block it — the machine would idle.
                     if _INCH_RULES_ENABLED and to_inch != cur_inch:
                         _flex_off_ok = True
-                    if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok:
+                    if cost > 0.30 * s["remaining"] and not is_urgent and not _flex_off_ok and not _dlvr:
                         continue
                     avail = s["remaining"] - cost
                     _ra = _bld_qty_per_shift(m, sku) / SHIFT_MINS   # per-SKU CT rate
@@ -4929,7 +5530,7 @@ def _assign_building_shift(
                     if (_S2_CAMPAIGN and sku != cur
                             and _MACHINE_GROUP.get(str(m), "") == "STAGE2"):
                         _min_camp = max(_min_camp, _S2_MIN_CAMPAIGN_MINS)
-                    if mins < _min_camp or qty <= 0:
+                    if (mins < _min_camp and not _dlvr) or qty <= 0:
                         continue
                     tier, primary = _tierg(sku, m, d)
                     # Prefer staying on the CURRENT inch (cheap same-size CO) once the
@@ -5031,8 +5632,12 @@ def _assign_building_shift(
                 # greedy: max U (SAME_GROUP home-group tiebreak, then lower CO, m, sku).
                 # -_group_pen is a constant 0 for every pair when the lever is OFF → the
                 # ordering is unchanged (bit-for-bit).
+                # SG_DELIB: the deliberate stable-group term dominates U (a blocked cross-group
+                # move → -_HYST_BIG, always beaten by any sanctioned/admitted pair). 0 for all
+                # pairs (identity) when deliberate mode is OFF → bit-for-bit.
                 m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = max(
-                    pairs, key=lambda p: (_U[(p[0], p[1])],
+                    pairs, key=lambda p: ((-_sg_move_pen(p[0], p[1]),) if _sg_delib else ()) + (
+                                          _U[(p[0], p[1])],
                                           -(_pickup_pen(p[0], p[1]) + _group_pen(p[0], p[1])),
                                           -p[2], p[0], p[1]))
                 s = stg[m]
@@ -5040,7 +5645,7 @@ def _assign_building_shift(
             else:
                 _pick_done = False
 
-            def _key(p):
+            def _key_base(p):
                 m, sku, cost, to_inch, tier, primary, qty, mins, inch_penalty = p
                 # Combined soft stickiness: machine-level pickup damper (migration waste) +
                 # coarse group-home penalty. 0 for every candidate when both levers are OFF →
@@ -5112,6 +5717,15 @@ def _assign_building_shift(
                             tier, primary, _gp, cost, m, sku)
                 return (inch_penalty, constraint, tier, primary, _gp, cost, m, sku)  # "above"
 
+            def _key(p):
+                # SG_DELIB: prepend the DELIBERATE stable-group penalty as the DOMINANT term
+                # (0 = sanctioned/target group or admitted move; _HYST_BIG = blocked cross-group
+                # move → the pair loses), so a SKU is built by its assigned group whenever that
+                # group can serve it — group purity above urgency (priority #7, coverage cost
+                # accepted). Inert (identity, bit-for-bit) when deliberate mode is OFF.
+                _b = _key_base(p)
+                return ((_sg_move_pen(p[0], p[1]),) + _b) if _sg_delib else _b
+
             if not _pick_done:
                 # DELIVERY_PRIORITY: prepend the committed-delivery EDF rank so a behind
                 # committed SKU wins its eligible machines first. Identity when inactive.
@@ -5160,6 +5774,7 @@ def _assign_building_shift(
                 if _FIXED_ESCAPE_ENABLED and str(m) in _FIXED_MACHS_HIST:
                     fixed_escape_used[str(m)] = fixed_escape_used.get(str(m), 0) + 1  # Lever B budget
             s["campaigns"].append((sku, qty, co_type))
+            _sg_move_commit(m, sku)                  # SG_DELIB: sanction an admitted cross-group move
             projected_gt[sku] = projected_gt.get(sku, 0.0) + qty
             s["remaining"] -= (cost + mins)
             _conc_commit(m, sku, qty)                # CONCENTRATION: count the Phase-B pick
@@ -5364,10 +5979,26 @@ def _assign_building_shift(
                     if _ENDOFDAY_GT_CAP_ENABLED and hr <= 0:
                         break
                     dom = s["dom"]; cur = s["cur_sku"]; cur_inch = sku_inch.get(cur, "")
+                    # SG_DELIB HARD guard: groups already committed to each SKU this shift.
+                    _shift_grp_c: dict = {}
+                    if _sg_delib:
+                        for _mm in machines:
+                            _mg = _sku_group_of(_mm)
+                            for (_cs, _cq, _ct) in stg[_mm]["campaigns"]:
+                                if _cq > 0 and _cs not in _shift_grp_c:
+                                    _shift_grp_c[_cs] = _mg
                     best = None; best_key = None; best_room = 0.0
                     for sku in machine_skus.get(m, set()):
-                        if sku != cur and not _sku_revert_ok(m, sku):
+                        _dlvr = _delivery_relax(sku)   # delivery-date SKU → relax soft rules (Phase C)
+                        if sku != cur and not _sku_revert_ok(m, sku) and not _dlvr:
                             continue   # SKU_NO_REVERT (Phase C): don't pre-build a left SKU
+                        if _sg_delib and sku not in _SG_EXEMPT_SKUS and not _dlvr and not _sg_multi_ok(m, sku):
+                            _cg = _shift_grp_c.get(sku)
+                            if (_SG_SAMESHIFT_HARD and _cg is not None
+                                    and _cg != _sku_group_of(m)):
+                                continue   # SG_DELIB: SKU already built in another group this shift
+                            if _sg_pair_blocked(m, sku):
+                                continue   # SG_HARD: non-admitted cross-group pair → machine idles
                         if sku != cur and not _plus3_direct_ok(m, cur_inch, sku_inch.get(sku, ""), _buf_of(m)):
                             continue   # #2: two-hop through a productive intermediate, not direct 8h
                         draw = _eff_draw(sku)              # LOOKAHEAD_BUF: anticipated peak draw
@@ -5406,7 +6037,7 @@ def _assign_building_shift(
                                 and projected_gt.get(sku, 0.0) >= draw * _FWD_RISK_SHIFTS):
                             continue
                         need_co = (sku != cur)
-                        if need_co and s["co_count"] >= s["max_cos"]:
+                        if need_co and s["co_count"] >= s["max_cos"] and not _dlvr:
                             continue
                         # S2_CAMPAIGN per-day CO budget: no more Stage-2 switches once spent.
                         if need_co and _s2_co_budget_blocks(m):
@@ -5483,7 +6114,11 @@ def _assign_building_shift(
                             _pace_star_rank = 0 if _pace_starving else 1
                             _pace_spread = (0 if (_pace_served is not None
                                                   and sku not in _pace_served) else 1)
-                        key = (# DELIVERY_PRIORITY: a behind committed SKU is pre-built first
+                        key = (# SG_DELIB: DOMINANT stable-group term (0 = target/admitted move;
+                               # _HYST_BIG = blocked cross-group → the SKU loses this idle machine).
+                               # 0 for all pairs when deliberate mode is OFF → order-preserving.
+                               _sg_move_pen(m, sku),
+                               # DELIVERY_PRIORITY: a behind committed SKU is pre-built first
                                # (EDF). (1,0.0) constant when inactive → order-preserving.
                                _bld_prio(sku),
                                # CONCENTRATION: defer an idle machine from piling onto an
@@ -5539,6 +6174,7 @@ def _assign_building_shift(
                         machine_last_diff_co_day[m] = day
                         machine_day_diff_co[m] = machine_day_diff_co.get(m, 0) + 1   # Part 2 budget
                     s["campaigns"].append((best, qty, co_type))
+                    _sg_move_commit(m, best)         # SG_DELIB: sanction an admitted cross-group move
                     projected_gt[best] = projected_gt.get(best, 0.0) + qty
                     _fwd_added += qty
                     if _pace_served is not None:
@@ -6152,6 +6788,19 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0,
             # EndTime=max, which would merge two pieces ACROSS the maintenance-window gap and
             # re-create the very overlap the window-skip above removed. Leaving the (few) sub-MPQ
             # fragments as separate rows is total-preserving and keeps every row clear of the window.
+            # BUG (found auditing Stage-1 carcass over-capacity rows, e.g. machine 6803 /
+            # 2026-09-14 / SKU 1325119815106QBRQ0 emitted Qty=161 spanning 484 min into the
+            # next shift): the fold below used to merge a sub-mpq fragment into ITS NEIGHBOUR
+            # UNCONDITIONALLY, incl. across a shift boundary — that recombines exactly the two
+            # pieces the boundary-split above exists to keep apart, reproducing a row whose
+            # Qty exceeds its own shift's physical capacity (floor(SHIFT_MINS*60/ct)) and whose
+            # EndTime spills past the shift. Now the merge only fires when the COMBINED
+            # [min(StartTime), max(EndTime)] stays inside ONE shift window (`_shift_of` agrees
+            # for the merged start and the merged end's last minute) — i.e. it may only fold
+            # fragments that were already in the SAME shift (e.g. from overlap resequencing),
+            # never a genuine cross-shift split artifact. If no neighbour is safe, the sub-mpq
+            # fragment is left as its own (small) row rather than fabricating an over-capacity
+            # one — total Qty is still preserved exactly, just not folded away cosmetically.
             if mpq > 0 and qfloor > 0 and len(_pieces) > 1 and not _mw:
                 _guard = 0
                 while len(_pieces) > 1 and _guard < 64:
@@ -6159,10 +6808,19 @@ def _split_rows_at_shift_boundaries(rows, mkey="Machine", even_qty=False, mpq=0,
                     _sm = min(range(len(_pieces)), key=lambda k: int(_pieces[k].get("Qty", 0) or 0))
                     if int(_pieces[_sm].get("Qty", 0) or 0) >= mpq:
                         break
-                    if _sm > 0 and _sm < len(_pieces) - 1:
-                        _nb = _sm - 1 if int(_pieces[_sm-1]["Qty"]) >= int(_pieces[_sm+1]["Qty"]) else _sm + 1
-                    else:
-                        _nb = _sm - 1 if _sm > 0 else _sm + 1
+                    _cands = [k for k in (_sm - 1, _sm + 1) if 0 <= k < len(_pieces)]
+                    _cands.sort(key=lambda k: -int(_pieces[k].get("Qty", 0) or 0))
+                    _nb = None
+                    for _c in _cands:
+                        _ns = _p(min(_pieces[_c]["StartTime"], _pieces[_sm]["StartTime"]))
+                        _ne = _p(max(_pieces[_c]["EndTime"],   _pieces[_sm]["EndTime"]))
+                        if _ns is None or _ne is None:
+                            continue
+                        if _shift_of(_ns) == _shift_of(max(_ns, _ne - _td(minutes=1))):
+                            _nb = _c
+                            break
+                    if _nb is None:
+                        break     # no shift-safe neighbour — keep the sub-mpq fragment as-is
                     _pieces[_nb]["Qty"] = int(_pieces[_nb]["Qty"]) + int(_pieces[_sm].get("Qty", 0) or 0)
                     _pieces[_nb]["StartTime"] = min(_pieces[_nb]["StartTime"], _pieces[_sm]["StartTime"])
                     _pieces[_nb]["EndTime"]   = max(_pieces[_nb]["EndTime"], _pieces[_sm]["EndTime"])
@@ -6269,25 +6927,131 @@ def _write_rolling_building_excel(
             return (int(_r.get("Qty", 0) or 0) > 0
                     and int(_r.get("CO_Mins", 0) or 0) == 0
                     and str(_r.get("SKUCode")) not in _SENTINEL)
+        def _pdt(_s):
+            try:
+                return datetime.strptime(str(_s), "%Y-%m-%d %H:%M")
+            except Exception:
+                return None
         _grp = _dd(list)   # (machine, date, sku) -> [row,...]
         for r in bld_shift_rows:
             if _is_prod(r):
                 _grp[(str(r["Machine"]), str(r["Date"])[:10], str(r["SKUCode"]))].append(r)
         _drop = set()
-        for _rs in _grp.values():
+        for (_mch, _dt0, _sk), _rs in _grp.items():
             if len(_rs) < 2:
                 continue
             if not any(0 < int(x.get("Qty", 0) or 0) < _MINF for x in _rs):
                 continue
-            _big = max(_rs, key=lambda x: int(x.get("Qty", 0) or 0))
+            # BUG (found auditing over-capacity carcass rows, e.g. machine 6803 / 2026-09-14
+            # / SKU 1325119815106QBRQ0: two sub-threshold tails (27 + 2 units) both folded
+            # BLINDLY into the day's single biggest slice — 132(cap) + 27 + 2 = 161, a Qty no
+            # 480-min shift can physically build for this SKU's cycle time). The fold now only
+            # accepts a tail into a sibling that has SPARE room in its OWN recorded shift span
+            # (sibling's existing [StartTime,EndTime] duration + the tail's own production time
+            # at this (machine,SKU) cycle time ≤ SHIFT_MINS) — never past a full shift, and
+            # never past whatever less-than-full span the sibling already reflects (e.g. a
+            # PM/MTC-shortened shift). A tail with no capacity-safe sibling is left as its own
+            # (small) display row instead of being folded into a physically-impossible one.
+            _ct = _bld_ct_sec(_mch, _sk)
             for _r in _rs:
-                if _r is _big:
+                _q = int(_r.get("Qty", 0) or 0)
+                if not (0 < _q < _MINF) or id(_r) in _drop:
                     continue
-                if 0 < int(_r.get("Qty", 0) or 0) < _MINF:
-                    _big["Qty"] = int(_big.get("Qty", 0) or 0) + int(_r.get("Qty", 0) or 0)
-                    _drop.add(id(_r))
+                _tail_min = (_q * _ct / 60.0) if _ct > 0 else 0.0
+                _recv = None
+                for _cand in sorted((x for x in _rs if x is not _r and id(x) not in _drop),
+                                     key=lambda x: -int(x.get("Qty", 0) or 0)):
+                    _cs, _ce = _pdt(_cand.get("StartTime")), _pdt(_cand.get("EndTime"))
+                    _cand_span = (_ce - _cs).total_seconds() / 60.0 if (_cs and _ce) else 0.0
+                    if _ct <= 0 or _cand_span + _tail_min <= SHIFT_MINS + 1e-6:
+                        _recv = _cand
+                        break
+                if _recv is None:
+                    continue     # no shift-capacity-safe sibling — keep this tail row as-is
+                _recv["Qty"] = int(_recv.get("Qty", 0) or 0) + _q
+                _drop.add(id(_r))
         if _drop:
             bld_shift_rows = [r for r in bld_shift_rows if id(r) not in _drop]
+
+    # Carcass FINAL shift-cap enforcement (residual cumulative-rounding fix — see
+    # `_enforce_carcass_shift_cap` docstring). Runs AFTER the boundary split + tail-fold
+    # above so it sees the truly final rows; catches the 1-2-unit-over-strict-floor-cap
+    # artifact the earlier fixes (over-480-min-span, tail-fold) did not target. Display-
+    # only / KPI-neutral (carcass not in gt_inventory). CARCASS_SHIFT_CAP=0 disables.
+    if _CARCASS_SHIFT_CAP_ENFORCE and any(r.get("CO_Type") == "carcass" for r in bld_shift_rows):
+        bld_shift_rows, _cap_over, _cap_dropped, _cap_dropped_by_day = _enforce_carcass_shift_cap(
+            bld_shift_rows, holiday_windows=_hol_wc_windows)
+        # a row capped all the way down to 0 (its whole shift was PM/MTC/CO-consumed) is a
+        # zero-production stub — drop it from the display rather than showing a 0-Qty row.
+        bld_shift_rows = [r for r in bld_shift_rows
+                           if not (r.get("CO_Type") == "carcass"
+                                   and str(r.get("SKUCode")) != "CHANGEOVER"
+                                   and int(round(r.get("Qty", 0) or 0)) <= 0)]
+        if _cap_over:
+            print(f"  [Stage-1 carcass] shift-cap enforce: {_cap_over:,} row(s) were over their "
+                  f"strict per-shift floor cap (residual rounding artifact) -> re-capped"
+                  + (f"; {_cap_dropped:,} unit(s) unbuildable that day (dropped, display-only): "
+                     + ", ".join(f"{d}={q}" for d, q in sorted(_cap_dropped_by_day.items()))
+                     if _cap_dropped else "; 0 units dropped (all excess re-homed same-day)") + ".")
+
+    # HARD min-carcass floor on the display rows: fold any sub-MIN carcass slice left by the
+    # renderer / shift-cap redistribution into a same-(machine,date,SKU) sibling (preserves the
+    # day total → GT/curing sync + R5 untouched). Runs before the PM relocate so re-timed rows
+    # still get maintenance-cleared. OFF (CARCASS_MIN_ENFORCE=0) → bit-for-bit.
+    bld_shift_rows = _enforce_carcass_min_qty(bld_shift_rows)
+
+    # PM/MTC no-overlap for carcass rows: qty was already reduced for maintenance upstream, but
+    # the emitted time span could still straddle a window (a naive shift-start cursor). Relocate
+    # each straddling carcass row into its shift's free sub-interval(s). Display-only / KPI-neutral
+    # (mirrors the curing-side _pm_relocate_curing_rows). OFF (PM_MTC off) = bit-for-bit.
+    bld_shift_rows = _pm_relocate_carcass_rows(bld_shift_rows)
+
+    # ── SYNC: cap Stage-2 GT to displayed carcass per SKU (drop the extra GT) ─────────
+    # After all carcass finalization (min-10 fold/drop, shift-cap, PM), the displayed carcass
+    # per SKU is FINAL. Cap each Stage-2 SKU's total GT display rows to (carcass + opening
+    # carcass) so no GT is shown without carcass backing → R5 (GT ≤ carcass) holds. Report the
+    # per-SKU carcass cap so the caller reduces cured/coverage in sync (drop carcass+GT+cured
+    # together). Non-Stage-2 GT (VMI/BJ/Unistage — no carcass) is untouched. OFF → bit-for-bit.
+    _carcass_cap_by_sku: dict = {}
+    _gt_drop_by_sku: dict = {}
+    if _CARCASS_MIN_ENFORCE:
+        from collections import defaultdict as _dd2
+        _carc_tot = _dd2(float); _gt_rows = _dd2(list)
+        _gt_drop_by_sku = _dd2(float)
+        for r in bld_shift_rows:
+            _sk = str(r.get("SKUCode", "")); _grp = _MACHINE_GROUP.get(str(r.get("Machine", "")), "")
+            if r.get("CO_Type") == "carcass" and _sk != "CHANGEOVER":
+                _carc_tot[_sk] += float(r.get("Qty", 0) or 0)
+            elif (_grp == "STAGE2" and _sk not in _SENTINEL
+                  and int(r.get("CO_Mins", 0) or 0) == 0 and float(r.get("Qty", 0) or 0) > 0):
+                _gt_rows[_sk].append(r)
+        for _sk, _rows in _gt_rows.items():
+            _cap = _carc_tot.get(_sk, 0.0)                # displayed carcass (opening ignored → strict)
+            _carcass_cap_by_sku[_sk] = _cap
+            _tot = sum(float(r.get("Qty", 0) or 0) for r in _rows)
+            _excess = _tot - _cap
+            if _excess <= 1e-6:
+                continue
+            _gt_drop_by_sku[_sk] = _excess
+            for r in sorted(_rows, key=lambda x: str(x.get("StartTime", "")), reverse=True):
+                if _excess <= 1e-6:
+                    break
+                _q = float(r.get("Qty", 0) or 0); _d = min(_q, _excess)
+                _newq = int(round(_q - _d)); _excess -= _d
+                _ctm = _bld_ct_sec(str(r.get("Machine", "")), _sk)
+                r["Qty"] = _newq
+                _cs = None
+                try:
+                    _cs = datetime.strptime(str(r.get("StartTime")), "%Y-%m-%d %H:%M")
+                except (TypeError, ValueError):
+                    _cs = None
+                if _cs and _ctm > 0:
+                    r["EndTime"] = _fmt_dt(_cs + timedelta(minutes=_newq * _ctm / 60.0))
+        # drop now-zero Stage-2 GT rows
+        _zids = {id(r) for _rows in _gt_rows.values() for r in _rows
+                 if int(round(r.get("Qty", 0) or 0)) <= 0}
+        if _zids:
+            bld_shift_rows = [r for r in bld_shift_rows if id(r) not in _zids]
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -6754,6 +7518,7 @@ def _write_rolling_building_excel(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
     print(f"  [Rolling] Building output → {output_path}")
+    return _carcass_cap_by_sku, dict(_gt_drop_by_sku)   # carcass cap + GT dropped, per SKU (caller cured-sync)
 
 
 def _write_rolling_curing_excel(
@@ -6816,6 +7581,36 @@ def _write_rolling_curing_excel(
     # even_qty=True → every shift's cured Qty is EVEN (2 cavities = 2 tyres/cycle; a boundary
     # cycle is credited to its completion shift). Preserves per-(press,SKU) totals.
     cure_shift_rows = _split_rows_at_shift_boundaries(cure_shift_rows, "Machine", even_qty=True, mpq=_CURING_MPQ)
+
+    # CONTINUOUS CARRY display: the shift-boundary split can emit a press's continuous-cured shift
+    # as a main row + a small straddling-cycle completion row (30 + 2 → 32). Consolidate same-
+    # (press, date, shift, SKU) PRODUCTION rows into ONE row (sum Qty; EndTime = Start + Qty/2·CT)
+    # so each shift shows the true per-shift cured (e.g. 32) and the per-shift feasibility rules see
+    # one press = 2 mould cavities. Quantity-preserving; CO / clean / PM rows untouched.
+    if _CURE_CYCLE_CARRY:
+        def _p_dt(_s):
+            try:
+                return datetime.strptime(str(_s), "%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                return None
+        _seen_pk: dict = {}; _cons_out = []
+        for r in cure_shift_rows:
+            _q = float(r.get("Qty", 0) or 0)
+            if _q > 0 and str(r.get("_status", "RUNNING")) == "RUNNING" \
+                    and str(r.get("SKUCode", "")) not in ("", "—"):
+                _pk = (str(r.get("Machine")), str(r.get("Date"))[:10], r.get("Shift"),
+                       str(r.get("SKUCode")))
+                if _pk in _seen_pk:
+                    _b = _seen_pk[_pk]
+                    _b["Qty"] = float(_b.get("Qty", 0) or 0) + _q
+                    _bs = _p_dt(_b.get("StartTime"))
+                    _ctm = float(cure_ct_map.get(str(r.get("SKUCode")), DEFAULT_CURING_CT) or DEFAULT_CURING_CT)
+                    if _bs is not None and _ctm > 0:
+                        _b["EndTime"] = _fmt_dt(_bs + timedelta(minutes=(_b["Qty"] / CURING_CAVITIES) * _ctm))
+                    continue
+                _seen_pk[_pk] = r
+            _cons_out.append(r)
+        cure_shift_rows = _cons_out
 
     # PM/MTC no-overlap: relocate curing (Qty>0) rows that overlap a press's maintenance window
     # into the free minutes of their shift (post-split; plan-neutral, quantity-preserving).
@@ -7327,13 +8122,15 @@ def _build_priority_deadline_map(demand_path: str, plan_start, planning_days: in
         past_start, beyond_month}}`` for the feasibility report.
 
     A committed SKU with no date maps to ``planning_days`` (end of month) when
-    ``DELIVERY_PRIORITY_UNDATED_TO_MONTHEND`` is on. A date before the plan start
+    ``PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED`` is on. A date before the plan start
     clamps to day 1 (``past_start``); a date beyond month-end clamps to
     ``planning_days`` (``beyond_month``). Any read/parse failure → ``({}, {})`` so the
     feature is simply inert (never breaks a run). Non-committed SKUs are absent from
     both maps → treated as normal everywhere (identity)."""
     empty: tuple[dict, dict] = ({}, {})
-    if not getattr(_bc_cfg, "DELIVERY_PRIORITY_ENABLED", True):
+    # feature active iff EITHER merged mode toggle is on (DELIVERY_PRIORITY_ENABLED merged away)
+    if not (bool(getattr(_bc_cfg, "DELIVERY_DATE_ALL_SOFT_RULES_RELAXED", False))
+            or bool(getattr(_bc_cfg, "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED", False))):
         return empty
     try:
         df = (pd.read_csv(demand_path) if str(demand_path).lower().endswith(".csv")
@@ -7372,7 +8169,7 @@ def _build_priority_deadline_map(demand_path: str, plan_start, planning_days: in
         return None if pd.isna(d) else pd.Timestamp(d)
 
     undated_to_monthend = bool(
-        getattr(_bc_cfg, "DELIVERY_PRIORITY_UNDATED_TO_MONTHEND", True))
+        getattr(_bc_cfg, "PRIORITY_FLAG_MONTHEND_ALL_SOFT_RULES_RELAXED", False))
     start_date = plan_start.date() if hasattr(plan_start, "date") else plan_start
 
     df = df.copy()
@@ -7823,10 +8620,18 @@ def run_rolling_pipeline(
     priority_deadline_map, priority_meta = _build_priority_deadline_map(
         demand_path, plan_start, planning_days)
     _prio_active = _DELIVERY_PRIORITY_ENABLED and bool(priority_deadline_map)
+    # SKUs committed WITH a real Delivery Date (vs flag-only month-end) — drives the split
+    # DATE-mode vs MONTHEND-mode relaxation gating in _assign_building_shift._delivery_relax.
+    _prio_dated = {str(_s) for _s, _m in priority_meta.items() if not _m["undated"]}
+    _PRIO_DATED_SKUS.clear(); _PRIO_DATED_SKUS.update(_prio_dated)   # seen by _assign_building_shift
+    _BLD_CARRY_UNITS.clear()   # continuous-build carry: fresh per run
     if _prio_active:
-        _n_dated = sum(1 for _m in priority_meta.values() if not _m["undated"])
+        _n_dated = len(_prio_dated)
+        _relax_mode = ("DATE at-risk" if _DELIVERY_DATE_RELAX
+                       else "MONTHEND at-risk" if _PRIORITY_FLAG_MONTHEND_RELAX else "ordering-only")
         print(f"  [Rolling] DELIVERY_PRIORITY ON — {len(priority_deadline_map)} committed SKUs "
-              f"({_n_dated} dated, {len(priority_deadline_map) - _n_dated} end-of-month); EDF order")
+              f"({_n_dated} dated, {len(priority_deadline_map) - _n_dated} end-of-month); EDF order; "
+              f"relax={_relax_mode}")
 
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Pre-computation")
@@ -8510,6 +9315,13 @@ def run_rolling_pipeline(
     # so its CURING_CO_CHANGEOVER_MINS overhang spills past the shift boundary —
     # the new SKU therefore starts MID-shift, not at the boundary.
     co_carry: dict[str, float] = defaultdict(float)
+    # CONTINUOUS CYCLE CARRY (PLANT RULE — permanent): leftover production-eligible minutes carried
+    # from a press's PREVIOUS shift — the fractional cure cycle in progress at the shift boundary.
+    # Curing is continuous, so a press that ran flat-out (TIME-limited) does NOT reset to a fresh
+    # 480 min each shift; its partial cycle finishes early next shift. Added to _avail before the
+    # cap so `int((_avail+carry)/ct)` recovers the fraction (30,32,32,… not 30,30,30,…). Reset to 0
+    # on CO / mould-clean / holiday / GT-or-demand-limited (idle at the boundary → no cycle to carry).
+    _cure_carry_min: dict[str, float] = defaultdict(float)
 
     # ── E: Demand ─────────────────────────────────────────────────────────────
     demand_df = pd.read_excel(demand_path)
@@ -9923,6 +10735,100 @@ def run_rolling_pipeline(
               f"(pen={_SAME_GROUP_PEN})")
         return _homes
 
+    # ── SG_DELIB deliberate + stable group allocation state ─────────────────────────
+    _sku_grp_target: dict | None = None            # {sku: frozenset(allowed groups)}; None until day 3
+    _sku_cur_group: dict = {}                       # {sku: current finer group} (updated at commit)
+    _sku_last_group_move: dict = {}                 # {sku: day of last admitted group MOVE} (cooldown)
+
+    def _compute_grp_targets(_from_day: int):
+        """_best_group over ALL GT SKUs: the DELIBERATE, STABLE target group SET.
+          - single group when ONE group's remaining monthly building capacity completes the
+            SKU's remaining demand (the most-capable such group, seeded by any days 1-2 build);
+          - else the MINIMAL completing SET (greedily add the highest-capacity groups until
+            Σ capacity ≥ remaining demand) — the high-demand class (e.g. LSTL0/SUNE1) that no
+            single group can finish. Falls back to ALL its GT groups if even that can't finish.
+          Returns (targets:{sku: frozenset}, cur:{sku: seed group}). SKUs with no GT group are
+          left OUT of `targets` → unconstrained (no penalty)."""
+        _wshifts = max(1, _working_days_left(_from_day) * 3)
+        _shift_secs = float(SHIFT_MINS) * 60.0
+        # days 1-2 plant-replay build per (sku, group) → seeds continuity of the assignment
+        _built_by_sku: dict = defaultdict(dict)
+        for (_s, _g), _u in _sg_d12_units.items():
+            if _u > 0 and _g in _SG_GT_GROUPS:
+                _built_by_sku[_s][_g] = _built_by_sku[_s].get(_g, 0.0) + _u
+        _targets: dict = {}
+        _cur: dict = {}
+        _allsku = set().union(*machine_skus.values()) if machine_skus else set()
+        # INCH-AWARE: total demand competing for each (GT group, inch). SKUs on an inch share the
+        # group's inch-locked machines, so a SKU's realistic capacity from a group is its
+        # demand-proportional share of the group's capacity (see _SG_INCH_AWARE_TARGETS).
+        _grp_inch_dem: dict = defaultdict(float)
+        if _SG_INCH_AWARE_TARGETS:
+            for _s2 in _allsku:
+                _d2 = float(demand_remaining.get(_s2, 0.0))
+                if _d2 <= 0:
+                    continue
+                _i2 = sku_inch.get(_s2, "")
+                for _g2 in ({_sku_group_of(_m2) for _m2 in sku_machine_map.get(_s2, ())}
+                            & _SG_GT_GROUPS):
+                    _grp_inch_dem[(_g2, _i2)] += _d2
+        for _s in _allsku:
+            _grp_machs: dict = defaultdict(list)
+            for _m in sku_machine_map.get(_s, ()):
+                _g = _sku_group_of(_m)
+                if _g in _SG_GT_GROUPS:
+                    _grp_machs[_g].append(_m)
+            if not _grp_machs:
+                continue                              # no GT group → unconstrained (free)
+            _cap: dict = {}
+            for _g, _ms in _grp_machs.items():
+                _c = 0.0
+                for _m in _ms:
+                    _ct = _bld_ct_sec(_m, _s)
+                    if _ct > 0:
+                        _c += math.floor(_shift_secs / _ct) * _wshifts
+                _cap[_g] = _c * _SG_GRP_CAP_DERATE   # deliverable (COs/contention/draw) < raw
+            _dem = float(demand_remaining.get(_s, 0.0))
+            _built = _built_by_sku.get(_s, {})
+            # ── DAY2→DAY3 CONTINUITY (plant-seeded) ──────────────────────────────────
+            # If the SKU was BUILT in days 1-2, its day-3 current group MUST be the plant's
+            # days-1-2 DOMINANT group (most units) — carry the plant assignment forward, no
+            # gratuitous boundary group-jump. This is exactly _compute_home_groups' "home".
+            # Restrict to the plant groups that are ALSO allowable (day-3+ building must be
+            # feasible there); if the plant built it ONLY in unallowable groups (§22 rows),
+            # continuity is physically impossible → fall back to the best allowable group.
+            _built_allow = {_g: _u for _g, _u in _built.items() if _g in _grp_machs}
+            _home = (max(_built_allow.items(), key=lambda kv: (kv[1], kv[0]))[0]
+                     if _built_allow else None)
+            # order: HOME group first (continuity), then most days-1-2 units, capacity, id
+            _order = sorted(_grp_machs, key=lambda g: (0 if g == _home else 1,
+                                                       -_built.get(g, 0.0), -_cap[g], g))
+            _inch_s = sku_inch.get(_s, "")
+            _chosen: list = []
+            _acc = 0.0
+            for _g in _order:
+                _chosen.append(_g)
+                if _SG_INCH_AWARE_TARGETS:
+                    # this SKU's demand-proportional SHARE of group g's capacity (inch contention)
+                    _comp = _grp_inch_dem.get((_g, _inch_s), 0.0)
+                    _acc += _cap[_g] * min(1.0, _dem / _comp) if _comp > _dem else _cap[_g]
+                else:
+                    _acc += _cap[_g]
+                if _acc >= _dem:                      # minimal completing set reached
+                    break
+            _targets[_s] = frozenset(_chosen)
+            # seed the day-3 current group = plant days-1-2 dominant group when built there;
+            # else the deliberate best-allowable pick (SKU not built in days 1-2, or §22 forced).
+            _cur[_s] = _home if _home is not None else _order[0]
+        _mset = {_s: sorted(_v) for _s, _v in _targets.items() if len(_v) > 1}
+        print(f"  [SG_DELIB] deliberate group targets frozen at day {_from_day}: "
+              f"{len(_targets)} GT SKUs assigned "
+              f"({len(_targets)-len(_mset)} single-group, {len(_mset)} minimal-SET) "
+              f"(derate={_SG_GRP_CAP_DERATE}, band={_SG_MOVE_BAND}, cooldown={_SG_MOVE_COOLDOWN_DAYS}d, hard={_SG_HARD})")
+        for _s, _v in _mset.items():
+            print(f"      [SG_DELIB] minimal-SET: {_s}  demand={demand_remaining.get(_s,0.0):.0f}  groups={_v}")
+        return _targets, _cur
+
     for day in range(1, planning_days + 1):
         _cur_day[0] = day                          # for the mould-movement log in _try_mount
         # Per-machine one-way locks (7002 14→16, 7501 12→13) — flip once on the switch day, never revert.
@@ -10181,39 +11087,56 @@ def run_rolling_pipeline(
         # most-under-served SKUs (adds COs within the daily cap). No-op unless enabled.
         today_cos = _global_mould_boost(day, today_cos)
 
-        # ── IDLE_PRESS_ACTIVATE (Day 1 only) ──────────────────────────────────────
-        # Bring roster presses absent from the Day-0 snapshot online via a cold-start
-        # curing CO (nothing -> SKU). Injected AFTER the normal CO solve + daily_co_count
-        # bump, so these one-time setup COs are EXEMPT from MAX_CHANGEOVERS_PER_DAY and take
-        # whatever moulds remain free after the demand-driven COs (contention-safe). Modeled
-        # as a planned CO with old_sku=None: co_shift_idx resolves to Shift A (no old demand),
-        # so the press is CHANGEOVER in Shift A and RUNNING its target from Shift B.
-        # #6: fire Day-1 setup COs on the FIRST WORKING day, not literally day 1 — if day 1 is a
-        # plant holiday, the cold-start must wait for the first working shift (no CO on a holiday).
-        if (_IDLE_PRESS_ACTIVATE or _FULL_PRESS_ROSTER) and day == _first_working_day and _idle_presses:
+        # ── IDLE_PRESS_ACTIVATE (SUPPLY-AWARE, any working day) ───────────────────
+        # Bring roster presses absent from the Day-0 snapshot online as DIRECT PRODUCTION (fresh
+        # moulds, no curing CO — a fresh press is not a changeover). SUPPLY-AWARE: a press is
+        # cold-started only when Building can realistically feed its target SKU (per-SKU marginal
+        # test — see _IDLE_PRESS_SUPPLY_AWARE); otherwise it is DEFERRED and retried on a LATER
+        # working day when supply exists, instead of blindly starting and immediately starving.
+        # Runs each working day (was Day-1-only) so deferred presses activate when supply appears.
+        # _idle_presses is the mutable pool of not-yet-activated presses. Exempt from the CO cap.
+        def _idle_supply_ok(_sku: str) -> bool:
+            """Per-SKU marginal supply test (day-level signals only): should we cold-start ANOTHER
+            press on `_sku` now, or DEFER until Building can feed it? Rules (avoids the rejected
+            inch-level over-skip): (1) no eligible building machine → never (unsupplyable). (2) the
+            SKU has NO curing press yet → YES (must start one to cure it at all). (3) an ADDITIONAL
+            press → only when Building is actually BANKING GT for it (on-hand ≥ one press-shift of
+            draw) OR a known per-SKU building rate covers the extra press — i.e. real supply exists,
+            so the new press is fed instead of immediately starving. Otherwise DEFER to a later day."""
+            if not sku_machine_map.get(_sku):
+                return False                        # no eligible building machine → cannot supply
+            if press_count.get(_sku, 0) <= 0:
+                return True                         # SKU uncured so far → activate the first press
+            _per_press = _cure_qty_per_shift(cure_ct_map.get(_sku, DEFAULT_CURING_CT))
+            if gt_inventory.get(_sku, 0.0) >= _per_press * _IDLE_PRESS_SUPPLY_MARGIN:
+                return True                         # Building is banking GT → an extra press is fed
+            _bs = _buildable_rate.get(_sku) if _buildable_rate is not None else None
+            if _bs is not None and _bs > 0:
+                _need = (press_count.get(_sku, 0) + 1) * _per_press * 3
+                return _bs >= _need * _IDLE_PRESS_SUPPLY_MARGIN
+            return False                            # no banked GT / no rate → DEFER, retry later
+        if ((_IDLE_PRESS_ACTIVATE or _FULL_PRESS_ROSTER) and _idle_presses
+                and day not in _holiday_days):
             _cold = []
-            for _ip in _idle_presses:
-                _tgt = _pick_retarget(_ip)          # neediest allowable SKU w/ 2 free moulds
+            for _ip in list(_idle_presses):
+                _tgt = _pick_retarget(_ip)          # neediest allowable in-demand SKU w/ 2 free moulds
                 if _tgt is None:
-                    continue
+                    continue                        # no feasible target today → keep in pool, retry later
+                if _IDLE_PRESS_SUPPLY_AWARE and not _idle_supply_ok(_tgt):
+                    continue                        # DEFER — Building can't feed this press yet
                 if not _try_mount(_ip, _tgt, defer_free=False):
-                    continue
-                # DIRECT PRODUCTION START (no curing CO). A cold-start press has no old SKU/mould
-                # to swap out, so it is NOT a changeover: it starts RUNNING its target from Day-1
-                # Shift A and produces immediately. Kept OUT of today_cos, so it is never marked
-                # CHANGEOVER (no lost Shift A), never charged a 480-min curing CO, and never counted
-                # in the curing-CO total. Mould-life = fresh 3000 (newly mounted moulds, not a CO
-                # clean). press_count / curing_allowable updated here (the end-of-day today_cos loop
-                # no longer sees these presses).
+                    continue                        # no 2 free moulds → keep in pool, retry later
                 press_state[_ip]  = {"sku": _tgt, "status": "RUNNING"}
                 press_count[_tgt] = press_count.get(_tgt, 0) + 1
                 curing_allowable[_tgt].append(_ip)
                 mould_life[_ip]   = MOULD_CLEAN_CYCLES
                 clean_carry[_ip]  = 0.0
+                _idle_presses.remove(_ip)           # activated → out of the deferral pool
                 _cold.append((_ip, _tgt))
             if _cold:
-                _VERBOSE and print(f"  [Rolling] Day {day} (first working day): cold-started "
-                      f"{len(_cold)} idle press(es) as DIRECT PRODUCTION, no CO: {_cold}")
+                _VERBOSE and print(f"  [Rolling] Day {day}: supply-aware cold-started "
+                      f"{len(_cold)} idle press(es) as DIRECT PRODUCTION: {_cold}"
+                      + (f" ({len(_idle_presses)} deferred — no supply yet)" if _idle_presses else ""))
 
         # ── Runner-Out Day-1 CO (Day 1 only) ──────────────────────────────────────
         # Plant rule: a press running a NO-DEMAND SKU at Day-0 (Runner-Out) must change over
@@ -10541,6 +11464,11 @@ def run_rolling_pipeline(
                 # full 2-day replay is accumulated). Inert (map stays None) when the lever is OFF.
                 if _SAME_GROUP_SOFT and _sku_home_group is None and day > _PLANT_2DAY_DAYS:
                     _sku_home_group = _compute_home_groups(day)
+                # SG_DELIB: freeze the DELIBERATE target group SETS once, at day 3 (after the
+                # 2-day replay). Seeds _sku_cur_group from the per-SKU seed group. Inert when OFF.
+                if _SG_DELIB and _sku_grp_target is None and day > _PLANT_2DAY_DAYS:
+                    _sku_grp_target, _sg_seed = _compute_grp_targets(day)
+                    _sku_cur_group.update(_sg_seed)
                 shift_plan = _assign_building_shift(
                     shift_cure_demand=_scd_for_build,
                     machine_down_mins=_mdown,
@@ -10583,6 +11511,9 @@ def run_rolling_pipeline(
                     pacing_day_built=float(sum(day_gt_built.values())),
                     pacing_day_skus={_s for _s, _q in day_gt_built.items() if _q > 0},
                     sku_home_group=_sku_home_group,   # SAME_GROUP soft one-SKU→one-group lever
+                    sku_grp_target=_sku_grp_target,   # SG_DELIB: deliberate target group SETS
+                    sku_cur_group=_sku_cur_group,     # SG_DELIB: current group per SKU (mutable)
+                    sku_last_group_move=_sku_last_group_move,  # SG_DELIB: last group-move day (cooldown)
                 )
 
             # ps3/ps4 hard monthly cap: clamp this shift's ps build to the remaining room so the
@@ -10669,6 +11600,10 @@ def run_rolling_pipeline(
                 # old one-SKU-per-machine rule under-supplied carcass and made Stage-2
                 # wait needlessly — that was the bulk of the avoidable loss.
                 _gate_cap: dict = {}
+                # min-carcass rule: cumulative carcass built per (Stage-1 machine, SKU) THIS
+                # shift, across all _gate_build calls (PASS 1 + PASS 2). Reconciled to the
+                # MIN floor right before the GT clamp below.
+                _carc_ms: dict = defaultdict(float)
 
                 def _s1cap(_m):
                     # BUGFIX: track remaining capacity in MINUTES (was units at the machine-DEFAULT CT,
@@ -10755,6 +11690,7 @@ def run_rolling_pipeline(
                         _a = min(_max_u, _target - _got)
                         _gate_cap[_m] -= _a * _ctm / 60.0          # deduct production minutes
                         _got += _a
+                        _carc_ms[(_m, _sku)] += _a                  # min-carcass: per-(machine,SKU) shift total
                         if _STAGE1_CO and _a > 0:      # log for Site 2 (rows built later)
                             _s1_prod_log.append({
                                 "day": day, "date": date_str, "shift": shift,
@@ -10881,10 +11817,45 @@ def run_rolling_pipeline(
                             _extra = min(_extra, max(0.0, _buf_cap - _bank_total()))
                         if _extra > 0:
                             _gate_build(_gs, _extra)
+                # ── HARD min-carcass floor (per machine, SKU, shift) ─────────────
+                # Any per-(Stage-1 machine, SKU) carcass built < MIN this shift is a
+                # sub-MIN fragment (over-production leftover) → DROP it: remove those units
+                # from the carcass bank (freshest lots = this shift's build) AND from the
+                # display log (_s1_prod_log) so no sub-MIN carcass row is emitted. The GT
+                # clamp immediately below then makes Stage-2 GT only to the carcass that
+                # REMAINS available → GT + curing reduce in sync (carcass-first order).
+                if _CARCASS_MIN_ENFORCE and _CARCASS_MIN_QTY > 0:
+                    _drop_ms = [(_m, _sku) for (_m, _sku), _q in _carc_ms.items()
+                                if 1e-9 < _q < _CARCASS_MIN_QTY]
+                    for (_m, _sku) in _drop_ms:
+                        _need = _carc_ms[(_m, _sku)]
+                        # remove from bank, freshest (highest age-left) lots first = this shift
+                        for _lot in sorted(_carcass_bank.get(_sku, []),
+                                           key=lambda l: -l[0]):
+                            if _need <= 1e-9:
+                                break
+                            _d = min(_lot[1], _need); _lot[1] -= _d; _need -= _d
+                        if _sku in _carcass_bank:
+                            _carcass_bank[_sku] = [l for l in _carcass_bank[_sku] if l[1] > 1e-9]
+                            if not _carcass_bank[_sku]:
+                                del _carcass_bank[_sku]
+                        _carc_ms[(_m, _sku)] = 0.0
+                    if _drop_ms:
+                        _dkeys = set(_drop_ms)
+                        # drop this shift's display-log entries for the dropped (machine,SKU)
+                        _s1_prod_log[:] = [
+                            _e for _e in _s1_prod_log
+                            if not (_e.get("day") == day and _e.get("shift") == shift
+                                    and (_e.get("machine"), _e.get("sku")) in _dkeys)]
                 # CLAMP Stage-2 GT per SKU to the bank; consume FIFO (oldest first).
+                # HARD min-carcass: if the carcass a SKU can draw this shift is a sub-MIN sliver,
+                # don't back GT with it → drop the GT (and thus curing) for that SKU this shift, so
+                # no <MIN carcass is consumed and GT/carcass/curing stay in sync (carcass-first).
                 _take: dict[str, float] = {}
                 for _gs in _s2_desired:
                     _t = min(_s2_desired[_gs], _bank_avail(_gs))
+                    if _CARCASS_MIN_ENFORCE and _CARCASS_MIN_QTY > 0 and 0 < _t < _CARCASS_MIN_QTY:
+                        _t = 0.0
                     _take[_gs] = _t
                     _rem = _t
                     for _entry in _carcass_bank.get(_gs, []):
@@ -11116,6 +12087,10 @@ def run_rolling_pipeline(
                         gt_inventory[sku]   = gt_inventory.get(sku, 0.0) + qty
                         if qty > 0:                                    # FIFO: new dated GT lot
                             gt_lots.setdefault(sku, []).append([day, float(qty)])
+                            # SG_DELIB: record the finer group that actually built this SKU
+                            # (mutable current-group state; day 3+ only, inert when OFF).
+                            if _SG_DELIB and day > _PLANT_2DAY_DAYS:
+                                _sku_cur_group[sku] = _sku_group_of(machine)
                         day_gt_built[sku]  += qty
                         if _DYNAMIC_CO_PLANNER_ENABLED:
                             _prev_tier = sku_campaign_tier.get(sku)
@@ -11318,15 +12293,12 @@ def run_rolling_pipeline(
                     status = "CAMPAIGN_IDLE"
 
                 ct       = cure_ct_map.get(sku, DEFAULT_CURING_CT)
-                ct_disp  = ct                       # per-SKU DISPLAY CT (baked at 0.94) — sheet only
-                if _PRESS_EFF_BY_DIGIT:
-                    # Per-press efficiency: scale THIS press's effective cure CT so a
-                    # 5-digit press cures ~2% slower. cure_ct_map is baked at 0.94, so a
-                    # 5-digit press's true CT = raw/0.92 = cure_ct_map × (0.94/0.92);
-                    # a 4-digit press keeps 0.94/0.94 = 1.0 (unchanged). The effective ct
-                    # flows into cap / cap_time / prod_mins / early-CO; ct_disp (0.94) is
-                    # kept UNSCALED for the CycleTime_min display column.
-                    ct = ct * (ConsumptionConfig.PRESS_EFFICIENCY / _press_efficiency(press))
+                ct_disp  = ct                       # per-SKU DISPLAY CT (baked at 0.95) — sheet only
+                # Per-press efficiency (plant rule, always applied): scale THIS press's effective
+                # cure CT by 0.95/eff(press) — 4-digit keeps 0.95/0.95 = 1.0 (unchanged, cure_ct_map
+                # already baked at 0.95); 5-digit → 0.95/0.94 (true CT = raw/0.94, ~1% slower).
+                # Effective ct flows into cap / cap_time / prod_mins / early-CO; ct_disp stays 0.95.
+                ct = ct * (ConsumptionConfig.PRESS_EFFICIENCY / _press_efficiency(press))
                 cap      = _cure_qty_per_shift(ct)
                 _pm_down = 0.0                                       # PM/MTC press maintenance mins
                 if _PM_MTC_ENABLED and _CUR_DOWN.get(press):
@@ -11393,6 +12365,11 @@ def run_rolling_pipeline(
 
                 _cleaned  = False
                 prod_mins = 0.0
+                # CONTINUOUS CYCLE CARRY (plant rule): capture prior shift's in-progress fractional
+                # cycle, then reset to 0 — a CO / mould-clean / idle / holiday press has no cycle to
+                # carry; a RUNNING, TIME-limited press re-sets it after producing (below).
+                _carry_prev = _cure_carry_min[press] if _CURE_CYCLE_CARRY else 0.0
+                _cure_carry_min[press] = 0.0
                 if status == "RUNNING":
                     # DEBUG self-check: a RUNNING press must own 2 moulds eligible
                     # for its SKU. Counts leaks where the gate failed to block.
@@ -11412,18 +12389,31 @@ def run_rolling_pipeline(
                                   f"sku_moulds[SRBT0]={len(_sku_moulds.get(sku,set()))}")
                     # Cap curing at remaining demand — never over-produce.
                     demand_left = max(0.0, demand_remaining.get(sku, 0.0))
+                    # CONTINUOUS CYCLE CARRY: add the fractional cycle carried from the prior shift
+                    # to this shift's production minutes, so the cap recovers it (30,32,32,… not
+                    # 30,30,30,…). _carry_prev captured + reset above; re-set below iff TIME-limited.
                     if _MOULD_CLEAN_ENABLED:
-                        cap_time = int(_avail / ct) * CURING_CAVITIES   # partial-shift cap
+                        _avail_prod = _avail + _carry_prev
+                        cap_time = int(_avail_prod / ct) * CURING_CAVITIES   # partial-shift cap (+carry)
                         cap_life = mould_life[press] * CURING_CAVITIES  # cycles left × cavities
                         cured = min(cap_time, int(gt_avail), int(demand_left), cap_life)
+                        _time_cap = cap_time
                     else:
-                        cured = min(cap, int(gt_avail), int(demand_left))
+                        _avail_prod = float(SHIFT_MINS) + _carry_prev
+                        _time_cap = int(_avail_prod / ct) * CURING_CAVITIES
+                        cured = min(_time_cap, int(gt_avail), int(demand_left))
                     # MPQ (shift-level floor): don't emit a sub-floor cured block. The GT is
                     # LEFT in inventory (batches a later shift); a genuine sub-MPQ demand tail
                     # is dropped via the _demand_done release threshold below (press moves on,
                     # tail stays UNMET — no over-production, no coverage inflation).
                     if _CURING_MPQ > 0 and 0 < cured < _CURING_MPQ:
                         cured = 0
+                    # CONTINUOUS CYCLE CARRY: if this press was TIME-limited (ran flat-out — cured
+                    # hit the time cap, not GT / demand / mould-life / MPQ), a cure cycle is in
+                    # progress at the shift boundary → carry its fractional minutes to the next
+                    # shift. Otherwise the press idled/stopped at the boundary → no carry (stays 0).
+                    if _CURE_CYCLE_CARRY and cured > 0 and cured >= _time_cap:
+                        _cure_carry_min[press] = max(0.0, _avail_prod - (cured // CURING_CAVITIES) * ct)
                     gt_inventory[sku]      = gt_avail - cured
                     if cured > 0:                                     # FIFO: draw oldest lots first
                         _gt_consume_lots(sku, cured)
@@ -12170,8 +13160,17 @@ def run_rolling_pipeline(
             aging_shifts=max(1, _STAGE1_CARCASS_LEAD + 1))
         if _CARCASS_CONSOLIDATE:
             # Split to the FINAL wall-clock Date/Shift first, then consolidate WITHIN each day
-            # (representation-only; per-(date, SKU) carcass preserved exactly). The Excel writer
-            # re-splits the returned rows at shift boundaries, so this stays KPI/feasibility-neutral.
+            # (representation-only; per-(date, SKU) carcass preserved exactly). NOTE:
+            # `_consolidate_carcass_rows` deliberately re-lays each (machine, date) as ONE
+            # contiguous block from 07:00 and emits a SINGLE row per (machine, date, SKU) whose
+            # Shift label is only the block's START shift — the row's Qty is the whole day's
+            # total and can span 2-3 shifts (e.g. a day-total of 161 units on one SKU emitted as
+            # one "Shift B" row spanning into C = 585 min of production in a 480-min shift).
+            # The unconditional re-split below (right before extend into bld_shift_rows) is what
+            # actually re-derives the FINAL per-shift Date/Shift/Qty and caps each emitted row at
+            # its own shift's physical capacity — it MUST always run, not only inside the
+            # BLD_SEED_PIN_D1A branch (that branch is skipped e.g. under PLANT_2DAY_REPLAY, which
+            # used to leave these day-aggregated over-capacity rows unsplit in the output).
             # HOLIDAY FIX: pass holiday_windows so a machine whose wall-clock cursor is running
             # behind schedule (e.g. an earlier PM/MTC window it had to skip over) cannot have that
             # drift carry its carcass production into a later holiday's wall-clock window — the
@@ -12235,6 +13234,20 @@ def run_rolling_pipeline(
                     _forced += 1
                 print(f"  [Rolling] BLD_SEED_PIN_D1A: pinned {_forced}/{len(_s1_seed)} seeded Stage-1 "
                       f"machines' Shift-A carcass to their seed (Day-1 Shift-A only; B/C demand-driven)")
+        # FINAL unconditional re-split at shift boundaries — the load-bearing fix. Whatever
+        # path produced `_carc_rows` (raw `_stage1_carcass_rows_co` emit, `_consolidate_carcass_rows`
+        # day-level re-layout, or the BLD_SEED_PIN_D1A branch above), this guarantees NO carcass
+        # row's [StartTime,EndTime]/Qty extends past its own shift — re-deriving Date/Shift from
+        # wall clock and apportioning Qty by shift, exactly like every other building/curing sheet
+        # (`_split_rows_at_shift_boundaries` is idempotent on rows already confined to one shift,
+        # so this is a no-op when the input is already correct). Previously this only ran inside
+        # the BLD_SEED_PIN_D1A branch, which is skipped under PLANT_2DAY_REPLAY (default ON) and
+        # mid-month runs — leaving `_consolidate_carcass_rows`'s day-aggregated rows (Qty = a
+        # whole day's total, Shift = only the block's start shift) in the final output uncapped.
+        if _carc_rows:
+            _carc_rows = _split_rows_at_shift_boundaries(
+                _carc_rows, "Machine", mpq=_BUILDING_MPQ,
+                holiday_windows=_holiday_wallclock_windows)
         bld_shift_rows[:] = [r for r in bld_shift_rows if r.get("CO_Type") != "carcass"]
         bld_shift_rows.extend(_carc_rows)
         bld_co_events.extend(_carc_co)                # so Stage-1 occupancy counts the CO
@@ -12245,7 +13258,19 @@ def run_rolling_pipeline(
               + f" / {_carc_rep['demand']:,} Stage-2 GT across {_cm} machines; "
               f"{_carc_rep['co_count']:,} carcass building COs = {_carc_rep['co_mins']:,} min "
               f"(no production during CO).")
-        if _carc_rep["unmet"] > 0:
+        # FIX 1 (cosmetic, display-only, zero KPI risk): `_carc_rep["unmet"]` here is computed
+        # from `prod_log` — the normal demand-derived Stage-1 gate's OWN production — BEFORE the
+        # Days-1-2 plant carcass force-injection below (`_PLANT_2DAY_REPLAY`) replaces the
+        # derived days-1-2 carcass rows with the plant's exact snapshot. Under replay, the
+        # plant-forced Stage-2 GT on days 1-2 has no matching derived Stage-1 build in
+        # `prod_log` yet (that's what the injection supplies), so this pre-injection number is
+        # dominated by a reporting-timing artifact, not a real shortfall — skip it and print the
+        # corrected post-injection residual after the injection block instead. When replay is
+        # OFF nothing later touches carcass rows, so this number IS already final — print as
+        # before (bit-for-bit unchanged for OFF/inert runs).
+        if _PLANT_2DAY_REPLAY:
+            pass
+        elif _carc_rep["unmet"] > 0:
             print(f"  [Stage-1 carcass] ⚠ INFEASIBLE: {_carc_rep['unmet']:,} carcass units cannot "
                   f"be supplied within the aging window.")
         else:
@@ -12327,6 +13352,34 @@ def run_rolling_pipeline(
         print(f"  [Plant2Day] Stage-1 carcass: forced {_rp_carc_n} plant rows for days "
               f"1-{_PLANT_2DAY_DAYS} (exact snapshot replay)")
 
+    # FIX 1 (cosmetic, display-only, zero KPI risk): the TRUE final Stage-1 carcass residual,
+    # recomputed AFTER the Days-1-2 plant carcass force-injection above (see the guarded print
+    # in the STAGE1_CO block for why the pre-injection number is stale under replay). Uses the
+    # FINAL bld_shift_rows (post-injection) against the same per-SKU Stage-2 GT targets
+    # `_stage1_carcass_rows_co` used, capped per SKU exactly like that function caps `produced`
+    # at `T` — so this is the honest post-injection shortfall, not a re-derivation of the
+    # planning logic. Does not touch any row Qty, gt_inventory, or the cured/built KPI.
+    if _PLANT_2DAY_REPLAY and _STAGE1_CO and _STAGE2_CARCASS_GATE:
+        _gt_int_f = {str(s): int(round(float(q))) for s, q in _s2_gt_per_sku.items()}
+        _open_f = {str(k): float(v) for k, v in (opening_carcass or {}).items() if v and float(v) > 0}
+        _open_used_f = {s: min(int(_open_f.get(s, 0.0)), q) for s, q in _gt_int_f.items()}
+        _final_supplied: dict = defaultdict(float)
+        for _r in bld_shift_rows:
+            if _r.get("CO_Type") == "carcass" and str(_r.get("SKUCode")) != "CHANGEOVER":
+                _final_supplied[str(_r["SKUCode"])] += float(_r.get("Qty", 0) or 0)
+        _total_gt_f = float(sum(_gt_int_f.values()))
+        _supplied_f = float(sum(_open_used_f.values()))
+        for _s, _T in _gt_int_f.items():
+            _cap_f = max(0, _T - _open_used_f.get(_s, 0))
+            _supplied_f += min(_final_supplied.get(_s, 0.0), _cap_f)
+        _true_unmet = round(max(0.0, _total_gt_f - _supplied_f))
+        if _true_unmet > 0:
+            print(f"  [Stage-1 carcass] ⚠ INFEASIBLE: {_true_unmet:,} carcass units cannot "
+                  f"be supplied within the aging window (post Days-1-2 plant injection).")
+        else:
+            print("  [Stage-1 carcass] FEASIBLE: Stage-1 supplies 100% of Stage-2 carcass demand "
+                  "(CO-charged, pre-build within 1-day aging; post Days-1-2 plant injection).")
+
     # ── Write Excel outputs (same format as legacy pipeline) ─────────────────
     closing_gt_bal = {sku: v for sku, v in gt_inventory.items() if v > 0}
 
@@ -12349,7 +13402,7 @@ def run_rolling_pipeline(
         print(f"  [Skip_Reason] curing master set unavailable ({_e_sr2}); legacy label")
         _cur_master_skus = None
 
-    _write_rolling_building_excel(
+    _carcass_cap_by_sku, _gt_drop_by_sku = _write_rolling_building_excel(
         output_path    = build_output,
         bld_shift_rows = bld_shift_rows,
         bld_co_events  = bld_co_events,
@@ -12374,6 +13427,64 @@ def run_rolling_pipeline(
         bld_matrix_skus   = _bld_matrix_skus,
         cur_master_skus   = _cur_master_skus,
     )
+    # ── SYNC cured to the dropped Stage-2 GT: the building writer capped Stage-2 GT rows to the
+    # displayed carcass (R5), dropping _gt_drop_by_sku[sku] units of Stage-2 GT. That GT is no
+    # longer built → it can't be cured → reduce cured by the SAME amount (bounded by the SKU's
+    # cured), and mark it back as unmet demand. IMPORTANT: a SKU's GT also comes from carcass-free
+    # groups (Unistage/VMI/BJ), so we reduce ONLY by the dropped Stage-2 GT — never cap cured to
+    # total carcass. Non-Stage-2 GT is untouched.
+    if _CARCASS_MIN_ENFORCE and _gt_drop_by_sku:
+        _sync_cured_drop = 0.0
+        for _sk, _gtd in _gt_drop_by_sku.items():
+            if _gtd <= 1e-6:
+                continue
+            _drop = min(float(sku_cured.get(_sk, 0.0)), float(_gtd))
+            if _drop <= 1e-6:
+                continue
+            _sync_cured_drop += _drop
+            sku_cured[_sk] = float(sku_cured.get(_sk, 0.0)) - _drop
+            demand_remaining[_sk] = demand_remaining.get(_sk, 0.0) + _drop
+            # reduce this SKU's curing production rows, latest first, by _drop (2 tyres/cavity-cycle
+            # but rows carry unit Qty already) — keep the curing sheet consistent with the KPI.
+            _rem = _drop
+            for _cr in sorted((r for r in cure_shift_rows if str(r.get("SKUCode")) == _sk
+                               and float(r.get("Qty", 0) or 0) > 0),
+                              key=lambda x: str(x.get("StartTime", "")), reverse=True):
+                if _rem <= 1e-6:
+                    break
+                _cq = float(_cr.get("Qty", 0) or 0); _cd = min(_cq, _rem)
+                _cr["Qty"] = int(round(_cq - _cd)); _rem -= _cd
+            # reduce daily_cured (latest days first)
+            _rem = _drop
+            for _dk in sorted(daily_cured, reverse=True):
+                if _rem <= 1e-6:
+                    break
+                _dv = float(daily_cured.get(_dk, 0.0)); _dd_ = min(_dv, _rem)
+                daily_cured[_dk] = _dv - _dd_; _rem -= _dd_
+        # reduce daily_summary GT_Built by the dropped GT (latest days), GT_Cured by dropped cured
+        _gt_drop_total = sum(_gt_drop_by_sku.values())
+        _rem = _gt_drop_total
+        for _row in sorted(daily_summary, key=lambda r: r["Day"], reverse=True):
+            if _rem <= 1e-6:
+                break
+            _dv = float(_row["GT_Built"]); _dd_ = min(_dv, _rem)
+            _row["GT_Built"] = int(round(_dv - _dd_)); _rem -= _dd_
+        _rem = _sync_cured_drop
+        for _row in sorted(daily_summary, key=lambda r: r["Day"], reverse=True):
+            if _rem <= 1e-6:
+                break
+            _dv = float(_row["GT_Cured"]); _dd_ = min(_dv, _rem)
+            _row["GT_Cured"] = int(round(_dv - _dd_)); _rem -= _dd_
+        # recompute headline KPIs
+        total_built  = sum(r["GT_Built"] for r in daily_summary)
+        total_cured  = sum(r["GT_Cured"] for r in daily_summary)
+        dem_met      = total_demand - sum(max(0, v) for v in demand_remaining.values())
+        final_cov    = dem_met / total_demand * 100 if total_demand > 0 else 0
+        if _sync_cured_drop or _gt_drop_total:
+            print(f"  [SYNC] dropped {_gt_drop_total:,.0f} GT / {_sync_cured_drop:,.0f} cured to match "
+                  f"displayed carcass (GT/carcass/cured now in sync). New cured {total_cured:,.0f} "
+                  f"/ coverage {final_cov:.1f}%.")
+
     _write_rolling_curing_excel(
         output_path       = curing_output,
         cure_shift_rows   = cure_shift_rows,
