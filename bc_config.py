@@ -40,7 +40,25 @@ PLANNING_DAYS = 27                              # 4 Sep .. 30 Sep inclusive (mid
 # Mid-month demand: original Sept demand MINUS the plant's actual 2-day curing production
 # (Curing_Production_2days.xlsx), deducted ONCE per SKU and re-allocated proportionally across
 # duplicate MTS/MTO rows. Original file BTP_SEPT26_DEMAND.xlsx is retained untouched.
-DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_minus_3day_HYBRID.xlsx")
+DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_deducted.xlsx")
+
+# ── ACTUAL PRODUCTION (mid-month demand deduction) ────────────────────────────
+# Daily curing-event export from the plant. ONE ROW = ONE CURED TYRE (qty is the
+# row count, there is no Qty column). Only TWO columns are read:
+#     dtandTime  -> production day = (dtandTime - 7h).date()   [07:00-anchored]
+#     recipeID   -> SKUCode via RECIPE_MASTER_FILE
+# `isCured` is filtered if the column is present; if you pre-filter it, that is fine.
+# Any other columns are ignored, so the export may carry extras.
+# >>> UPDATE THIS PATH when a newer production file arrives. <<<
+ACTUAL_PRODUCTION_FILE = os.path.join(INPUT_DIR, "curingPCR_4sep.xlsx")
+
+# Untouched ORIGINAL month demand. The deduction is always applied to THIS file,
+# never to an already-deducted one (deducting twice would double-count).
+DEMAND_BASE_FILE = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND.xlsx")
+
+# recipeID -> 18-char SKUCode map (column `iD` -> `description`). Must stay in sync:
+# an unlisted recipeID is DROPPED and its production is silently NOT deducted.
+RECIPE_MASTER_FILE = os.path.join(INPUT_DIR, "RECIPE_MASTER.csv")
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
 PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
