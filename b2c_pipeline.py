@@ -8316,7 +8316,7 @@ def _build_priority_deadline_map(demand_path: str, plan_start, planning_days: in
         if not sku or sku.lower() == "nan":
             continue
         flag_any = bool(g[flag_c].map(_flag_set).any()) if flag_c else False
-        dates = [d for d in (g[date_c].map(_parse_date) if date_c else []) if d is not None]
+        dates = [d for d in (g[date_c].map(_parse_date) if date_c else []) if d is not None and not pd.isna(d)]
         has_date = len(dates) > 0
         if not (flag_any or has_date):
             continue  # normal SKU
@@ -13111,8 +13111,8 @@ def run_rolling_pipeline(
     print("\n" + "=" * 70)
     print("  ROLLING PIPELINE — Results")
     print("=" * 70)
-    print(f"  Total GT built       : {total_built:>10,.0f}")
-    print(f"  Total cured          : {total_cured:>10,.0f}")
+    # NOTE: GT built / cured / coverage are printed AFTER the carcass SYNC below (which drops the
+    # over-carcass Stage-2 GT), so the terminal matches the output Excel + the result dict exactly.
     if _IDLE_DIAG_ON:
         _d = _IDLE_DIAG
         _tot = _d["rec_units"] + _d["ceil_units"]
@@ -13176,7 +13176,6 @@ def run_rolling_pipeline(
         print(f"  [MOULD-DBL] _mould_owner/_press_moulds mismatches: {_mismatch}")
         if _mould_selfcheck[0]:
             print(f"  [MOULD-LEAK] {_mould_selfcheck[0]} running press-shifts own <2 moulds")
-    print(f"  Demand coverage      : {final_cov:>9.1f}%  ({dem_met:,.0f} / {total_demand:,.0f})")
     _eod_inv = [r["EndDay_GT_Inventory"] for r in daily_summary if "EndDay_GT_Inventory" in r]
     if _eod_inv:
         _n_over = sum(1 for v in _eod_inv if v > MAX_ENDOFDAY_GT_INVENTORY)
@@ -13621,6 +13620,12 @@ def run_rolling_pipeline(
             print(f"  [SYNC] dropped {_gt_drop_total:,.0f} GT / {_sync_cured_drop:,.0f} cured to match "
                   f"displayed carcass (GT/carcass/cured now in sync). New cured {total_cured:,.0f} "
                   f"/ coverage {final_cov:.1f}%.")
+
+    # Headline KPIs printed here (AFTER the carcass SYNC) so the terminal matches the output Excel
+    # + the result dict exactly — total_built/total_cured/final_cov are now the post-SYNC values.
+    print(f"  Total GT built       : {total_built:>10,.0f}")
+    print(f"  Total cured          : {total_cured:>10,.0f}")
+    print(f"  Demand coverage      : {final_cov:>9.1f}%  ({dem_met:,.0f} / {total_demand:,.0f})")
 
     _write_rolling_curing_excel(
         output_path       = curing_output,
