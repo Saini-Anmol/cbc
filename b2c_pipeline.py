@@ -371,6 +371,14 @@ _PLANT_SET_LOCK = os.environ.get(
 _CO_STARVE_BYPASS = os.environ.get(
     "CO_STARVE_BYPASS",
     "1" if getattr(_bc_cfg, "CO_STARVE_BYPASS", True) else "0") != "0"
+# PLANT-LOCK STARVED-FEED (Fix C): let a plant-locked machine build a SAME-INCH, live-draw, STARVED
+# non-plant SKU (presses RUNNING, 0 GT on hand + none built this shift, demand left) even when its
+# plant SKUs still show a nominal deficit — because those plant SKUs are draw-capped and a real
+# press is waiting empty. Same-inch keeps the CO cheap; bounded to genuinely starved targets → no
+# waste-GT. Env PLANT_STARVE_FEED=0 reverts.
+_PLANT_STARVE_FEED = os.environ.get(
+    "PLANT_STARVE_FEED",
+    "1" if getattr(_bc_cfg, "PLANT_STARVE_FEED", False) else "0") != "0"   # default OFF: measured −4,868 (churn), kept for the record
 # SPARE-RELEASE threshold (units): a locked machine may ALSO build other curing-drawn SKUs in a
 # shift once its plant-set SKUs can no longer use a meaningful chunk of its time — i.e. their best
 # residual draw-deficit is below this many units (a machine can't fill a real campaign with them
@@ -5382,6 +5390,17 @@ def _assign_building_shift(
             # SKUs. Let a plant-locked machine build such a sole-builder SKU as spare so it isn't
             # orphaned. Bounded by no-waste-GT (curable ceiling) as usual.
             if _sku in _sole_builder_skus:
+                return True
+            # STARVED-FEED (Fix C): feed a SAME-INCH, live-draw, STARVED non-plant SKU even when a
+            # plant SKU still shows a nominal deficit (it's draw-capped). Same inch as the machine's
+            # current campaign → cheap CO; genuinely starved (press empty) → no waste. Downstream
+            # CO-cost / dwell gates still apply.
+            if (_PLANT_STARVE_FEED
+                    and sku_inch.get(_sku, "") == sku_inch.get(machine_current_sku.get(_m, ""), "\0")
+                    and shift_cure_demand.get(_sku, 0.0) > 0
+                    and gt_inventory.get(_sku, 0.0) <= 0
+                    and projected_gt.get(_sku, 0.0) <= 0
+                    and demand_remaining.get(_sku, 0.0) > 0):
                 return True
             return not any(_defc(_p, _buf_of(_m)) > 0 for _p in _ps)
 
