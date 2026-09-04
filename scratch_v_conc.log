@@ -1,0 +1,215 @@
+  [SAME_GROUP] 1 SKU(s) EXEMPT from the group rule (any allowable machine): 1225170015012LSTL0
+  [BLD_CT] loaded 414 per-(SKU,machine) CTs for 133 SKUs from last_building_a_ct.xlsx
+  [PM_MTC] 70 building + 65 curing downtime windows loaded
+  [DOM_INCH] file not found (/Users/anmolsaini/Documents/cbc/data/analysis_aug/machine_inch_dominant_aug.xlsx); using hardcoded dominant inch
+  [INCH_HIST_LOCK] loaded allowed-inch sets for 42 machines from bc_config.INCH_HIST_LOCK_SETS (28 FIXED single-inch, 14 FLEXIBLE); ±2 band discontinued
+  [INCH18_DEFER] VMI realloc — 7001→{15}, 7003→{16,18}, 6004→{16}, 7002→{14,16} (DB-allowable, no invented pairs)
+  [Plant2Day] loaded 272 plant rows, 41 machines, days 1-2 (replay OFF)
+  [PlantSetLock] ON — 27 GT machines pinned to their Days-1-2 plant SKU set (sizes: [1, 2, 3])
+  [PLANT_INCH_ADMIT] plant-set inches re-admitted: 7003+17, 8501+14
+  [Rolling] DELIVERY_PRIORITY ON — 2 committed SKUs (2 dated, 0 end-of-month); EDF order; relax=DATE at-risk
+
+======================================================================
+  ROLLING PIPELINE — Pre-computation
+======================================================================
+  [Rolling] Computing CO schedule …
+  [BLD_ALLOW] 134 SKUs from last_building_a_ct.xlsx (rule=ct_present; dropped cols ['6401', '6801'])
+  [Rolling] Surplus-release ON — buildable_rate for 133 SKUs (5b guard)
+  [BLD_ALLOW] 134 SKUs from last_building_a_ct.xlsx (rule=ct_present; dropped cols ['6401', '6801'])
+  [Rolling] early sku_inch for 274 SKUs
+  [BLD_ALLOW] 134 SKUs from last_building_a_ct.xlsx (rule=ct_present; dropped cols ['6401', '6801'])
+  [Rolling] CO-PLAN: 3 BJ/US locks; building_inch_capacity {'12': 5232, '13': 7833, '14': 4503, '15': 10938, '16': 4242, '17': 2799, '18': 1674}
+  [INCH_ONEWAY] 7501: 12"→13" one-way @day 1 (7002 left flexible 14/16)
+
+======================================================================
+  B2C Phase 0 Extended — 27-Day Dynamic Curing Consumption and CO plan
+======================================================================
+  Demand file : BTP_SEPT26_DEMAND_minus_3day_HYBRID.xlsx
+  Plan start  : 04-Sep-2026 | Days: 27
+
+  [ETL] Loading demand …
+        115 demanded SKUs
+  [ETL] Loading cycle times …
+  [ETL] Loading running moulds …
+[snapshot] requested 2026-09-04 → snapshot 2026-09-04 (356 running-moulds rows)
+        179 active press rows
+  [ETL] Loading curing allowable machines …
+        274 SKUs with allowable presses
+  [ETL] Loading eligibility sources …
+  [Eligible] 114 SKUs pass | 1 excluded
+  [Classify] Runner-In: 52 | Non-Runner-In: 62
+  [CT] 114 SKUs | 1 using default 17.0 min
+  [Day0] Re-added 1 excluded SKUs with Skip_Reason
+  [Day0] Added 3 Runner-Out SKUs | Total rows: 118 (115 demand + 3 non-demand CO candidates)
+
+  [Pass 1] Computing CO schedule …
+  [PRESS_STABLE_SINGLESRC] 22 single-source SKUs (<= 1 builder machine(s)) — draw-drain pinned to buildable feed
+  [CO Rescue] 28 NRI SKUs without CO — attempting rescue …
+  [CO Rescue] Rescued 11 NRI SKUs via spare-press donation | 17 still without CO (no compatible spare press)
+  [CO Scheduler] 185 COs used / 459 available (40.3%)
+  [CO Scheduler] Peak: Day 1 (17 COs)  |  Zero-CO days: 5
+
+  [Pass 2] Simulating 27 days …
+
+  Day     RI Presses  NRI Presses  Total GT/Shift  Demand Left
+  ------------------------------------------------------------
+  Day 01         180            0           9,294      698,027
+  Day 02         180            0           9,314      670,942
+  Day 03         180            0           9,288      643,550
+  Day 04         180            0           9,288      617,489
+  Day 05         180            0           9,172      591,444
+  Day 06         180            0           9,170      565,174
+  Day 07         180            0           9,166      539,112
+  Day 08         180            0           9,166      513,559
+  Day 09         180            0           9,086      488,141
+  Day 10         180            0           9,060      462,892
+  Day 11         180            0           9,122      437,796
+  Day 12         180            0           9,118      412,334
+  Day 13         180            0           9,104      386,756
+  Day 14         180            0               0      386,756
+  Day 15         180            0           9,104      361,572
+  Day 16         180            0           9,104      338,421
+  Day 17         180            0           9,102      314,383
+  Day 18         180            0           9,146      291,531
+  Day 19         180            0           9,150      267,968
+  Day 20         180            0           9,164      243,536
+  Day 21         180            0           9,156      220,189
+  Day 22         180            0           9,060      195,537
+  Day 23         180            0           9,168      171,182
+  Day 24         180            0           9,164      147,312
+  Day 25         180            0           9,174      124,670
+  Day 26         180            0           9,282      102,554
+  Day 27         180            0           9,232       83,924
+
+  [Export] Writing Excel …
+  [Export] Saved → /Users/anmolsaini/Documents/cbc/data/output/curing_consumption_27day_2026-09-04.xlsx
+  [Export] Sheets: Summary + Day0_Summary + CO_Schedule + 27 day sheets + demand_drawdown + curing_daily_cons
+  [Rolling] 185 curing CO events pre-computed
+  [BLD_ALLOW] 134 SKUs from last_building_a_ct.xlsx (rule=ct_present; dropped cols ['6401', '6801'])
+  [Rolling] Allowable map: 27 machines
+  [Rolling] IDLE_PRESS_ACTIVATE ON — 6 roster press(es) absent from Day-0 snapshot to cold-start Day-1 Shift A: ['14802', '15203', '24819', '24821', '4410', '9803']
+  [Rolling] Day-0 second-mould top-up: 2 moulds assigned to single-mould presses
+  [Rolling] Mould life v2: seeded 179 presses from DB (179 open below 3000 → earlier cleans)
+  [Rolling] Demand: collapsed 123 rows → 116 unique SKUs (summed 7 duplicate rows)
+  [Rolling] Demand: 116 SKUs, 725,817 units
+  [Rolling] BLD_START_FREE: all building machines start free (no Day-0 running SKU, no initial building COs)
+[midmonth-seed] 36 machines from day4_seed_end_of_3sep.xlsx
+  [Rolling] BLD_ACTUAL_SEED: seeded 36 machines (26 GT + 10 Stage-1) from actual plant production; dropped 0 not-allowable + 0 no-demand
+  [Rolling] Pools: 71 SKU slots across 27 machines
+  [Rolling] Inch anchors seeded from Day-0 machine state: 36 machines
+  [Rolling] INIT_HYBRID: 27 GT anchors (26 kept real running size, 1 re-anchored to demand)
+  [Rolling] GROUP_INCH_POLICY: hard single-inch on 3 US machines (0 ongoing diff-CO); BJ+VMI tight JIT margin=250/budget=1; Stage-2 flexible
+  [Rolling] S1_SINGLE_INCH: locked 14 Stage-1 machines to one inch ({'6802': '13', '6803': '15', '6909': '12', '6911': '15', '7601': '15', '7701': '15', '7801': '12', '7802': '12', '7803': '15', '7804': '15', '8001': '12', '8002': '12', '8003': '12', '8101': '15'})
+  [Rolling] INCH_HIST_LOCK: 18 GT machines FIXED to one historical inch (0 diff-CO), 9 FLEXIBLE to their ranked historical inches; ±2 band discontinued
+  [Rolling] BLD_ACTUAL_SEED: seed inch made DOMINANT for 26 GT + 10 Stage-1 machines (historical inches kept in the locked set for later diff-CO)
+
+======================================================================
+  ROLLING PIPELINE — Day-by-day simulation
+======================================================================
+  [Rolling] PLANT HOLIDAYS: day-index [14] → 1 idle day(s); 26 working days; first working day = 1
+  [GT-CAP WARN] Day 1: end-of-day GT inventory 9,958 > cap 8,000
+    [DynCO] Day 2 Shift B: press 75223 1325220316091VURL1→1325218515088HTMX0 (slot 8/17)
+    [DynCO] Day 2 Shift B: press 75227 1325220316091VURL1→1325218515088HTMX0 (slot 9/17)
+  [GT-CAP WARN] Day 2: end-of-day GT inventory 10,514 > cap 8,000
+  [SAME_GROUP] home groups frozen at day 3: 127/128 GT SKUs pinned to one group (pen=1)
+  [SG_DELIB] deliberate group targets frozen at day 3: 128 GT SKUs assigned (97 single-group, 31 minimal-SET) (derate=0.55, band=0.15, cooldown=3d, hard=False)
+      [SG_DELIB] minimal-SET: 1325121715115SLTB0  demand=3144  groups=['BJ', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325218514086HURL0  demand=1000  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325220516095HTMX0  demand=4464  groups=['EXIUM', 'PS']
+      [SG_DELIB] minimal-SET: 1325221317098VUX10  demand=650  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325216814085STMX0  demand=3332  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325217515084HURL4  demand=7041  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325216614081SUTR0  demand=15237  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325218614088HURL0  demand=2139  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325218615089HURL0  demand=1589  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325119015008SRBT0  demand=8521  groups=['BJ', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325119815106QBRQ0  demand=5993  groups=['BJ', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325217415081HUTR0  demand=704  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325221416095VURL0  demand=17175  groups=['EXIUM', 'PS']
+      [SG_DELIB] minimal-SET: 1325223715105SRXT0  demand=3187  groups=['PS', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325223517104HRPG0  demand=1000  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325217514082TUTR0  demand=3577  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325216614081STMX0  demand=12258  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325217613082TUXPE  demand=2877  groups=['BJ', 'PS']
+      [SG_DELIB] minimal-SET: 1325221715100SRHT0  demand=13749  groups=['MAXX', 'PS']
+      [SG_DELIB] minimal-SET: 1325224517107HRHP0  demand=175  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325123715105SRXT0  demand=2000  groups=['PS', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325219316087VUTR0  demand=6000  groups=['EXIUM', 'PS']
+      [SG_DELIB] minimal-SET: 1325123715105SBRT0  demand=6000  groups=['PS', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1225170015012LSTL0  demand=54925  groups=['BJ', 'STAGE2']
+      [SG_DELIB] minimal-SET: 1325216514079TTMX0  demand=500  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325222417099HURL0  demand=744  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325218515088HTMX0  demand=21811  groups=['EXIUM', 'PS']
+      [SG_DELIB] minimal-SET: 1325221417100HURS0  demand=225  groups=['EXIUM', 'MAXX']
+      [SG_DELIB] minimal-SET: 1325214813075SUNE1  demand=60669  groups=['BJ', 'PS']
+      [SG_DELIB] minimal-SET: 1325218515088HUTR0  demand=5000  groups=['EXIUM', 'MAXX', 'PS']
+      [SG_DELIB] minimal-SET: 1325218515088TURL0  demand=3000  groups=['EXIUM', 'MAXX']
+  [GT-CAP WARN] Day 3: end-of-day GT inventory 10,131 > cap 8,000
+    [DynCO] Day 4 Shift A: press 4918 1325216614081TVECE→1225170015012LSTL0 (slot 2/17)
+    [DynCO] Day 4 Shift B: press 14810 1325216814085SURL0→1D25215Z13008QXPC0 (slot 3/17)
+  [GT-CAP WARN] Day 4: end-of-day GT inventory 10,025 > cap 8,000
+  [GT-CAP WARN] Day 5: end-of-day GT inventory 9,721 > cap 8,000
+  [GT-CAP WARN] Day 6: end-of-day GT inventory 10,661 > cap 8,000
+  [GT-CAP WARN] Day 7: end-of-day GT inventory 10,594 > cap 8,000
+  [GT-CAP WARN] Day 8: end-of-day GT inventory 10,082 > cap 8,000
+  [GT-CAP WARN] Day 9: end-of-day GT inventory 9,868 > cap 8,000
+    [DynCO] Day 10 Shift B: press 85209 1325223715105SRXT0→1325123715105SRXT0 (slot 7/17)
+  [GT-CAP WARN] Day 10: end-of-day GT inventory 10,274 > cap 8,000
+    [DynCO] Day 11 Shift C: press 75230 1325220516095HTMX0→1325221416095VURL0 (slot 4/17)
+    [DynCO] Day 11 Shift C: press 85215 1325220516095HTMX0→1325221416095VURL0 (slot 5/17)
+    [DynCO] Day 11 Shift C: press 9804 1325216814085STMX0→1325217514082TTMX0 (slot 6/17)
+  [GT-CAP WARN] Day 11: end-of-day GT inventory 10,404 > cap 8,000
+    [DynCO] Day 12 Shift C: press 14806 1325221417100HURS0→1325221416095VURL0 (slot 6/17)
+  [GT-CAP WARN] Day 12: end-of-day GT inventory 11,406 > cap 8,000
+  [GT-CAP WARN] Day 15: end-of-day GT inventory 8,843 > cap 8,000
+    [DynCO] Day 16 Shift C: press 24823 1325223517104HRPG0→1325217514082TTMX0 (slot 7/17)
+  [GT-CAP WARN] Day 16: end-of-day GT inventory 10,612 > cap 8,000
+  [GT-CAP WARN] Day 17: end-of-day GT inventory 11,154 > cap 8,000
+  [GT-CAP WARN] Day 18: end-of-day GT inventory 11,900 > cap 8,000
+  [GT-CAP WARN] Day 19: end-of-day GT inventory 12,500 > cap 8,000
+    [DynCO] Day 20 Shift C: press 24808 1325114812074TUHL0→1325215613075TUHL0 (slot 8/17)
+  [GT-CAP WARN] Day 20: end-of-day GT inventory 11,437 > cap 8,000
+  [GT-CAP WARN] Day 21: end-of-day GT inventory 11,387 > cap 8,000
+  [GT-CAP WARN] Day 22: end-of-day GT inventory 11,663 > cap 8,000
+  [GT-CAP WARN] Day 23: end-of-day GT inventory 11,961 > cap 8,000
+  [GT-CAP WARN] Day 24: end-of-day GT inventory 11,744 > cap 8,000
+  [GT-CAP WARN] Day 25: end-of-day GT inventory 10,864 > cap 8,000
+  [GT-CAP WARN] Day 26: end-of-day GT inventory 8,685 > cap 8,000
+  [GT-CAP WARN] Day 27: end-of-day GT inventory 8,689 > cap 8,000
+
+======================================================================
+  ROLLING PIPELINE — Results
+======================================================================
+  Total GT built       :    568,794
+  Total cured          :    565,137
+  Expired GT           :      2,833
+  Expired carcass      :      2,587
+  Starvation events    :      2,450
+  Curing COs (total)   :        210  (planned 199 + dynamic 11)
+  Mould cleans taken   :         35  (events=35, by-minutes=35; clean ON)
+  PM/MTC no-overlap    : ON  (curing rows relocated out of maintenance windows; see [PM_MTC] line)
+  Mould-blocked COs    :         26  (mould gate ON)
+  Mould-retargeted COs :          0  (Phase-2 opt ON)
+  CO scorer (ADD) : planned=75 pullfwd=17 retarget=91 dynamic=27 cancelled=2 build_blocked=5
+  Demand coverage      :      77.9%  (565,137 / 725,817)
+  End-day GT inventory : max 12,500 | mean 10,280 | days>8k 25  (cap ON, fwd-buf ON)
+
+  ── PRIORITY FULFILLMENT (committed-delivery SKUs, EDF order) ──
+  SKU                   Demand       Date  Dd CuredByDl  Short  Met Presses EarliestFull
+  1325215813079TUNE6     9,576 2026-09-20  17       785  8,791    N       4   2026-09-16
+  1D25215013008SXC1T    20,770 2026-09-20  17    15,694  5,076    N       7  2026-09-24*
+  → 0/2 committed SKUs fully delivered by their deadline.
+  [Rolling] BLD_SEED_PIN_D1A: pinned 10/10 seeded Stage-1 machines' Shift-A carcass to their seed (Day-1 Shift-A only; B/C demand-driven)
+  [Stage-1 carcass] STAGE1_CO ON: 113,473 carcass units (+1,357 opening) / 114,830 Stage-2 GT across 14 machines; 82 carcass building COs = 7,380 min (no production during CO).
+  [Stage-1 carcass] FEASIBLE: Stage-1 supplies 100% of Stage-2 carcass demand (CO-charged, pre-build within 1-day aging).
+  [Stage-1 carcass] EOD carcass buffer: max   500 | mean   449 | cap 500 | days>cap 0
+  [Stage-1 carcass] S1_INCH_FLEX: 0 machines advanced inch (one-way): []
+  [BLD_ALLOW] 134 SKUs from last_building_a_ct.xlsx (rule=ct_present; dropped cols ['6401', '6801'])
+  [Stage-1 carcass] shift-cap enforce: 226 row(s) were over their strict per-shift floor cap (residual rounding artifact) -> re-capped; 584 unit(s) unbuildable that day (dropped, display-only): 2026-09-04=2, 2026-09-05=5, 2026-09-06=9, 2026-09-07=108, 2026-09-08=28, 2026-09-09=49, 2026-09-10=7, 2026-09-11=9, 2026-09-12=8, 2026-09-13=11, 2026-09-14=9, 2026-09-15=96, 2026-09-16=3, 2026-09-18=92, 2026-09-19=49, 2026-09-20=10, 2026-09-21=12, 2026-09-22=14, 2026-09-23=9, 2026-09-24=9, 2026-09-25=8, 2026-09-26=11, 2026-09-27=6, 2026-09-28=8, 2026-09-29=7, 2026-09-30=5.
+  [Stage-1 carcass] min-qty ≥10: folded 0 sub-10 slice(s) into same-machine-day siblings; dropped 90 unplaceable unit(s) (display-only)
+  [PM_MTC] no-overlap: relocated 3 carcass row(s) out of maintenance windows
+  [Rolling] Building output → /Users/anmolsaini/Documents/cbc/data/output/variants/bc_building_conc.xlsx
+  [SYNC] dropped 2,085 GT / 2,085 cured to match displayed carcass (GT/carcass/cured now in sync). New cured 563,052 / coverage 77.6%.
+  [PM_MTC] no-overlap: relocated 92 curing row(s) out of maintenance windows
+  [Rolling] Curing output  → /Users/anmolsaini/Documents/cbc/data/output/variants/bc_curing_conc.xlsx
+RESULT conc built=566709 cured=563052 cov=77.57 cos=210 starv=2450

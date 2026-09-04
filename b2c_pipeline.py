@@ -2000,6 +2000,30 @@ if _INCH18_EXC or _INCH18_DEFER:
     print(f"  [INCH18_DEFER] VMI realloc — 7001→{{15}}, {_INCH18_MACHINE}→{{16,18}}, 6004→{{16}}, "
           f"7002→{{14,16}} (DB-allowable, no invented pairs)")
 
+# ── PLANT_INCH_ADMIT (env PLANT_INCH_ADMIT, default ON; =0 reverts bit-for-bit) ───────────
+# The hardcoded INCH18_DEFER realloc above can pin a machine to an inch set that EXCLUDES the
+# SKUs the plant ACTUALLY ran on it in Days 1-2. 7003 is pinned to {"18"} while its plant set
+# HURL0/HRHT0/HRHP0 is all 17", and 1325223517104HRHT0 is certified on NO OTHER machine — so it
+# becomes unbuildable for the WHOLE month, silently (Eligible_Machines="NA", Skip_Reason blank),
+# while the curing planner still commits presses to it. Observed plant behaviour outranks the
+# hardcoded realloc, so re-admit the plant-set inches here (this must run AFTER the override,
+# and it only ever WIDENS a machine's inch set — never narrows one).
+_PLANT_INCH_ADMIT = os.environ.get("PLANT_INCH_ADMIT", "1") != "0"
+if _PLANT_INCH_ADMIT and _PLANT_SET_LOCK:
+    _pia_dbg = []
+    for _m, _pset in (_get_machine_plant_set() or {}).items():
+        if _m not in _MACHINE_ALLOWED_INCH_SET:
+            continue
+        _pin = {str(_s)[8:10] for _s in (_pset or set()) if len(str(_s)) >= 10}
+        _add = _pin - set(_MACHINE_ALLOWED_INCH_SET[_m])
+        if _add:
+            _MACHINE_ALLOWED_INCH_SET[_m] = set(_MACHINE_ALLOWED_INCH_SET[_m]) | _add
+            _MACHINE_ALLOWED_INCHES[_m] = list(_MACHINE_ALLOWED_INCHES.get(_m, [])) + sorted(_add)
+            _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_MACHINE_ALLOWED_INCHES[_m])
+            _pia_dbg.append(f"{_m}+{'/'.join(sorted(_add))}")
+    if _pia_dbg:
+        print(f"  [PLANT_INCH_ADMIT] plant-set inches re-admitted: {', '.join(_pia_dbg)}")
+
 # Flexible machines under the historical lock (allowed-inch set >= 2) — the only
 # machines that can redirect between inches; fixed machines are single-inch.
 _FLEX_MACHS_HIST: frozenset = frozenset(
@@ -9638,7 +9662,15 @@ def run_rolling_pipeline(
         # A 1st-of-month start keeps the static Day-1 seed exactly as before (bit-for-bit).
         _sd = {}
         if int(getattr(plan_start, "day", 1) or 1) != 1:
-            _sd = _derive_seed_from_plant_2day()
+            # Explicit mid-month carry-in file (machine -> SKU at the END of the last
+            # actually-run day) takes priority; else derive from the plant 2-day replay.
+            _mm = (os.environ.get("MIDMONTH_SEED_FILE", "")
+                   or getattr(_bc_cfg, "MIDMONTH_BUILDING_SEED_FILE", "") or "")
+            if _mm:
+                _sd = _load_actual_seed(_mm)
+                print(f"[midmonth-seed] {len(_sd)} machines from {os.path.basename(_mm)}")
+            if not _sd:
+                _sd = _derive_seed_from_plant_2day()
         if not _sd:
             _sd = _load_actual_seed(_BLD_ACTUAL_SEED_FILE)
         _n_seed = _n_drop_allow = _n_drop_dem = 0

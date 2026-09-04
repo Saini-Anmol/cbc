@@ -1,19 +1,13 @@
 """
-SAP actual-production fetch — Plant 1300, Mtart = ZFGS (finished/cured tyres).
+Download SAP production data for a date range, Plant 1300, filtered on
+Mtart = ZFGS. Produces a single combined XLSX with columns:
+    ProdDate, SKUCode, Shift, Timestamp, ProdQty
+ProdQty is a floored integer, summed per SKUCode per Shift for each date.
+Timestamp is ESTIMATED from the shift (A=07:00, B=15:00, C=23:00) because the
+SAP API does not return a real per-record production time.
 
-Two ways to use it:
-
-  • As a library (the pipeline path — `local_main` / `main` call this live):
-        from api.sap_production_data import production_by_sku, fetch_production
-        prod = production_by_sku("2026-08-01", "2026-08-20")   # {SKUCode: cured_qty}
-        df   = fetch_production("2026-08-01", "2026-08-20")     # per-(date, SKU) rows
-
-  • As a script (writes a combined xlsx):
-        python api/sap_production_data.py [START_DATE END_DATE] [OUT_DIR]
-
+Run:  python sap_production_data.py
 Requires connectivity to s4api.sap.jktyre.in:44305 (corporate network / VPN).
-Credentials come from env (SAP_USER / SAP_PASS); the committed fallback keeps the
-standalone script working. Move the real password to the repo .env for production.
 """
 
 import math
@@ -29,118 +23,131 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 URL = ("https://s4api.sap.jktyre.in:44305/"
        "sap/opu/odata/sap/ZINFI_PLT_API_SRV/InfiProdDtlSet")
-# Credentials: env first (SAP_USER / SAP_PASS), fallback to the committed pair so the
-# standalone script still runs. TODO: keep the real password only in .env.
-AUTH = (os.environ.get("SAP_USER", "INFI_CON"),
-        os.environ.get("SAP_PASS", "Welcome@12345678"))
+AUTH = ("INFI_CON", "Welcome@12345678")
 
-PLANT = "1300"
-MTART = "ZFGS"
-OUT_COLS = ["ProdDate", "SKUCode", "ProdQty"]
-DEFAULT_OUT = "pord_output"
+# Output goes into a "pord_output" sub-folder next to wherever the script is run.
+OUT = "pord_output"
+os.makedirs(OUT, exist_ok=True)
+# Date range to pull (both inclusive). Set these to cover the full month.
+START_DATE = "2026-07-01"
+END_DATE = "2026-07-31"
+
+OUT_COLS = ["ProdDate", "SKUCode", "Shift", "Timestamp", "ProdQty"]
+
+# Estimated shift-start time (the 7AM-7AM production day: A 07-15, B 15-23, C 23-07).
+# NOTE: this is an ESTIMATE from the shift, not the real production timestamp,
+# because the SAP API does not return a per-record time.
+SHIFT_START = {"A": "07:00:00", "B": "15:00:00", "C": "23:00:00"}
 
 
-def _date_range(start, end):
-    """All dates start..end inclusive as 'YYYY-MM-DD' strings."""
-    s = datetime.strptime(str(start)[:10], "%Y-%m-%d")
-    e = datetime.strptime(str(end)[:10], "%Y-%m-%d")
+def date_range(start, end):
+    """Return all dates from start to end (inclusive) as 'YYYY-MM-DD' strings."""
+    s = datetime.strptime(start, "%Y-%m-%d")
+    e = datetime.strptime(end, "%Y-%m-%d")
     if e < s:
         raise ValueError(f"END_DATE ({end}) is before START_DATE ({start}).")
     return [(s + timedelta(days=i)).strftime("%Y-%m-%d")
             for i in range((e - s).days + 1)]
 
 
-def _floor_qty(value):
-    """SAP quantity (e.g. '560.000') → floored int; 0 on bad input."""
+DATES = date_range(START_DATE, END_DATE)
+
+
+def floor_qty(value):
+    """Convert a SAP quantity (e.g. '560.000') to a floored integer."""
     try:
         return int(math.floor(float(value)))
     except (TypeError, ValueError):
         return 0
 
 
-def _fetch_one(date_str, plant=PLANT, mtart=MTART, timeout=300):
-    """Fetch one date's ZFGS records; return list of dicts. Raises on transport error."""
-    sap_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y%m%d")
+def fetch(date_str):
+    """Fetch ZFGS production records for a single date; return list of dicts."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    sap_date = dt.strftime("%Y%m%d")  # 20260801
+
     params = {
         "$filter": (
-            f"Plant eq '{plant}' "
-            f"and PFrDt eq '{sap_date}' and PToDt eq '{sap_date}' "
+            "Plant eq '1300' "
+            f"and PFrDt eq '{sap_date}' "
+            f"and PToDt eq '{sap_date}' "
             "and Matnr eq ' ' "
-            f"and Mtart eq '{mtart}' "
-            "and Matkl eq ' ' and StorgLoc eq ' ' and Arbpl eq ' ' and PType eq 'PD'"
+            "and Mtart eq 'ZFGS' "
+            "and Matkl eq ' ' "
+            "and StorgLoc eq ' ' "
+            "and Arbpl eq ' ' "
+            "and PType eq 'PD'"
         ),
         "$format": "json",
     }
+
     r = requests.get(URL, params=params, headers={"Accept": "application/json"},
-                     auth=AUTH, verify=False, timeout=timeout)
-    print(f"  [SAP] {date_str}: HTTP {r.status_code}")
+                     auth=AUTH, verify=False, timeout=300)
+    print(f"{date_str}: HTTP {r.status_code}")
     r.raise_for_status()
-    return r.json().get("d", {}).get("results", [])
+
+    results = r.json().get("d", {}).get("results", [])
+    print(f"{date_str}: {len(results)} raw records")
+    return results
 
 
-def fetch_production(start_date, end_date, plant=PLANT, mtart=MTART) -> pd.DataFrame:
-    """Actual production for a date range → DataFrame[ProdDate, SKUCode, ProdQty]
-    (ProdQty floored int, summed per (date, SKU)). SKUCode is stripped so it joins the
-    demand file's SKUCode. Raises RuntimeError if SAP is unreachable."""
+def to_rows(date_str, results):
+    """Filter to ZFGS and reduce each record to ProdDate, SKUCode, Shift, ProdQty."""
     rows = []
-    for d in _date_range(start_date, end_date):
+    for rec in results:
+        if str(rec.get("Mtart", "")).strip().upper() != "ZFGS":
+            continue
+        rows.append({
+            "ProdDate": date_str,
+            "SKUCode": rec.get("Matnr"),
+            "Shift": str(rec.get("Shift", "")).strip().upper(),
+            "ProdQty": floor_qty(rec.get("ProdQty")),
+        })
+    return rows
+
+
+def main():
+    all_rows = []
+    for d in DATES:
         try:
-            results = _fetch_one(d, plant, mtart)
+            results = fetch(d)
         except requests.exceptions.RequestException as exc:
-            raise RuntimeError(
-                f"[SAP] could not reach {URL} for {d} ({exc.__class__.__name__}). "
-                "Check corporate network / VPN to s4api.sap.jktyre.in:44305.") from exc
-        for rec in results:
-            if str(rec.get("Mtart", "")).strip().upper() != mtart:
-                continue
-            rows.append({"ProdDate": d,
-                         "SKUCode": str(rec.get("Matnr", "")).strip(),
-                         "ProdQty": _floor_qty(rec.get("ProdQty"))})
-    if not rows:
-        return pd.DataFrame(columns=OUT_COLS)
-    df = pd.DataFrame(rows, columns=OUT_COLS)
-    df["ProdQty"] = df["ProdQty"].astype(int)
-    return (df.groupby(["ProdDate", "SKUCode"], as_index=False)["ProdQty"].sum()
-              .sort_values(["ProdDate", "SKUCode"], ignore_index=True))
+            print(
+                f"\nERROR: could not reach SAP for {d} -> {exc.__class__.__name__}.\n"
+                "Check that you are on the corporate network / VPN and that "
+                "s4api.sap.jktyre.in:44305 is reachable.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        rows = to_rows(d, results)
+        print(f"{d}: {len(rows)} rows after ZFGS filter")
+        all_rows.extend(rows)
 
-
-def production_by_sku(start_date, end_date) -> dict:
-    """Actual CURED production summed over [start_date, end_date] per SKU → {SKUCode: qty}.
-    This is what the mid-month demand-deduction consumes (original demand − this)."""
-    df = fetch_production(start_date, end_date)
-    if df.empty:
-        return {}
-    g = df.groupby("SKUCode")["ProdQty"].sum()
-    return {str(k).strip(): int(v) for k, v in g.items() if str(k).strip()}
-
-
-def write_production_file(df: pd.DataFrame, out_dir=DEFAULT_OUT) -> str:
-    """Write the per-(date, SKU) production DataFrame to <out_dir>/sap_prod_<range>.xlsx."""
-    os.makedirs(out_dir, exist_ok=True)
-    _d = df["ProdDate"]
-    first = datetime.strptime(_d.min(), "%Y-%m-%d").strftime("%d%b%Y")
-    last = datetime.strptime(_d.max(), "%Y-%m-%d").strftime("%d%b%Y")
-    path = os.path.join(out_dir, f"sap_prod_{first}-{last}.xlsx")
-    df.to_excel(path, index=False)
-    return path
-
-
-def main(argv=None):
-    argv = argv if argv is not None else sys.argv[1:]
-    start = argv[0] if len(argv) > 0 else "2026-08-01"
-    end = argv[1] if len(argv) > 1 else "2026-08-20"
-    out_dir = argv[2] if len(argv) > 2 else DEFAULT_OUT
-    try:
-        df = fetch_production(start, end)
-    except RuntimeError as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
-    if df.empty:
+    if not all_rows:
         print("\nNo data returned for the given date range.")
         return
-    path = write_production_file(df, out_dir)
-    print(f"\nCombined rows: {len(df)}  |  total ProdQty: {int(df['ProdQty'].sum()):,}")
-    print(f"Saved: {path}")
+
+    df = pd.DataFrame(all_rows)
+    df["ProdQty"] = df["ProdQty"].astype(int)
+
+    # Sum ProdQty per SKUCode per Shift for each date.
+    df = (df.groupby(["ProdDate", "SKUCode", "Shift"], as_index=False)["ProdQty"]
+            .sum())
+
+    # Estimated production timestamp = ProdDate + shift-start time.
+    df["Timestamp"] = pd.to_datetime(
+        df["ProdDate"] + " " + df["Shift"].map(SHIFT_START).fillna("00:00:00"),
+        errors="coerce")
+
+    df = df[OUT_COLS].sort_values(["ProdDate", "Shift", "SKUCode"], ignore_index=True)
+
+    first = datetime.strptime(DATES[0], "%Y-%m-%d").strftime("%d%b%Y")
+    last = datetime.strptime(DATES[-1], "%Y-%m-%d").strftime("%d%b%Y")
+    out_path = os.path.join(OUT, f"sap_prod_{first}-{last}.xlsx")
+    df.to_excel(out_path, index=False)
+
+    print(f"\nCombined rows: {len(df)}")
+    print(f"Saved: {out_path}")
 
 
 if __name__ == "__main__":
