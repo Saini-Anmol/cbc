@@ -655,6 +655,15 @@ _SP_SPARE_MARGIN = float(os.environ.get("SP_SPARE_MARGIN", "1.0"))
 # to big SKUs and stay at 0 built/cured forever (free moulds + idle presses, but never bootstrapped).
 # The mould gate still applies at mount, so a press is only taken if 2 eligible moulds are free.
 _UNMET_BOOTSTRAP = os.environ.get("UNMET_BOOTSTRAP", "0") != "0"   # default OFF: net −1.5k July + can't help SKUs whose 1 press is HOLD-locked (needs a press-release, not re-ranking)
+# COLD-START BOOTSTRAP (default ON): a demand SKU with eligible curing presses AND an eligible
+# building machine but 0 presses committed all month never enters the acquisition pool (its presses
+# are HOLD-locked RI on other SKUs), so curing draw stays 0 → building's _defc≤0 gate builds 0 GT →
+# the press is never bootstrapped (e.g. 8501→1D25215Z13008QXPC0, sole builder, 10,200 demand, 0
+# press for 28 days). Once per such SKU, directly CO ONE n-1-protected donor press onto it to seed
+# the draw; building then follows and PRESS_STABLE holds it. Env COLDSTART_BOOTSTRAP=0 reverts.
+_COLDSTART_BOOTSTRAP = os.environ.get(
+    "COLDSTART_BOOTSTRAP",
+    "1" if getattr(_bc, "COLDSTART_BOOTSTRAP", True) else "0") != "0"
 
 # ── v4 CAMPAIGN / active-set planner (env CAMPAIGN_PLAN, default OFF) ──────────────────
 # Phase 1 = build the abstract per-SKU-per-day campaign target (Stage 1) + LOG diagnostics only
@@ -1323,6 +1332,7 @@ class COScheduler:
                   f"(<= {_SS_MAX_BLD} builder machine(s)) — draw-drain pinned to buildable feed")
 
         # ── Day-by-day simulation ─────────────────────────────────────────────
+        _coldstart_done: set = set()   # COLD-START BOOTSTRAP: SKUs already seeded (one-shot latch)
         for day in range(1, planning_days + 1):
             horizon_left = _working_days_left(day, planning_days, _hol)
             co_used = daily_co_used.get(day, 0)
@@ -1602,6 +1612,59 @@ class COScheduler:
                         newly_free.append(p)
                         overcap_free.add(p)
                         _released += _qty_per_press_per_day(ct_map.get(_old, _dct0))
+
+            # ── COLD-START BOOTSTRAP ────────────────────────────────────────────
+            # Seed 1 press onto a demand SKU that has eligible presses + an eligible building machine
+            # but 0 presses committed (its presses are HOLD-locked on other SKUs, so it never enters
+            # `newly_free`). Directly CO an n-1-protected donor press onto it — building then follows
+            # (draw>0) and PRESS_STABLE holds it. One-shot per SKU (latch), mould-gated, deterministic.
+            if _COLDSTART_BOOTSTRAP:
+                _dctb = ConsumptionConfig.DEFAULT_CYCLE_TIME_MIN
+                for _cs in sorted(all_demand_skus):
+                    if co_used >= max_co_per_day:
+                        break
+                    if _cs in _coldstart_done or press_count.get(_cs, 0) > 0:
+                        continue
+                    if updated_demand.get(_cs, 0.0) <= _qty_per_press_per_day(ct_map.get(_cs, _dctb)):
+                        continue                              # not enough real demand to seed
+                    if not _feed_sm.get(_cs):
+                        continue                              # no eligible building machine
+                    _donor = None
+                    for _p in sorted(sku_to_presses.get(_cs, set())):
+                        _old = press_to_sku.get(_p, "")
+                        if not _old or _old == _cs or _p in newly_free:
+                            continue
+                        if _n_free_for(_cs, _p) < 2:
+                            continue                          # mould gate: need 2 free eligible moulds
+                        if (_prio_res and _old in _pdm
+                                and updated_demand.get(_old, 0) > 0 and day <= _pdm[_old]):
+                            continue                          # never poach a committed-delivery press
+                        _nold = press_count.get(_old, 0) - 1
+                        _remold = updated_demand.get(_old, 0.0)
+                        if _remold > 0 and _nold <= 0:
+                            continue                          # donor's LAST press → don't strand old_sku
+                        if _remold > 0 and _nold > 0:
+                            _rold = _qty_per_press_per_day(ct_map.get(_old, _dctb))
+                            if _rold > 0 and _remold / (_nold * _rold) > horizon_left:
+                                continue                      # old_sku genuinely needs this press
+                        _donor = _p
+                        break
+                    if _donor is None:
+                        continue
+                    _old = press_to_sku.get(_donor, "")
+                    co_events.append({"day": day, "press": _donor, "old_sku": _old, "new_sku": _cs})
+                    press_to_sku[_donor] = _cs
+                    if _p0_gate:
+                        _p0_mount(_donor, _cs)                 # claim the target's 2 moulds
+                    press_count[_old] = max(0, press_count.get(_old, 0) - 1)
+                    press_count[_cs] = press_count.get(_cs, 0) + 1
+                    if (_STATEFUL_PLAN or _CAMPAIGN_PLAN) and _old:
+                        _peaked.add(_old)
+                    pending_ro_presses.discard(_donor)
+                    demand_running_presses.add(_donor)
+                    _coldstart_done.add(_cs)
+                    co_used += 1
+                    daily_co_used[day] = co_used
 
             if not newly_free:
                 continue
