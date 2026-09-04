@@ -740,6 +740,56 @@ def _load_actual_seed(path: str) -> dict[str, str]:
     return seed
 
 
+_MIDMONTH_SET: dict = {}          # {machine: set(SKUs it built in the N days before PLAN_START)}
+_MIDMONTH_LAST: dict = {}         # {machine: the LAST SKU it was building before PLAN_START}
+
+
+def _derive_midmonth_sets(plan_start, path: str = None, days: int = None) -> dict:
+    """MID-MONTH CARRY-IN as a rolling N-day SKU SET per building machine.
+
+    Reads a FULL-MONTH baseline plan (built with NO production deduction) and returns
+    {machine: set(SKUCode)} for the `days` calendar days immediately BEFORE plan_start.
+    The machine then starts on whichever SKU in its own set has the best live need —
+    it demonstrably ran all of them recently, so no changeover is charged.
+
+    Returns {} on any failure so the caller falls back to the previous behaviour.
+    """
+    path = path or getattr(_bc_cfg, "MIDMONTH_BASELINE_PLAN", "") or ""
+    days = int(days or getattr(_bc_cfg, "MIDMONTH_SET_DAYS", 3) or 3)
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        d = pd.read_excel(path, sheet_name="Shift Schedule", header=2)
+        d.columns = [str(c).strip() for c in d.columns]
+        win = {(plan_start - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, days + 1)}
+        d["_D"] = d["Date"].astype(str).str[:10]
+        d["_S"] = d["SKUCode"].astype(str).str.strip()
+        d["_M"] = d["Machine"].astype(str).str.strip()
+        d["_C"] = d["CO_Type"].astype(str).str.upper()
+        d["_Q"] = pd.to_numeric(d["Qty"], errors="coerce").fillna(0.0)
+        _sent = {"CHANGEOVER", "MOULD_CLEAN", "PM", "MTC", "NAN", "—", "",
+                 "EXPIRED_GT", "EXPIRED_CARCASS"}
+        d = d[(d["_D"].isin(win)) & (d["_Q"] > 0)
+              & (~d["_S"].str.upper().isin(_sent))
+              & (~d["_C"].isin(["PM", "MTC", "EXPIRED_GT", "EXPIRED_CARCASS"]))]
+        d = d.reset_index()
+        d["_so"] = d["Shift"].map({"A": 0, "B": 1, "C": 2}).fillna(0)
+        out: dict = {}
+        _MIDMONTH_LAST.clear()
+        for _m, _g in d.groupby("_M"):
+            _sk = {x for x in _g["_S"] if len(x) == 18}
+            if not _sk:
+                continue
+            out[str(_m)] = _sk
+            # the SKU physically on the machine at PLAN_START 07:00
+            _MIDMONTH_LAST[str(_m)] = str(
+                _g.sort_values(["_D", "_so", "index"], kind="stable").iloc[-1]["_S"])
+        return out
+    except Exception as exc:                       # never block a run on the baseline file
+        print(f"  [midmonth-set] could not read {os.path.basename(path)}: {exc}")
+        return {}
+
+
 def _derive_seed_from_plant_2day(path: str = None) -> dict[str, str]:
     """MID-MONTH carry-in: derive {Machine: SKUCode} = each building machine's SKU at the
     END of the plant's last replayed day, from PLANT_2DAY_SCHEDULE_FILE.
@@ -2007,30 +2057,6 @@ if _INCH18_EXC or _INCH18_DEFER:
         _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_al)
     print(f"  [INCH18_DEFER] VMI realloc — 7001→{{15}}, {_INCH18_MACHINE}→{{16,18}}, 6004→{{16}}, "
           f"7002→{{14,16}} (DB-allowable, no invented pairs)")
-
-# ── PLANT_INCH_ADMIT (env PLANT_INCH_ADMIT, default ON; =0 reverts bit-for-bit) ───────────
-# The hardcoded INCH18_DEFER realloc above can pin a machine to an inch set that EXCLUDES the
-# SKUs the plant ACTUALLY ran on it in Days 1-2. 7003 is pinned to {"18"} while its plant set
-# HURL0/HRHT0/HRHP0 is all 17", and 1325223517104HRHT0 is certified on NO OTHER machine — so it
-# becomes unbuildable for the WHOLE month, silently (Eligible_Machines="NA", Skip_Reason blank),
-# while the curing planner still commits presses to it. Observed plant behaviour outranks the
-# hardcoded realloc, so re-admit the plant-set inches here (this must run AFTER the override,
-# and it only ever WIDENS a machine's inch set — never narrows one).
-_PLANT_INCH_ADMIT = os.environ.get("PLANT_INCH_ADMIT", "1") != "0"
-if _PLANT_INCH_ADMIT and _PLANT_SET_LOCK:
-    _pia_dbg = []
-    for _m, _pset in (_get_machine_plant_set() or {}).items():
-        if _m not in _MACHINE_ALLOWED_INCH_SET:
-            continue
-        _pin = {str(_s)[8:10] for _s in (_pset or set()) if len(str(_s)) >= 10}
-        _add = _pin - set(_MACHINE_ALLOWED_INCH_SET[_m])
-        if _add:
-            _MACHINE_ALLOWED_INCH_SET[_m] = set(_MACHINE_ALLOWED_INCH_SET[_m]) | _add
-            _MACHINE_ALLOWED_INCHES[_m] = list(_MACHINE_ALLOWED_INCHES.get(_m, [])) + sorted(_add)
-            _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_MACHINE_ALLOWED_INCHES[_m])
-            _pia_dbg.append(f"{_m}+{'/'.join(sorted(_add))}")
-    if _pia_dbg:
-        print(f"  [PLANT_INCH_ADMIT] plant-set inches re-admitted: {', '.join(_pia_dbg)}")
 
 # Flexible machines under the historical lock (allowed-inch set >= 2) — the only
 # machines that can redirect between inches; fixed machines are single-inch.
@@ -5424,6 +5450,29 @@ def _assign_building_shift(
                 cands = [x for x in eligible if _defc(x, buf) > 0
                          and not _fixed_esc_block(m, sku_inch.get(x, ""), "")
                          and _sku_revert_ok(m, x) and _plant_ok(m, x)]
+                # MID-MONTH N-DAY SET: on plan day 1 restrict the start to SKUs this machine
+                # ACTUALLY built in the N days before PLAN_START. It ran all of them recently,
+                # so starting on any of them is physical and costs no changeover; the ranking
+                # below then picks the one with the best live need (draw / deficit / inventory).
+                # Machines with no set (idle in the window) are unrestricted, as before.
+                if day == 1 and _MIDMONTH_SET:
+                    _ms = _MIDMONTH_SET.get(str(m)) or set()
+                    if _ms:
+                        _in_set = [x for x in cands if x in _ms]
+                        if not _in_set:      # plant-set lock excluded them all -> relax that gate
+                            _in_set = [x for x in eligible if x in _ms and _defc(x, buf) > 0
+                                       and not _fixed_esc_block(m, sku_inch.get(x, ""), "")
+                                       and _sku_revert_ok(m, x)]
+                        if _in_set:
+                            cands = _in_set
+                        else:
+                            # Nothing in the machine's recent set shows a deficit this shift.
+                            # It was PHYSICALLY RUNNING at PLAN_START 07:00, so continue its
+                            # last actual SKU rather than idle it — the plant would not stop
+                            # the machine. Still a day-1 "start" ⇒ no changeover charged.
+                            _last = _MIDMONTH_LAST.get(str(m), "")
+                            if _last and _last in eligible:
+                                cands = [_last]
                 if cands:
                     # DELIVERY_PRIORITY: a behind committed SKU seeds an empty machine first
                     # (EDF), still dom-inch-filtered. (1,0.0) constant when off → identity.
@@ -9679,8 +9728,25 @@ def run_rolling_pipeline(
         # carry-in state is the END of the plant's last replayed day, derived from
         # PLANT_2DAY_SCHEDULE_FILE. Falls back to the static seed file if that is unavailable.
         # A 1st-of-month start keeps the static Day-1 seed exactly as before (bit-for-bit).
-        _sd = {}
+        # MID-MONTH N-DAY SET: each machine's recent-SKU set from the full-month baseline
+        # plan. Day-1 Shift A then picks the best-need SKU from its OWN set, no CO charged.
+        _MIDMONTH_SET.clear()
         if int(getattr(plan_start, "day", 1) or 1) != 1:
+            _MIDMONTH_SET.update(_derive_midmonth_sets(plan_start))
+            if _MIDMONTH_SET:
+                _sz = sorted(len(v) for v in _MIDMONTH_SET.values())
+                print(f"  [midmonth-set] {len(_MIDMONTH_SET)} machines from "
+                      f"{os.path.basename(getattr(_bc_cfg, 'MIDMONTH_BASELINE_PLAN', ''))} "
+                      f"({getattr(_bc_cfg, 'MIDMONTH_SET_DAYS', 3)}d before {plan_start.date()}); "
+                      f"set size min/med/max {_sz[0]}/{_sz[len(_sz)//2]}/{_sz[-1]}")
+        _sd = {}
+        if _MIDMONTH_SET:
+            # N-DAY SET ACTIVE: do NOT pin a single carry-in SKU. Leaving machine_current_sku
+            # empty is what lets the Phase-A day-1 "start" pick the best-need SKU from the
+            # machine's own recent set (and be charged no changeover). Pinning one SKU here
+            # would make `cur` non-empty and the set would never be consulted.
+            pass
+        elif int(getattr(plan_start, "day", 1) or 1) != 1:
             # Explicit mid-month carry-in file (machine -> SKU at the END of the last
             # actually-run day) takes priority; else derive from the plant 2-day replay.
             _mm = (os.environ.get("MIDMONTH_SEED_FILE", "")
@@ -9690,7 +9756,9 @@ def run_rolling_pipeline(
                 print(f"[midmonth-seed] {len(_sd)} machines from {os.path.basename(_mm)}")
             if not _sd:
                 _sd = _derive_seed_from_plant_2day()
-        if not _sd:
+        if not _sd and not _MIDMONTH_SET:
+            # (skipped when the N-day SET is active — a 1st-of-month static seed would pin
+            #  machine_current_sku and the set would never get to choose)
             _sd = _load_actual_seed(_BLD_ACTUAL_SEED_FILE)
         _n_seed = _n_drop_allow = _n_drop_dem = 0
         for _m, _sku in _sd.items():

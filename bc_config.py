@@ -59,6 +59,20 @@ DEMAND_BASE_FILE = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND.xlsx")
 # recipeID -> 18-char SKUCode map (column `iD` -> `description`). Must stay in sync:
 # an unlisted recipeID is DROPPED and its production is silently NOT deducted.
 RECIPE_MASTER_FILE = os.path.join(INPUT_DIR, "RECIPE_MASTER.csv")
+
+# ── MID-MONTH BUILDING CARRY-IN: rolling N-day SKU SET per machine ────────────
+# For a mid-month PLAN_START, each building machine is started on a SKU it ACTUALLY
+# built in the N days immediately BEFORE the start date — not one frozen SKU.
+# Source = a FULL-MONTH baseline plan (1st -> month end) run with NO production
+# deduction; from it we read, per machine, the distinct SKUs built on the N days
+# before PLAN_START. On day 1 the machine picks the SKU from that set with the best
+# live need (curing draw / GT + carcass inventory / deficit) and is charged NO
+# changeover. A machine with no set (idle in the window) starts free, as today.
+# Regenerate the baseline whenever the month's demand changes:
+#   set PLAN_START=1st + PLANNING_DAYS=month length, run local_main.py, then restore.
+MIDMONTH_SET_DAYS = 3                                    # window length (3 = GT shelf life)
+MIDMONTH_BASELINE_PLAN = os.path.join(
+    OUTPUT_DIR, "main_output", "bc_building_schedule_2026-09-01.xlsx")
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)
 PLANT_HOLIDAYS = ["2026-09-17"]                     # list of "YYYY-MM-DD" or False (INERT); cloud reads jkt_holiday_calendar
 # auto-derived from PLAN_START (env overrides) — month keys for running-moulds + opening GT/carcass
@@ -81,7 +95,7 @@ DAY1_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day1_seed_from_plant.xlsx")
 # last actually-run day (i.e. the day before PLAN_START). Used ONLY when PLAN_START.day
 # != 1; takes priority over deriving the carry-in from the plant 2-day replay file.
 # Env override: MIDMONTH_SEED_FILE.  Set to "" to fall back to the derived seed.
-MIDMONTH_BUILDING_SEED_FILE = os.path.join(INPUT_DIR, "day4_seed_end_of_3sep.xlsx")
+MIDMONTH_BUILDING_SEED_FILE = ""    # superseded by the N-day SET below; set a path to force one SKU/machine
 STICKY_HANDOFF = True; STICKY_HANDOFF_LOCK = False   # ← Day2→Day3 handoff LOCK ON: each GT machine keeps its end-of-day-2 SKU on day-3 ShiftA, excluded from Phase B/C that shift  (line 52)
 SAME_GROUP_SOFT_A = True   # ← SOFT-A group-allocation DEFAULT (b2c_pipeline.py): SAME_GROUP soft "one SKU→one machine group" rule ON, but SOFT (SG_HARD=0, foreign builds allowed rather than hard-dropped); same-shift multi-group guard stays HARD (SG_SAMESHIFT_HARD, rule 3); deliberate cross-group move-gate stays OFF (SG_MOVE_ADMIT). Env SAME_GROUP=0 fully disables (bit-for-bit OFF baseline); SG_HARD=1 / SG_MOVE_ADMIT=1 still work for A/B.  (line 53)
 SAME_GROUP_SOFT_A_EXEMPT_SKUS = ["1225170015012LSTL0"]   # ← EXCEPTION to SAME_GROUP_SOFT_A: these SKUs are EXEMPT from the one-SKU→one-group rule and may be built on ANY allowable machine across groups (incl. simultaneously in different groups the same shift). All SAME_GROUP penalties/HARD guards (home-pen, deliberate move-gate, same-shift-multi-group, SG_HARD drop) are bypassed for a listed SKU; every other constraint (demand cap, inch-lock, mould feasibility, CT) still applies. Env SG_EXEMPT_SKUS (comma-separated) overrides.  (line 54)
