@@ -35,8 +35,8 @@ OUTPUT_DIR = os.path.join(HERE, "data", "output")
 #   (defined just above); RUNNING_MOULDS_MONTH / PLAN_MONTH auto-derive from PLAN_START.
 #   Detailed notes for each param remain in their original sections further below.
 # ══════════════════════════════════════════════════════════════════════════════
-PLAN_START    = datetime(2026, 9, 4, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
-PLANNING_DAYS = 27                              # 4 Sep .. 30 Sep inclusive (mid-month start)
+PLAN_START    = datetime(2026, 9, 5, 7, 0, 0)   # first shift of plan (Shift A, 07:00)
+PLANNING_DAYS = 26                              # 4 Sep .. 30 Sep inclusive (mid-month start)
 # Mid-month demand: original Sept demand MINUS the plant's actual 2-day curing production
 # (Curing_Production_2days.xlsx), deducted ONCE per SKU and re-allocated proportionally across
 # duplicate MTS/MTO rows. Original file BTP_SEPT26_DEMAND.xlsx is retained untouched.
@@ -50,7 +50,7 @@ DEMAND_FILE   = os.path.join(INPUT_DIR, "BTP_SEPT26_DEMAND_deducted.xlsx")
 # `isCured` is filtered if the column is present; if you pre-filter it, that is fine.
 # Any other columns are ignored, so the export may carry extras.
 # >>> UPDATE THIS PATH when a newer production file arrives. <<<
-ACTUAL_PRODUCTION_FILE = os.path.join(INPUT_DIR, "curingPCR_4sep.xlsx")
+ACTUAL_PRODUCTION_FILE = os.path.join(INPUT_DIR, "till_4_sept_prod.xlsx")
 
 # Untouched ORIGINAL month demand. The deduction is always applied to THIS file,
 # never to an already-deducted one (deducting twice would double-count).
@@ -70,7 +70,52 @@ RECIPE_MASTER_FILE = os.path.join(INPUT_DIR, "RECIPE_MASTER.csv")
 # changeover. A machine with no set (idle in the window) starts free, as today.
 # Regenerate the baseline whenever the month's demand changes:
 #   set PLAN_START=1st + PLANNING_DAYS=month length, run local_main.py, then restore.
-MIDMONTH_SET_DAYS = 3                                    # window length (3 = GT shelf life)
+# ── HARD DAY-1 START OVERRIDE (plant instruction) ────────────────────────────
+# {machine: SKUCode} — on plan day 1 these machines MUST start on exactly this SKU,
+# regardless of the derived N-day set. Overrides MIDMONTH_SET/MIDMONTH_LAST for that
+# machine only. Set to {} to disable.
+#   7803 midland3stage1 -> 185R14_STEELKING_10PR_N_TL
+#   6911 nrm11stage1    -> 135/70R15 STAR XT_99M TL
+DAY1_FORCE_SKU = {}   # superseded by the day-5 mapping; restore entries to re-pin
+
+# DEDICATED MACHINES (plant instruction): this machine builds ONLY this SKU, all month.
+# Its allowable set is reduced to the single SKU, and — because both are Stage-1, whose
+# carcass is only made when a Stage-2 machine draws the SKU — the SKU is also given
+# FIRST-CALL priority on its Stage-2 partner (see DEDICATED_SKU_FIRST below), otherwise
+# the greedy deficit ranking starves it (1D25218014010NSTL0 has only 879 units left and
+# loses every comparison to 1D25215Z13008QXPC0's 9,740 on their shared machine 8501).
+MACHINE_DEDICATED_SKU = {
+    "7803": "1D25218014010NSTL0",   # midland3stage1 - keeping this pin measured +6,083 cured vs leaving 7803 free
+}
+# Give the dedicated SKUs first call on ANY machine allowed to build them, so the Stage-1
+# machine above actually gets carcass to make. =False reverts to pure deficit ranking.
+DEDICATED_SKU_FIRST = True
+
+# EARLY FULL-LOAD: run these machines flat out for the first N plan days. Every SKU they are
+# certified for gets FIRST CALL on any machine allowed to build it during those days, so the
+# Stage-2 partners feed them (both are Stage-1 — their carcass only exists when Stage-2 draws
+# the SKU). After the window the normal deficit ranking resumes.
+EARLY_FULL_LOAD_MACHINES = []   # MEASURED: priority boost cost 4,020 cured and moved these Stage-1 machines 0 units in days 5-10 (their SKUs have no curing DRAW those days, so _defc=0 regardless of rank)
+EARLY_FULL_LOAD_DAYS = 6                       # plan days 1..6 = 5 Sept .. 10 Sept
+
+# MIDMONTH_SET_MODE:
+#   "start_day" — take each machine's SKU set from the baseline plan on the PLAN_START DATE
+#                 itself (e.g. 5-Sept of the 1→30 plan). This is the exact state the mid-month
+#                 plan starts from; ALL SKUs a machine ran that day are carried, not just one.
+#   "window"    — legacy: the MIDMONTH_SET_DAYS days BEFORE PLAN_START.
+# SOURCE of the mid-month day-1 SKU set per machine:
+#   "plant_2day" — the PLANT's own Days-1-2 schedule (PLANT_2DAY_SCHEDULE_FILE). Real plant
+#                  data, not a simulation: each machine starts day 1 on a SKU it actually ran.
+#   "baseline"   — from MIDMONTH_BASELINE_PLAN (our own full-month plan) per MIDMONTH_SET_MODE.
+MIDMONTH_SET_SOURCE = "plant_2day"
+# Per-machine hard override of that set (plant instruction). Machine -> list of SKUCodes.
+MIDMONTH_SET_OVERRIDE = {
+    # 8501: plant SKU 1D25115013008QXPC0 has only 94 units left -> use these two instead
+    "8501": ["1D25218014010NSTL0",    # 185R14_STEELKING_10PR_N_TL
+             "1D25215Z13008QXPC0"],   # 155R13_ULTIMA XPC_8PR_Q_TL
+}
+MIDMONTH_SET_MODE = "start_day"
+MIDMONTH_SET_DAYS = 3                                    # only used when MODE = "window"
 MIDMONTH_BASELINE_PLAN = os.path.join(
     OUTPUT_DIR, "main_output", "bc_building_schedule_2026-09-01.xlsx")
 RUNNING_MOULDS_TABLE = "Daily_Running_Moulds"   # Day-0 curing press-state snapshot (live table)

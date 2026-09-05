@@ -742,6 +742,16 @@ def _load_actual_seed(path: str) -> dict[str, str]:
 
 _MIDMONTH_SET: dict = {}          # {machine: set(SKUs it built in the N days before PLAN_START)}
 _MIDMONTH_LAST: dict = {}         # {machine: the LAST SKU it was building before PLAN_START}
+# DEDICATED MACHINES (bc_config.MACHINE_DEDICATED_SKU): {machine: the ONLY SKU it may build}.
+_DEDICATED: dict = {str(k): str(v) for k, v in
+                    (getattr(_bc_cfg, "MACHINE_DEDICATED_SKU", {}) or {}).items()}
+_DEDICATED_SKUS: set = set(_DEDICATED.values())
+_DEDICATED_FIRST = bool(getattr(_bc_cfg, "DEDICATED_SKU_FIRST", True)) and bool(_DEDICATED)
+# EARLY FULL-LOAD (bc_config.EARLY_FULL_LOAD_*): SKUs certified on these machines get first call
+# during plan days 1..N so the machines run flat out early. Resolved lazily (needs the CT map).
+_EARLY_MACHINES: list = [str(x) for x in (getattr(_bc_cfg, "EARLY_FULL_LOAD_MACHINES", []) or [])]
+_EARLY_DAYS: int = int(getattr(_bc_cfg, "EARLY_FULL_LOAD_DAYS", 0) or 0)
+_EARLY_SKUS: set = set()
 
 
 def _derive_midmonth_sets(plan_start, path: str = None, days: int = None) -> dict:
@@ -754,6 +764,29 @@ def _derive_midmonth_sets(plan_start, path: str = None, days: int = None) -> dic
 
     Returns {} on any failure so the caller falls back to the previous behaviour.
     """
+    # SOURCE = the plant's own Days-1-2 schedule (real plant data) when configured.
+    if str(getattr(_bc_cfg, "MIDMONTH_SET_SOURCE", "baseline")).lower() == "plant_2day":
+        _pp = getattr(_bc_cfg, "PLANT_2DAY_SCHEDULE_FILE", "") or ""
+        if _pp and os.path.exists(_pp):
+            try:
+                _pd_ = pd.read_excel(_pp)
+                _pd_["_M"] = _pd_["Machine"].astype(str).str.strip()
+                _pd_["_S"] = _pd_["SKUCode"].astype(str).str.strip()
+                _out = {m: {x for x in g["_S"] if len(x) == 18}
+                        for m, g in _pd_.groupby("_M")}
+                _out = {m: v for m, v in _out.items() if v}
+                _MIDMONTH_LAST.clear()
+                for _m, _g in _pd_.groupby("_M"):          # last plant row = its latest SKU
+                    _r = _g.sort_values(["Day", "Shift"], kind="stable")
+                    if len(_r):
+                        _MIDMONTH_LAST[str(_m)] = str(_r.iloc[-1]["_S"])
+                for _om, _os in (getattr(_bc_cfg, "MIDMONTH_SET_OVERRIDE", {}) or {}).items():
+                    _out[str(_om)] = {str(x) for x in _os}
+                    _MIDMONTH_LAST[str(_om)] = str(list(_os)[0])
+                    print(f"  [midmonth-override] {_om} -> {sorted(_out[str(_om)])}")
+                return _out
+            except Exception as _e:
+                print(f"  [midmonth-set] plant_2day read failed ({_e}); falling back")
     path = path or getattr(_bc_cfg, "MIDMONTH_BASELINE_PLAN", "") or ""
     days = int(days or getattr(_bc_cfg, "MIDMONTH_SET_DAYS", 3) or 3)
     if not path or not os.path.exists(path):
@@ -761,7 +794,13 @@ def _derive_midmonth_sets(plan_start, path: str = None, days: int = None) -> dic
     try:
         d = pd.read_excel(path, sheet_name="Shift Schedule", header=2)
         d.columns = [str(c).strip() for c in d.columns]
-        win = {(plan_start - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, days + 1)}
+        _mode = str(getattr(_bc_cfg, "MIDMONTH_SET_MODE", "window") or "window").lower()
+        if _mode == "start_day":
+            # the baseline plan's rows ON the mid-month start date itself — the exact machine
+            # state the 26-day plan begins from, including every SKU a machine ran that day.
+            win = {plan_start.strftime("%Y-%m-%d")}
+        else:
+            win = {(plan_start - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(1, days + 1)}
         d["_D"] = d["Date"].astype(str).str[:10]
         d["_S"] = d["SKUCode"].astype(str).str.strip()
         d["_M"] = d["Machine"].astype(str).str.strip()
@@ -2049,14 +2088,57 @@ if _INCH18_EXC or _INCH18_DEFER:
     # 7002→[14,16], 6004→[16]) so the config file reflects reality — this loop is idempotent belt-and-
     # suspenders (re-asserts them when INCH18_DEFER on). The per-day timing (7003 16→18@d21, 7002 one-way)
     # lives in the day loop; INCH18_DEFER=0 keeps the config sets but drops the timing.
-    _inch18_override = {"7001": ["15"], _INCH18_MACHINE: ["18"], "6004": ["16"], "7002": ["14", "16"]}  # 7003 DEDICATED to 18" (whole month)
+    # 7003 carries 18" AND 17": its plant Days-1-2 set is three 17" SKUs (HRHT0/HRHP0/HURL0) and
+    # 1325223517104HRHT0 (7,000 units) has NO other allowable machine at all — pinning 7003 to 18"
+    # alone left the plant-set intersection EMPTY, so _plant_set_done could never clear and those
+    # units were permanently unbuildable. 18" stays FIRST (anchor) so the VMI realloc intent holds.
+    _inch18_override = {"7001": ["15"], _INCH18_MACHINE: ["18", "17"], "6004": ["16"], "7002": ["14", "16"]}
     for _m, _al in _inch18_override.items():
         _MACHINE_ALLOWED_INCHES[_m] = list(_al)
         _MACHINE_ALLOWED_INCH_SET[_m] = set(_al)
         _MACHINE_DOMINANT_INCH[_m] = _al[0]                    # anchor = first (15" 7001, 16" 7003, 14" 7002)
         _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_al)
-    print(f"  [INCH18_DEFER] VMI realloc — 7001→{{15}}, {_INCH18_MACHINE}→{{16,18}}, 6004→{{16}}, "
-          f"7002→{{14,16}} (DB-allowable, no invented pairs)")
+    print("  [INCH18_DEFER] VMI realloc — " + ", ".join(
+        f"{_m}→{{{','.join(_al)}}}" for _m, _al in _inch18_override.items())
+        + " (DB-allowable, no invented pairs)")
+
+# ── CT_INCH_TRUST (env CT_INCH_TRUST, default ON; =0 reverts bit-for-bit) ─────────────────
+# The CT matrix (bc_config.BLD_CT_FILE) and the historical inch-lock disagree: the CT file
+# CERTIFIES (machine, SKU) pairs whose inch the lock then forbids, so the pair is promised in
+# the matrix and silently unusable in the plan. Two measured casualties:
+#   8302 is CT-certified for 1325213615099MSXT0 (15") but inch-locked to {12,13} -> the SKU's
+#        only other Stage-2 (8301) is 123% oversubscribed, so 6911 (its SOLE Stage-1) idles 100%.
+#   8501 is CT-certified for 14" SKUs but inch-locked to {15,12,13} -> 4,068 units of 14" work
+#        are structurally dead and 7803 (sole Stage-1 for 4 of its 5 SKUs) sits at 19%.
+# Plant decision: the CT file is authoritative for capability. Widen each machine's allowed-inch
+# set to the inches its OWN CT-certified SKUs need. Only ever ADDS inches, never removes.
+# The explicit INCH18_DEFER realloc machines are EXEMPT — those sets are a deliberate plant call.
+_CT_INCH_TRUST = os.environ.get("CT_INCH_TRUST", "1") != "0"
+if _CT_INCH_TRUST and _MACHINE_ALLOWED_INCH_SET:
+    try:
+        _exempt = set(_inch18_override) if (_INCH18_EXC or _INCH18_DEFER) else set()
+        _ctdf = pd.read_excel(getattr(_bc_cfg, "BLD_CT_FILE", ""), sheet_name=0)
+        _ren = {"6402": "ps2", "6403": "ps3", "6404": "ps4"}
+        _skc = next(c for c in _ctdf.columns if str(c).strip().lower() in ("sku code", "skucode"))
+        _ctdf["_sk"] = _ctdf[_skc].astype(str).str.strip()
+        _added = []
+        for _c in _ctdf.columns:
+            _m = _ren.get(str(_c).strip(), str(_c).strip())
+            if _m in ("6801", "6401") or _m not in _MACHINE_ALLOWED_INCH_SET or _m in _exempt:
+                continue
+            _v = pd.to_numeric(_ctdf[_c], errors="coerce")
+            _need = {x[8:10] for x in _ctdf.loc[_v.notna(), "_sk"] if len(x) == 18}
+            _new = _need - set(_MACHINE_ALLOWED_INCH_SET[_m])
+            if _new:
+                _MACHINE_ALLOWED_INCH_SET[_m] = set(_MACHINE_ALLOWED_INCH_SET[_m]) | _new
+                _MACHINE_ALLOWED_INCHES[_m] = list(_MACHINE_ALLOWED_INCHES.get(_m, [])) + sorted(_new)
+                _MACHINE_DOMINANT_INCH_RANKED[_m] = list(_MACHINE_ALLOWED_INCHES[_m])
+                _added.append(f"{_m}+{'/'.join(sorted(_new))}")
+        if _added:
+            print(f"  [CT_INCH_TRUST] CT-certified inches admitted on {len(_added)} machine(s): "
+                  f"{', '.join(_added)}")
+    except Exception as _exc:
+        print(f"  [CT_INCH_TRUST] skipped ({_exc})")
 
 # Flexible machines under the historical lock (allowed-inch set >= 2) — the only
 # machines that can redirect between inches; fixed machines are single-inch.
@@ -5477,6 +5559,10 @@ def _assign_building_shift(
                     # DELIVERY_PRIORITY: a behind committed SKU seeds an empty machine first
                     # (EDF), still dom-inch-filtered. (1,0.0) constant when off → identity.
                     cur = min(cands, key=lambda x: (
+                        # DEDICATED_SKU_FIRST: a dedicated SKU outranks pure deficit so its
+                        # Stage-1 partner actually gets carcass to build (see bc_config).
+                        0 if (_DEDICATED_FIRST and x in _DEDICATED_SKUS) else 1,
+                        0 if (day <= _EARLY_DAYS and x in _EARLY_SKUS) else 1,
                         _bld_prio(x),
                         0 if sku_inch.get(x, "") == dom else 1,
                         *_tierg(x, m, _defc(x, buf)), x))
@@ -5975,9 +6061,13 @@ def _assign_building_shift(
                     if _CONCENTRATION:
                         # Defer a redundant machine (over_prov=1) below any still-under-served
                         # SKU, but keep inch stickiness first (never force a diff-CO to spread).
-                        return ((inch_penalty, _over_prov(m, sku), tier, _gp, primary,
+                        return ((0 if (_DEDICATED_FIRST and sku in _DEDICATED_SKUS) else 1,
+                                 0 if (day <= _EARLY_DAYS and sku in _EARLY_SKUS) else 1,
+                                 inch_penalty, _over_prov(m, sku), tier, _gp, primary,
                                  constraint, cost, m, sku) if _SG_STRONG else
-                                (inch_penalty, _over_prov(m, sku), tier, primary,
+                                (0 if (_DEDICATED_FIRST and sku in _DEDICATED_SKUS) else 1,
+                                 0 if (day <= _EARLY_DAYS and sku in _EARLY_SKUS) else 1,
+                                 inch_penalty, _over_prov(m, sku), tier, primary,
                                  _gp, constraint, cost, m, sku))
                     return ((inch_penalty, tier, _gp, primary, constraint, cost, m, sku)
                             if _SG_STRONG else
@@ -9733,6 +9823,42 @@ def run_rolling_pipeline(
         _MIDMONTH_SET.clear()
         if int(getattr(plan_start, "day", 1) or 1) != 1:
             _MIDMONTH_SET.update(_derive_midmonth_sets(plan_start))
+            # HARD DAY-1 START OVERRIDE (bc_config.DAY1_FORCE_SKU): plant instruction — these
+            # machines MUST start day 1 on exactly this SKU. Replace their derived set with the
+            # single forced SKU and make it eligible (the hist-lock strip may have removed it).
+            # DEDICATED MACHINES: reduce the machine's allowable set to its single SKU for the
+            # WHOLE month (not just day 1), and guarantee that SKU is eligible on it.
+            _EARLY_SKUS.clear()
+            if _EARLY_MACHINES and _EARLY_DAYS > 0:
+                for _em in _EARLY_MACHINES:
+                    # .update(), NOT |= — an augmented assignment would make _EARLY_SKUS a local
+                    _EARLY_SKUS.update({k for k, v in s1_sku_to_machines.items() if _em in v})
+                    _EARLY_SKUS.update(machine_skus.get(_em, set()))
+                if _EARLY_SKUS:
+                    print(f"  [EARLY_FULL_LOAD] {_EARLY_MACHINES} → first call on "
+                          f"{len(_EARLY_SKUS)} SKU(s) for plan days 1..{_EARLY_DAYS}")
+            for _dm, _ds in _DEDICATED.items():
+                if _dm in _S1_MACHINES:
+                    for _other, _ms in list(s1_sku_to_machines.items()):
+                        if _other != _ds:
+                            _ms.discard(_dm)
+                    s1_sku_to_machines[_ds].add(_dm)
+                else:
+                    machine_skus[_dm] = {_ds}
+                    for _other, _ms in list(sku_machine_map.items()):
+                        if _other != _ds:
+                            _ms.discard(_dm)
+                    sku_machine_map[_ds].add(_dm)
+                print(f"  [DEDICATED] {_dm} restricted to {_ds} for the whole month")
+            for _fm, _fs in (getattr(_bc_cfg, "DAY1_FORCE_SKU", {}) or {}).items():
+                _fm, _fs = str(_fm), str(_fs)
+                _MIDMONTH_SET[_fm] = {_fs}
+                _MIDMONTH_LAST[_fm] = _fs
+                if _fm in _S1_MACHINES:
+                    s1_sku_to_machines[_fs].add(_fm)
+                else:
+                    machine_skus[_fm].add(_fs); sku_machine_map[_fs].add(_fm)
+                print(f"  [DAY1_FORCE] {_fm} pinned to {_fs} on plan day 1")
             if _MIDMONTH_SET:
                 _sz = sorted(len(v) for v in _MIDMONTH_SET.values())
                 print(f"  [midmonth-set] {len(_MIDMONTH_SET)} machines from "
